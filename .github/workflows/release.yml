@@ -184,7 +184,7 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile.release
           target: caddy
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm/v7
           push: true
           tags: ${{ steps.meta-caddy.outputs.tags }}
           labels: ${{ steps.meta-caddy.outputs.labels }}
@@ -198,7 +198,7 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile.release
           target: panel
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm/v7
           push: true
           tags: ${{ steps.meta-panel.outputs.tags }}
           labels: ${{ steps.meta-panel.outputs.labels }}
