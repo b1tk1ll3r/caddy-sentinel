@@ -66,7 +66,7 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           CC: ${{ matrix.cc }}
-        run: ./scripts/build-release.sh
+        run: bash ./scripts/build-release.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -90,10 +90,25 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Prüfsummen
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+          path: src
+
+      # Zusätzlich Archive ohne Versionsnummer im Namen: so lädt
+      # install.sh immer die neueste Version über
+      # releases/latest/download/caddy-sentinel_linux_<arch>.tar.gz –
+      # ohne GitHub-API und deren Abfragelimit.
+      - name: Feste Dateinamen, VERSION und Prüfsummen
         run: |
           cd dist
-          cat ./*.sha256 > SHA256SUMS
+          for f in caddy-sentinel_${VERSION}_linux_*.tar.gz; do
+            arch=${f##*_linux_}; arch=${arch%.tar.gz}
+            cp "$f" "caddy-sentinel_linux_${arch}.tar.gz"
+          done
+          echo "$VERSION" > VERSION
+          cp ../src/scripts/install.sh install.sh
+          sha256sum ./*.tar.gz install.sh | sed 's| \./| |; s|  \./|  |' > SHA256SUMS
           cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
@@ -105,6 +120,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
+            dist/VERSION
+            dist/install.sh
 
   docker:
     name: Docker-Images

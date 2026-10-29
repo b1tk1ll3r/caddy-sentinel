@@ -111,8 +111,8 @@ export async function render(root, _p, scope) {
     const pre = el('pre.mono', { style: { whiteSpace: 'pre-wrap' } });
     const cmd = el('pre.mono', { style: { whiteSpace: 'pre-wrap' } });
     const draw = () => {
-      cmd.textContent = `curl -fsSL https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh \\
-  | sudo bash -s -- --agent --panel ${panelURL} --token ${token} --remote ${mode}`;
+      cmd.textContent = `bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh) \\
+  --agent --panel ${panelURL} --token ${token} --remote ${mode}`;
       pre.textContent = `{
 	sentinel {
 		panel ${panelURL}

@@ -4,4 +4,4 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DIST=${DIST:-./dist}
-exec ./scripts/install.sh --dir "$DIST" "$@"
+exec bash ./scripts/install.sh --dir "$DIST" "$@"

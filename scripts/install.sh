@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
-# Caddy Sentinel – Installation als systemd-Dienste (Debian/Ubuntu/RHEL u. a.)
+# Caddy Sentinel – Installation und Update als systemd-Dienste
+# (Debian, Ubuntu, RHEL, Raspberry Pi OS …)
 #
-# Direkt aus dem neuesten GitHub-Release:
-#   curl -fsSL https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh | sudo bash
+# Ein Befehl – installiert beim ersten Mal und aktualisiert danach:
+#   bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh)
+# Ohne root startet sich das Skript selbst mit sudo neu.
 #
 # Aus einem entpackten Release-Archiv:
 #   sudo ./install.sh
 #
-# Optionen:
+# Optionen (ohne Optionen fragt das Skript nach, was installiert werden soll):
 #   --version vX.Y.Z   bestimmte Version statt der neuesten
 #   --dir PFAD         Binaries aus diesem Verzeichnis (caddy, caddy-sentinel)
 #   --listen ADDR      Adresse des Panels (Standard: 127.0.0.1:7600)
 #   --panel-only       nur das Panel installieren, Caddy nicht anfassen
-#   --agent            nur Caddy mit Sentinel-Agent installieren – für einen
-#                      weiteren Server, der sich mit einem bestehenden Panel
-#                      verbindet (Instanz im Panel unter „Caddy-Instanzen“ anlegen)
+#   --agent            nur Caddy mit Sentinel-Agent – für einen weiteren Server,
+#                      der sich mit einem bestehenden Panel verbindet
 #     --panel URL      Adresse des Panels, z. B. https://sentinel.example.com
-#     --token TOKEN    Token der Instanz
+#     --token TOKEN    Token der Instanz (Panel › Caddy-Instanzen)
 #     --remote MODUS   full (Caddyfile im Panel bearbeitbar, Standard) | read | off
+#   --reinstall        auch bei vorhandener Installation neu installieren
+#   --force            auch dieselbe Version erneut einspielen
 #   --no-start         Dienste nicht starten
 #   -y, --yes          keine Rückfragen
 #
-# Umgebung: SENTINEL_REPO (Standard b1tk1ll3r/caddy-sentinel), GITHUB_TOKEN (optional, gegen API-Limits)
+# Umgebung: SENTINEL_REPO (Standard b1tk1ll3r/caddy-sentinel),
+#           SENTINEL_DOWNLOAD (Spiegel statt https://github.com/<repo>/releases)
 set -euo pipefail
+
+main() {
 
 REPO=${SENTINEL_REPO:-b1tk1ll3r/caddy-sentinel}
 VERSION=""
@@ -35,23 +42,30 @@ AGENT_TOKEN=""
 REMOTE=full
 START=1
 YES=0
+REINSTALL=0
+FORCE=0
+MODE_GIVEN=0
 BIN_DIR=/usr/local/bin
 DATA_DIR=/var/lib/caddy-sentinel
 SHARE_DIR=/usr/local/share/caddy-sentinel
+# Spiegel möglich, z. B. SENTINEL_DOWNLOAD=https://mirror.example.com/caddy-sentinel
+DL=${SENTINEL_DOWNLOAD:-$(cat "$SHARE_DIR/DOWNLOAD" 2>/dev/null || echo "https://github.com/$REPO/releases")}
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--version) VERSION=$2; shift ;;
 	--dir) SRC=$2; shift ;;
 	--listen) LISTEN=$2; shift ;;
-	--panel-only) PANEL_ONLY=1 ;;
-	--agent) AGENT=1 ;;
+	--panel-only) PANEL_ONLY=1; MODE_GIVEN=1 ;;
+	--agent) AGENT=1; MODE_GIVEN=1 ;;
 	--panel) PANEL_URL=$2; shift ;;
 	--token) AGENT_TOKEN=$2; shift ;;
 	--remote) REMOTE=$2; shift ;;
+	--reinstall) REINSTALL=1 ;;
+	--force) FORCE=1 ;;
 	--no-start) START=0 ;;
 	-y | --yes) YES=1 ;;
-	-h | --help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h | --help) usage; exit 0 ;;
 	*) echo "Unbekannte Option: $1" >&2; exit 2 ;;
 	esac
 	shift
@@ -68,11 +82,13 @@ confirm() {
 }
 
 [ "$(id -u)" = 0 ] || die "Bitte als root bzw. mit sudo ausführen."
-if [ "$AGENT" = 1 ]; then
-	[ -n "$PANEL_URL" ] && [ -n "$AGENT_TOKEN" ] || die "--agent braucht --panel URL und --token TOKEN (im Panel unter „Caddy-Instanzen“)."
-	case "$REMOTE" in full | read | off) ;; *) die "--remote muss full, read oder off sein." ;; esac
-	[ "$PANEL_ONLY" = 0 ] || die "--agent und --panel-only schließen sich aus."
-fi
+ask() { # frage default -> REPLY
+	local a
+	read -r -p "$1 " a </dev/tty || a=""
+	REPLY=${a:-$2}
+}
+interactive() { [ "$YES" = 0 ] && [ -r /dev/tty ] && [ -t 1 ]; }
+[ "$AGENT" = 0 ] || [ "$PANEL_ONLY" = 0 ] || die "--agent und --panel-only schließen sich aus."
 command -v systemctl >/dev/null || die "systemd wird benötigt (für Docker siehe docs/INSTALL.md)."
 
 case "$(uname -m)" in
@@ -82,15 +98,19 @@ armv7l | armv7*) ARCH=armv7 ;;
 *) die "Architektur $(uname -m) wird nicht unterstützt." ;;
 esac
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)
+# Verzeichnis des Skripts – nur wenn es als echte Datei aufgerufen wurde
+# (bei "bash <(wget …)" oder "curl | bash" gibt es keins)
+SCRIPT_DIR=${SENTINEL_SCRIPT_DIR:-}
+if [ -z "$SCRIPT_DIR" ] && [ -f "${BASH_SOURCE[0]:-}" ]; then
+	SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+fi
+SCRIPT_DIR=${SCRIPT_DIR:-/nonexistent}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 fetch() { # url dest
-	local auth=()
-	[ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
 	if command -v curl >/dev/null; then
-		curl -fsSL --retry 3 "${auth[@]}" -o "$2" "$1"
+		curl -fsSL --retry 3 -o "$2" "$1"
 	elif command -v wget >/dev/null; then
 		wget -q -O "$2" "$1"
 	else
@@ -98,20 +118,24 @@ fetch() { # url dest
 	fi
 }
 
-latest_version() {
-	fetch "https://api.github.com/repos/$REPO/releases/latest" "$TMP/latest.json" || die "Konnte die neueste Version nicht ermitteln (GitHub-API)."
-	sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/latest.json" | head -n1
-}
-
-download_release() { # version -> sets SRC
-	local v=$1 name="caddy-sentinel_${1}_linux_${ARCH}"
-	local base="https://github.com/$REPO/releases/download/$v"
-	say "Lade $name.tar.gz"
-	fetch "$base/$name.tar.gz" "$TMP/$name.tar.gz" || die "Download fehlgeschlagen: $base/$name.tar.gz"
+# Download ohne GitHub-API (kein Abfragelimit): das neueste Release hat
+# Archive mit festem Namen unter releases/latest/download/.
+download_release() { # [version] -> sets SRC
+	local v=${1:-} name base
+	if [ -n "$v" ]; then
+		name="caddy-sentinel_${v}_linux_${ARCH}.tar.gz"
+		base="$DL/download/$v"
+	else
+		name="caddy-sentinel_linux_${ARCH}.tar.gz"
+		base="$DL/latest/download"
+	fi
+	say "Lade ${v:-neueste Version} (linux/$ARCH)"
+	fetch "$base/$name" "$TMP/$name" || die "Download fehlgeschlagen: $base/$name"
 	fetch "$base/SHA256SUMS" "$TMP/SHA256SUMS" || die "Prüfsummen fehlen im Release."
-	(cd "$TMP" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c --quiet -) || die "Prüfsumme stimmt nicht – Abbruch."
-	tar -C "$TMP" -xzf "$TMP/$name.tar.gz"
-	SRC="$TMP/$name"
+	(cd "$TMP" && grep " $name\$" SHA256SUMS | sha256sum -c --quiet -) || die "Prüfsumme stimmt nicht – Abbruch."
+	install -d "$TMP/pkg"
+	tar -C "$TMP/pkg" --strip-components=1 -xzf "$TMP/$name"
+	SRC="$TMP/pkg"
 }
 
 # ------------------------------------------------------------ Quelle bestimmen
@@ -119,8 +143,6 @@ if [ -z "$SRC" ]; then
 	if [ -x "$SCRIPT_DIR/caddy-sentinel" ] && [ -z "$VERSION" ]; then
 		SRC=$SCRIPT_DIR # entpacktes Release-Archiv
 	else
-		[ -n "$VERSION" ] || VERSION=$(latest_version)
-		[ -n "$VERSION" ] || die "Keine Version gefunden."
 		download_release "$VERSION"
 	fi
 fi
@@ -132,7 +154,6 @@ for d in "$SRC/deploy" "$SCRIPT_DIR/deploy" "$SCRIPT_DIR/../deploy"; do
 done
 if [ -z "$DEPLOY" ]; then
 	# z. B. bei "curl | bash" mit --dir: Unit-Dateien aus dem Release holen
-	[ -n "$VERSION" ] || VERSION=$(latest_version)
 	download_release "$VERSION"
 	DEPLOY="$SRC/deploy"
 fi
@@ -142,11 +163,58 @@ else
 	NEW_VERSION=${VERSION:-unbekannt}
 fi
 
-say "Installiere Caddy Sentinel $NEW_VERSION (linux/$ARCH)"
-if [ "$AGENT" = 0 ] && [ -x "$BIN_DIR/caddy-sentinel" ]; then
-	warn "Caddy Sentinel ist bereits installiert ($("$BIN_DIR/caddy-sentinel" -version | awk '{print $NF}')). Für Updates besser caddy-sentinel-update verwenden."
-	confirm "Trotzdem fortfahren?" || exit 1
+# ------------------------------------------------------------ vorhandene Installation → Update
+INSTALLED=""
+if [ "$(cat "$SHARE_DIR/MODE" 2>/dev/null)" = agent ] && [ -x "$BIN_DIR/caddy" ]; then
+	INSTALLED=$(cat "$SHARE_DIR/VERSION" 2>/dev/null || echo unbekannt)
+elif [ -x "$BIN_DIR/caddy-sentinel" ]; then
+	INSTALLED=$("$BIN_DIR/caddy-sentinel" -version 2>/dev/null | awk '{print $NF}')
 fi
+if [ -n "$INSTALLED" ] && [ "$REINSTALL" = 0 ]; then
+	[ "$MODE_GIVEN" = 0 ] || warn "Bereits installiert – --agent/--panel-only werden ignoriert (neu einrichten: --reinstall)."
+	if [ "$INSTALLED" = "$NEW_VERSION" ] && [ "$FORCE" = 0 ]; then
+		say "Caddy Sentinel $INSTALLED ist installiert und aktuell."
+		exit 0
+	fi
+	say "Caddy Sentinel $INSTALLED ist installiert – Update auf $NEW_VERSION"
+	[ -f "$SRC/update.sh" ] || die "update.sh fehlt im Archiv."
+	args=(--dir "$SRC")
+	[ "$YES" = 1 ] && args+=(--yes)
+	[ "$FORCE" = 1 ] && args+=(--force)
+	bash "$SRC/update.sh" "${args[@]}"
+	exit $?
+fi
+
+# ------------------------------------------------------------ was installieren?
+if [ "$MODE_GIVEN" = 0 ] && interactive; then
+	echo
+	echo "Was soll auf diesem Server installiert werden?"
+	echo "  1) Panel und Caddy mit Sentinel   (Standard, alles auf einem Server)"
+	echo "  2) Nur das Panel                  (Caddy läuft woanders oder kommt später)"
+	echo "  3) Nur Caddy mit Sentinel-Agent   (weiterer Server für ein bestehendes Panel)"
+	ask "Auswahl [1]:" 1
+	case "$REPLY" in
+	2) PANEL_ONLY=1 ;;
+	3) AGENT=1 ;;
+	esac
+	if [ "$AGENT" = 1 ]; then
+		[ -n "$PANEL_URL" ] || { ask "Adresse des Panels (z. B. https://sentinel.example.com):" ""; PANEL_URL=$REPLY; }
+		[ -n "$AGENT_TOKEN" ] || { ask "Token der Instanz (Panel › Caddy-Instanzen › Instanz hinzufügen):" ""; AGENT_TOKEN=$REPLY; }
+		ask "Darf das Panel die Caddyfile bearbeiten? [J/n]:" j
+		case "$REPLY" in [nN]*) REMOTE=read ;; *) REMOTE=full ;; esac
+		[ -n "$PANEL_URL" ] && [ -n "$AGENT_TOKEN" ] || die "Panel-Adresse und Token werden benötigt."
+	elif [ -z "$LISTEN" ]; then
+		ask "Adresse des Panels [127.0.0.1:7600] (0.0.0.0:7600 = aus dem Netz erreichbar):" 127.0.0.1:7600
+		LISTEN=$REPLY
+	fi
+	[ "$PANEL_ONLY" = 1 ] || [ -x "$SRC/caddy" ] || die "$SRC/caddy fehlt."
+fi
+if [ "$AGENT" = 1 ]; then
+	[ -n "$PANEL_URL" ] && [ -n "$AGENT_TOKEN" ] || die "--agent braucht --panel URL und --token TOKEN (im Panel unter „Caddy-Instanzen“)."
+	case "$REMOTE" in full | read | off) ;; *) die "--remote muss full, read oder off sein." ;; esac
+fi
+
+say "Installiere Caddy Sentinel $NEW_VERSION (linux/$ARCH)"
 
 # ------------------------------------------------------------ Benutzer & Verzeichnisse
 say "Benutzer und Verzeichnisse"
@@ -197,6 +265,7 @@ for s in update uninstall; do
 done
 echo "$NEW_VERSION" >"$SHARE_DIR/VERSION"
 echo "$REPO" >"$SHARE_DIR/REPO"
+if [ "$DL" != "https://github.com/$REPO/releases" ]; then echo "$DL" >"$SHARE_DIR/DOWNLOAD"; else rm -f "$SHARE_DIR/DOWNLOAD"; fi
 
 # ------------------------------------------------------------ Agent-Modus
 if [ "$AGENT" = 1 ]; then
@@ -301,3 +370,38 @@ Caddy Sentinel $NEW_VERSION ist installiert.
   Entfernen:  sudo caddy-sentinel-uninstall
 
 EOF
+}
+
+usage() {
+	cat <<'USAGE'
+Caddy Sentinel – Installation und Update
+
+  bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh) [Optionen]
+
+  --version vX.Y.Z   bestimmte Version statt der neuesten
+  --dir PFAD         Binaries aus diesem Verzeichnis
+  --listen ADDR      Adresse des Panels (Standard: 127.0.0.1:7600)
+  --panel-only       nur das Panel
+  --agent            nur Caddy mit Sentinel-Agent (mit --panel URL --token TOKEN [--remote full|read|off])
+  --reinstall        auch bei vorhandener Installation neu installieren
+  --force            auch dieselbe Version erneut einspielen
+  --no-start         Dienste nicht starten
+  -y, --yes          keine Rückfragen
+
+Ohne Optionen fragt das Skript nach. Ist Caddy Sentinel schon installiert,
+aktualisiert derselbe Befehl auf die neueste Version.
+USAGE
+}
+
+# Ohne root: mit sudo neu starten. Das Skript kann aus einer Pipe oder
+# "<(…)" kommen, die sudo nicht lesen kann – deshalb wird der Quelltext der
+# Funktionen übergeben statt einer Datei.
+if [ "$(id -u)" -ne 0 ]; then
+	case " $* " in *" -h "* | *" --help "*) usage; exit 0 ;; esac
+	command -v sudo >/dev/null || { echo "Bitte als root ausführen (sudo ist nicht installiert)." >&2; exit 1; }
+	echo "==> Für die Installation werden root-Rechte benötigt – starte mit sudo neu"
+	dir=""
+	if [ -f "${BASH_SOURCE[0]:-}" ]; then dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); fi
+	exec sudo env SENTINEL_SCRIPT_DIR="$dir" SENTINEL_REPO="${SENTINEL_REPO:-}" SENTINEL_DOWNLOAD="${SENTINEL_DOWNLOAD:-}" bash -c "set -euo pipefail; $(declare -f main usage); main \"\$@\"" caddy-sentinel-install "$@"
+fi
+main "$@"

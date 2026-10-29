@@ -45,7 +45,7 @@ Firewall mit eigenen Regelsätzen und Limits pro Site.
 - **Testmodus** für IP-Regeln, Geo & Feeds, Filter, einzelne Ratelimits und Pfad-Regeln: Treffer werden als „Test: …“ protokolliert, die Anfrage geht durch. Auswertung „was wäre blockiert worden“ mit Knöpfen zum Scharfschalten
 
 **Mehrere Caddy-Server – ein Panel**
-- Weitere Caddy-Instanzen verbinden sich über ihren Sentinel-Agent mit eigenem Token – nur ausgehend, ohne offenen Port auf dem Server. Installation per `install.sh --agent --panel URL --token TOKEN`
+- Weitere Caddy-Instanzen verbinden sich über ihren Sentinel-Agent mit eigenem Token – nur ausgehend, ohne offenen Port auf dem Server. Installation mit demselben Einzeiler plus `--agent --panel URL --token TOKEN`
 - Zugriff je Server wählbar: `remote read` (Konfiguration, Backends, Zertifikate lesen) oder `remote full` (Caddyfile im Panel bearbeiten, prüfen und laden, mit automatischem Zurückrollen)
 - Jede Instanz hat Name und Farbe. Statistiken pro Instanz oder gesammelt (Auswahl in der Kopfzeile); Editor, Request-Fluss, Sites, Zertifikate und interne CA zeigen immer genau eine Instanz – mit farbigem Balken oben und Umschalter. Tabellen und Meldungen tragen die Instanz als farbiges Kennzeichen
 - Versionsverlauf, Zertifikatswarnungen und Alarme getrennt je Instanz; Policies, Sperren und Feeds gelten für alle
@@ -137,9 +137,14 @@ Kurzfassung – alle Wege (systemd, Docker Compose, selbst bauen, Updates, Rollb
 **Server mit systemd** (amd64, arm64, armv7):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh | sudo bash
-sudo caddy-sentinel-update --check     # später: Update prüfen
-sudo caddy-sentinel-update             # aktualisieren (mit Vorabprüfung, Sicherung, automatischem Rollback)
+bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh)
+```
+
+Derselbe Befehl aktualisiert später auf die neueste Version (mit Vorabprüfung, Sicherung und automatischem Rollback). Alternativ:
+
+```bash
+sudo caddy-sentinel-update --check     # Update prüfen
+sudo caddy-sentinel-update             # aktualisieren
 ```
 
 **Docker Compose** (Images auf ghcr.io):

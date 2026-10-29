@@ -20,6 +20,7 @@ set -euo pipefail
 
 SHARE_DIR=/usr/local/share/caddy-sentinel
 REPO=${SENTINEL_REPO:-$(cat "$SHARE_DIR/REPO" 2>/dev/null || echo b1tk1ll3r/caddy-sentinel)}
+DL=${SENTINEL_DOWNLOAD:-$(cat "$SHARE_DIR/DOWNLOAD" 2>/dev/null || echo "https://github.com/$REPO/releases")}
 BIN_DIR=/usr/local/bin
 DATA_DIR=${SENTINEL_DATA:-/var/lib/caddy-sentinel}
 BACKUP_ROOT=/var/backups/caddy-sentinel
@@ -87,7 +88,13 @@ fetch() {
 	[ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
 	if command -v curl >/dev/null; then curl -fsSL --retry 3 "${auth[@]}" -o "$2" "$1"; else wget -q -O "$2" "$1"; fi
 }
+# Neueste Version: VERSION-Datei des letzten Releases (kein API-Limit),
+# notfalls über die GitHub-API
 latest_version() {
+	if fetch "$DL/latest/download/VERSION" "$TMP/VERSION" 2>/dev/null; then
+		tr -d '[:space:]' <"$TMP/VERSION"
+		return 0
+	fi
 	fetch "https://api.github.com/repos/$REPO/releases/latest" "$TMP/latest.json" || return 1
 	sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/latest.json" | head -n1
 }
@@ -192,7 +199,7 @@ fi
 # ------------------------------------------------------------ Zielversion
 if [ -z "$SRC" ]; then
 	if [ -z "$VERSION" ]; then
-		VERSION=$(latest_version) || die "Konnte die neueste Version nicht ermitteln (GitHub-API, Internet?)."
+		VERSION=$(latest_version) || die "Konnte die neueste Version nicht ermitteln (Internet?)."
 	fi
 	[ -n "$VERSION" ] || die "Keine Version gefunden."
 fi
@@ -210,14 +217,15 @@ if [ -z "$SRC" ]; then
 		say "Bereits auf $CURRENT – nichts zu tun (--force installiert neu)."
 		exit 0
 	fi
-	name="caddy-sentinel_${VERSION}_linux_${ARCH}"
-	base="https://github.com/$REPO/releases/download/$VERSION"
-	say "Lade $name.tar.gz"
-	fetch "$base/$name.tar.gz" "$TMP/$name.tar.gz" || die "Download fehlgeschlagen."
+	name="caddy-sentinel_${VERSION}_linux_${ARCH}.tar.gz"
+	base="$DL/download/$VERSION"
+	say "Lade $name"
+	fetch "$base/$name" "$TMP/$name" || die "Download fehlgeschlagen: $base/$name"
 	fetch "$base/SHA256SUMS" "$TMP/SHA256SUMS" || die "Prüfsummen fehlen."
-	(cd "$TMP" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c --quiet -) || die "Prüfsumme stimmt nicht – Abbruch."
-	tar -C "$TMP" -xzf "$TMP/$name.tar.gz"
-	SRC="$TMP/$name"
+	(cd "$TMP" && grep " $name\$" SHA256SUMS | sha256sum -c --quiet -) || die "Prüfsumme stimmt nicht – Abbruch."
+	install -d "$TMP/pkg"
+	tar -C "$TMP/pkg" --strip-components=1 -xzf "$TMP/$name"
+	SRC="$TMP/pkg"
 fi
 [ -x "$SRC/caddy-sentinel" ] || die "$SRC/caddy-sentinel fehlt."
 NEW=$("$SRC/caddy-sentinel" -version | awk '{print $NF}')

@@ -16,10 +16,19 @@ Es gibt drei Wege: **systemd** (empfohlen für Server), **Docker Compose** und *
 ### Installation
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh | sudo bash
+bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh)
 ```
 
-Das Skript
+oder mit curl: `bash <(curl -fsSL https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh)`. Ohne root startet sich das Skript selbst mit `sudo` neu. Ohne Optionen fragt es, was installiert werden soll (alles, nur Panel, nur Caddy mit Agent) und unter welcher Adresse das Panel erreichbar sein soll.
+
+**Derselbe Befehl aktualisiert:** Ist Caddy Sentinel schon installiert, vergleicht das Skript die Version und spielt – falls nötig – das Update über `caddy-sentinel-update` ein (Vorabprüfung, Sicherung, automatischer Rollback). Ist alles aktuell, endet es mit „aktuell“.
+
+Woher kommen die Dateien? Jedes Release enthält neben den versionierten Archiven auch welche mit festem Namen (`caddy-sentinel_linux_amd64.tar.gz` usw.), eine `VERSION`-Datei und `SHA256SUMS`. Das Skript lädt direkt `https://github.com/b1tk1ll3r/caddy-sentinel/releases/latest/download/caddy-sentinel_linux_<arch>.tar.gz`, prüft die Prüfsumme und entpackt es mit `tar` – ohne GitHub-API und ohne deren Abfragelimit.
+
+> **Eigene Domain:** Soll der Befehl `bash <(wget -qO- https://example.com/install.sh)` lauten, genügt auf dem eigenen Webserver eine Weiterleitung, z. B. in Caddy:
+> `redir /install.sh https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh` – oder auf die Kopie im neuesten Release: `https://github.com/b1tk1ll3r/caddy-sentinel/releases/latest/download/install.sh` (passt immer zur veröffentlichten Version).
+
+Bei einer Neuinstallation
 
 1. lädt das passende Release (amd64, arm64 oder armv7) und prüft die SHA-256-Prüfsumme,
 2. legt den Benutzer `caddy` an (falls nicht vorhanden), `/var/lib/caddy-sentinel` und bei Bedarf eine Start-Caddyfile,
@@ -27,7 +36,7 @@ Das Skript
 4. richtet `caddy-sentinel.service` ein und hängt einen Override an `caddy.service` an, damit Caddy mit dem Sentinel-Build startet – ein Caddy aus dem Distributionspaket bleibt installiert und wird beim Deinstallieren wieder aktiv,
 5. startet Panel und Caddy und prüft, ob beide laufen.
 
-Optionen (bei `curl | bash` mit `-s --` anhängen, z. B. `| sudo bash -s -- --version v1.2.0`):
+Optionen werden hinten angehängt, z. B. `bash <(wget -qO- …/install.sh) --version v1.2.0`:
 
 | Option | Bedeutung |
 |---|---|
@@ -35,6 +44,9 @@ Optionen (bei `curl | bash` mit `-s --` anhängen, z. B. `| sudo bash -s -- --ve
 | `--listen 0.0.0.0:7600` | Adresse des Panels (Standard `127.0.0.1:7600`) |
 | `--panel-only` | nur das Panel (Caddy läuft auf einem anderen Host) |
 | `--dir PFAD` | Binaries aus einem Verzeichnis statt Download |
+| `--agent --panel URL --token T` | nur Caddy mit Agent für ein bestehendes Panel (siehe unten) |
+| `--reinstall` | trotz vorhandener Installation neu einrichten statt aktualisieren |
+| `--force` | dieselbe Version erneut einspielen |
 | `--no-start` | nur installieren |
 | `-y` | keine Rückfragen |
 
@@ -131,8 +143,8 @@ Caddyfile und Zertifikate bleiben immer erhalten. Vorher die Direktive `sentinel
 Ein Panel kann mehrere Caddy-Server verwalten. Im Panel unter **Caddy-Instanzen › Instanz hinzufügen** Name und Farbe wählen, dann auf dem neuen Server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh \
-  | sudo bash -s -- --agent --panel https://sentinel.example.com --token <TOKEN> --remote full
+bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh) \
+  --agent --panel https://sentinel.example.com --token <TOKEN> --remote full
 ```
 
 Das installiert nur Caddy mit Sentinel-Modul, legt das Token in `/etc/caddy/sentinel-agent.token` ab und verbindet den Server mit dem Panel. Die Verbindung geht immer vom Server zum Panel – dort muss kein Port offen sein, das Panel muss aber vom Server erreichbar sein.
