@@ -39,9 +39,9 @@ jobs:
           - arch: amd64
             cc: gcc
             packages: ''
-          - arch: arm64
-            cc: aarch64-linux-gnu-gcc
-            packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          #- arch: arm64
+          #  cc: aarch64-linux-gnu-gcc
+          #  packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           - arch: armv7
             cc: arm-linux-gnueabihf-gcc
             packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
