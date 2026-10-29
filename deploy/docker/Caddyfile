@@ -1,0 +1,27 @@
+# Caddyfile für den Docker-Betrieb von Caddy Sentinel.
+# Das Panel bearbeitet diese Datei; Änderungen über das Panel übernehmen.
+{
+	# Admin-API nur als Unix-Socket, den sich Caddy und Panel teilen
+	admin unix//run/caddy/admin.sock
+
+	# E-Mail für Let's-Encrypt-Benachrichtigungen
+	# email admin@example.com
+
+	# Echte Client-IP hinter einem weiteren Proxy/Load-Balancer:
+	# servers {
+	# 	trusted_proxies static private_ranges
+	# }
+}
+
+:80 {
+	sentinel
+	respond "Caddy Sentinel läuft – Konfiguration im Panel bearbeiten."
+}
+
+# Beispiel:
+# app.example.com {
+# 	sentinel
+# 	reverse_proxy app:8080
+# }
+
+import sites/*.caddy

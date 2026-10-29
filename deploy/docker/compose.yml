@@ -1,0 +1,54 @@
+# Caddy Sentinel mit Docker Compose
+#
+#   docker compose up -d
+#   Panel: http://127.0.0.1:7600 (nur lokal – von außen per SSH-Tunnel oder
+#          über eine eigene Site in der Caddyfile, siehe docs/INSTALL.md)
+#
+# Update: docker compose pull && docker compose up -d
+name: caddy-sentinel
+
+services:
+  panel:
+    image: ghcr.io/b1tk1ll3r/caddy-sentinel-panel:${SENTINEL_VERSION:-latest}
+    # build: { context: ../.., dockerfile: deploy/docker/Dockerfile, target: panel }
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:7600:7600"
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+    volumes:
+      - sentinel-data:/var/lib/caddy-sentinel
+      - caddy-etc:/etc/caddy
+      - caddy-admin:/run/caddy
+      - caddy-data:/caddy-data:ro
+      # GeoIP-Datenbanken (optional):
+      # - ./geo:/geo:ro
+
+  caddy:
+    image: ghcr.io/b1tk1ll3r/caddy-sentinel:${SENTINEL_VERSION:-latest}
+    # build: { context: ../.., dockerfile: deploy/docker/Dockerfile, target: caddy }
+    restart: unless-stopped
+    depends_on:
+      panel:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+    volumes:
+      - caddy-etc:/etc/caddy
+      - caddy-data:/data
+      - caddy-config:/config
+      - caddy-admin:/run/caddy
+      - sentinel-data:/var/lib/caddy-sentinel:ro
+      # eigene Inhalte für file_server:
+      # - ./www:/srv:ro
+
+volumes:
+  sentinel-data:
+  caddy-etc:
+  caddy-data:
+  caddy-config:
+  caddy-admin:

@@ -1,0 +1,262 @@
+package sentinel
+
+import (
+	"fmt"
+	"net/netip"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/corazawaf/coraza/v3"
+
+	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/protocol"
+	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/wafconf"
+)
+
+// runtimeState is the compiled, immutable form of protocol.State.
+type runtimeState struct {
+	raw        *protocol.State
+	bans       *ipSet[protocol.Ban]
+	trusted    *ipSet[struct{}]
+	policies   map[string]*cpolicy
+	hostExact  map[string]string
+	hostWild   []wildHost
+	defPolicy  string
+	errors     map[string]string
+	wafs       map[string]coraza.WAF // hash -> instance (kept for reuse)
+	challenges *ipSet[protocol.Ban]
+	secret     []byte
+}
+
+type wildHost struct {
+	suffix string // ".example.com"
+	policy string
+}
+
+type cpolicy struct {
+	p          *protocol.Policy
+	allow      *ipSet[struct{}]
+	deny       *ipSet[string]
+	methods    map[string]bool
+	uas        []string
+	honeypots  []string
+	rateLimits []crl
+	waf        coraza.WAF
+	wafMode    string
+	countries  map[string]bool
+	asns       map[int]bool
+	exempt     []string
+	authExempt []string
+	authBypass *ipSet[struct{}]
+	totpSkip   *ipSet[struct{}]
+	rules      []*protocol.CompiledRule
+	anyAuth    bool // policy or a path rule requires a login
+	ssoDomain  string
+}
+
+type crl struct {
+	rl      protocol.RateLimit
+	re      *regexp.Regexp
+	methods map[string]bool
+	window  time.Duration
+}
+
+// compileState compiles s. prev is used to reuse already compiled WAF
+// instances (CRS compilation is expensive).
+func compileState(s *protocol.State, prev *runtimeState) *runtimeState {
+	rs := &runtimeState{
+		raw:        s,
+		bans:       newIPSet[protocol.Ban](),
+		trusted:    newIPSet[struct{}](),
+		policies:   map[string]*cpolicy{},
+		hostExact:  map[string]string{},
+		defPolicy:  s.DefaultPolicy,
+		errors:     map[string]string{},
+		wafs:       map[string]coraza.WAF{},
+		challenges: newIPSet[protocol.Ban](),
+		secret:     challengeSecret(s.ChallengeSecret),
+	}
+	for _, c := range s.Challenges {
+		rs.challenges.add(c.IP, c)
+	}
+	for _, b := range s.Bans {
+		rs.bans.add(b.IP, b)
+	}
+	for _, t := range s.Trusted {
+		rs.trusted.add(t, struct{}{})
+	}
+	for pattern, id := range s.Hosts {
+		pattern = strings.ToLower(strings.TrimSpace(pattern))
+		if strings.HasPrefix(pattern, "*.") {
+			rs.hostWild = append(rs.hostWild, wildHost{pattern[1:], id})
+		} else if pattern != "" {
+			rs.hostExact[pattern] = id
+		}
+	}
+	for id, p := range s.Policies {
+		cp, err := compilePolicy(p, rs, prev)
+		if err != nil {
+			rs.errors[id] = err.Error()
+		}
+		rs.policies[id] = cp
+	}
+	return rs
+}
+
+func compilePolicy(p *protocol.Policy, rs, prev *runtimeState) (*cpolicy, error) {
+	cp := &cpolicy{
+		p:       p,
+		allow:   newIPSet[struct{}](),
+		deny:    newIPSet[string](),
+		methods: map[string]bool{},
+	}
+	var errs []string
+	for _, a := range p.IP.Allow {
+		if !cp.allow.add(a, struct{}{}) {
+			errs = append(errs, "invalid allow entry "+a)
+		}
+	}
+	for _, d := range p.IP.Deny {
+		if !cp.deny.add(d, strings.TrimSpace(d)) {
+			errs = append(errs, "invalid deny entry "+d)
+		}
+	}
+	cp.countries = map[string]bool{}
+	cp.asns = map[int]bool{}
+	for _, c := range p.Geo.Countries {
+		cp.countries[strings.ToUpper(strings.TrimSpace(c))] = true
+	}
+	for _, a := range p.Geo.ASNs {
+		cp.asns[a] = true
+	}
+	cp.exempt = append([]string{"/.well-known/acme-challenge/"}, p.Challenge.ExemptPaths...)
+	cp.authExempt = append([]string{"/.well-known/acme-challenge/"}, p.Auth.ExemptPaths...)
+	cp.authBypass = newIPSet[struct{}]()
+	for _, n := range p.Auth.BypassNetworks {
+		if !cp.authBypass.add(n, struct{}{}) {
+			errs = append(errs, "invalid auth bypass network "+n)
+		}
+	}
+	cp.totpSkip = newIPSet[struct{}]()
+	for _, n := range p.Auth.TOTPSkipNetworks {
+		if !cp.totpSkip.add(n, struct{}{}) {
+			errs = append(errs, "invalid totp skip network "+n)
+		}
+	}
+	cp.anyAuth = p.Auth.Enabled
+	for i := range p.PathRules {
+		cr, err := protocol.CompilePathRule(&p.PathRules[i])
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		cp.rules = append(cp.rules, cr)
+		if p.PathRules[i].Enabled && p.PathRules[i].Auth == "on" {
+			cp.anyAuth = true
+		}
+	}
+	if p.Auth.SSO && p.Auth.CookieDomain != "" {
+		cp.ssoDomain = strings.ToLower(strings.TrimPrefix(p.Auth.CookieDomain, "."))
+	}
+	for _, m := range p.AllowedMethods {
+		cp.methods[strings.ToUpper(strings.TrimSpace(m))] = true
+	}
+	for _, ua := range p.BlockedUserAgents {
+		if ua = strings.ToLower(strings.TrimSpace(ua)); ua != "" {
+			cp.uas = append(cp.uas, ua)
+		}
+	}
+	for _, h := range p.HoneypotPaths {
+		if h = strings.TrimSpace(h); h != "" {
+			cp.honeypots = append(cp.honeypots, h)
+		}
+	}
+	for _, rl := range p.RateLimits {
+		c := crl{rl: rl, methods: map[string]bool{}, window: time.Duration(rl.WindowSeconds) * time.Second}
+		if rl.PathRegex != "" {
+			re, err := regexp.Compile(rl.PathRegex)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("rate limit %q: %v", rl.Name, err))
+				continue
+			}
+			c.re = re
+		}
+		for _, m := range rl.Methods {
+			c.methods[strings.ToUpper(m)] = true
+		}
+		if rl.Requests <= 0 || rl.WindowSeconds <= 0 {
+			continue
+		}
+		cp.rateLimits = append(cp.rateLimits, c)
+	}
+
+	cp.wafMode = p.WAF.Mode
+	if p.WAF.Mode == "detect" || p.WAF.Mode == "block" {
+		h := wafconf.Hash(p.WAF)
+		if w, ok := rs.wafs[h]; ok {
+			cp.waf = w
+		} else if prev != nil && prev.wafs[h] != nil {
+			cp.waf = prev.wafs[h]
+			rs.wafs[h] = cp.waf
+		} else {
+			w, err := wafconf.Build(p.WAF)
+			if err != nil {
+				errs = append(errs, "waf: "+err.Error())
+				// keep the previous instance of this policy if there was one
+				if prev != nil && prev.policies[p.ID] != nil {
+					cp.waf = prev.policies[p.ID].waf
+				}
+			} else {
+				cp.waf = w
+				rs.wafs[h] = w
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return cp, fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return cp, nil
+}
+
+func (rs *runtimeState) policyFor(host, explicit string) *cpolicy {
+	if explicit != "" {
+		if p := rs.policies[explicit]; p != nil {
+			return p
+		}
+	}
+	host = strings.ToLower(host)
+	if id, ok := rs.hostExact[host]; ok {
+		if p := rs.policies[id]; p != nil {
+			return p
+		}
+	}
+	best := ""
+	bestID := ""
+	for _, w := range rs.hostWild {
+		if strings.HasSuffix(host, w.suffix) && len(w.suffix) > len(best) {
+			best, bestID = w.suffix, w.policy
+		}
+	}
+	if bestID != "" {
+		if p := rs.policies[bestID]; p != nil {
+			return p
+		}
+	}
+	return rs.policies[rs.defPolicy]
+}
+
+func (rs *runtimeState) challenged(a netip.Addr, now int64) bool {
+	b, ok := rs.challenges.lookup(a)
+	return ok && (b.Until == 0 || b.Until >= now)
+}
+
+func (rs *runtimeState) banned(a netip.Addr, now int64) (protocol.Ban, bool) {
+	b, ok := rs.bans.lookup(a)
+	if !ok {
+		return b, false
+	}
+	if b.Until != 0 && b.Until < now {
+		return b, false
+	}
+	return b, true
+}

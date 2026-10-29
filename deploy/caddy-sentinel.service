@@ -1,0 +1,35 @@
+[Unit]
+Description=Caddy Sentinel Panel (Editor, Metriken, IDS/IPS, WAF)
+Documentation=https://github.com/b1tk1ll3r/caddy-sentinel
+After=network-online.target
+Wants=network-online.target
+Before=caddy.service
+
+[Service]
+Type=simple
+User=caddy
+Group=caddy
+EnvironmentFile=-/etc/default/caddy-sentinel
+ExecStart=/usr/local/bin/caddy-sentinel
+Restart=on-failure
+RestartSec=3
+
+# Härtung
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/caddy-sentinel /etc/caddy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

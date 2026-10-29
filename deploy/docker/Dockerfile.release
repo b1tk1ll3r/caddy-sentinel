@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+# Images aus den vorgebauten Release-Binaries (dist/linux_<arch>/), wie sie
+# scripts/build-release.sh bzw. die Release-Action erzeugt.
+#
+#   docker buildx build -f deploy/docker/Dockerfile.release --target caddy -t caddy-sentinel .
+#   docker buildx build -f deploy/docker/Dockerfile.release --target panel -t caddy-sentinel-panel .
+
+FROM alpine:3.24 AS base
+ARG VERSION=dev
+RUN apk add --no-cache ca-certificates tzdata libcap-utils mailcap \
+ && addgroup -S -g 1000 caddy \
+ && adduser -S -D -H -u 1000 -G caddy -h /data -s /sbin/nologin caddy
+LABEL org.opencontainers.image.source="https://github.com/b1tk1ll3r/caddy-sentinel" \
+      org.opencontainers.image.version="${VERSION}"
+COPY deploy/docker/Caddyfile /usr/share/caddy-sentinel/Caddyfile.default
+COPY deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# ------------------------------------------------------------------ Caddy
+FROM base AS caddy
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy /usr/bin/caddy
+RUN setcap cap_net_bind_service=+ep /usr/bin/caddy \
+ && mkdir -p /data /config /run/caddy /var/lib/caddy-sentinel /srv /etc/caddy/sites \
+ && chown -R caddy:caddy /data /config /run/caddy /etc/caddy /srv
+ENV XDG_DATA_HOME=/data \
+    XDG_CONFIG_HOME=/config \
+    SENTINEL_PANEL=http://panel:7600 \
+    SENTINEL_TOKEN_FILE=/var/lib/caddy-sentinel/agent.token
+USER caddy
+EXPOSE 80 443 443/udp
+VOLUME ["/data", "/config"]
+WORKDIR /srv
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+  CMD test -S /run/caddy/admin.sock || wget -q -O /dev/null http://127.0.0.1:2019/config/
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+
+# ------------------------------------------------------------------ Panel
+FROM base AS panel
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy-sentinel /usr/bin/caddy-sentinel
+# Caddy-Binary für "caddy validate"/"caddy fmt" im Editor
+COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy /usr/bin/caddy
+RUN mkdir -p /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy \
+ && chown -R caddy:caddy /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data
+ENV SENTINEL_LISTEN=0.0.0.0:7600 \
+    SENTINEL_DATA=/var/lib/caddy-sentinel \
+    SENTINEL_CADDY_ADMIN=unix//run/caddy/admin.sock \
+    SENTINEL_CADDYFILE=/etc/caddy/Caddyfile \
+    SENTINEL_CADDY_BIN=/usr/bin/caddy \
+    SENTINEL_CADDY_DATA=/caddy-data/caddy \
+    XDG_DATA_HOME=/data
+USER caddy
+EXPOSE 7600
+VOLUME ["/var/lib/caddy-sentinel"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD wget -q -O /dev/null http://127.0.0.1:7600/api/auth/state || exit 1
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh", "/usr/bin/caddy-sentinel"]

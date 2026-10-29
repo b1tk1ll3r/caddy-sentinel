@@ -1,0 +1,190 @@
+name: Release
+
+# Ein Tag "v1.2.3" baut alle Binaries, erstellt das GitHub-Release und
+# veröffentlicht die Docker-Images auf ghcr.io. Manuell startbar, z. B. um
+# mit einer neueren Caddy-Version neu zu bauen.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versions-Tag (muss existieren, z. B. v1.2.3)'
+        required: true
+      caddy_version:
+        description: 'Caddy-Version (leer = aus go.mod, "latest" = neueste)'
+        required: false
+        default: 'latest'
+      upgrade_waf:
+        description: 'Coraza und OWASP CRS auf die neueste Version heben'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+  CADDY_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.caddy_version || vars.CADDY_VERSION || 'latest' }}
+  UPGRADE_WAF: ${{ (github.event_name != 'workflow_dispatch' || inputs.upgrade_waf) && '1' || '0' }}
+
+jobs:
+  build:
+    name: Build linux/${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            cc: gcc
+            packages: ''
+          - arch: arm64
+            cc: aarch64-linux-gnu-gcc
+            packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          - arch: armv7
+            cc: arm-linux-gnueabihf-gcc
+            packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: '**/go.mod'
+
+      - name: Cross-Compiler
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
+      - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
+          CC: ${{ matrix.cc }}
+        run: ./scripts/build-release.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/linux_${{ matrix.arch }}/
+          retention-days: 3
+
+  release:
+    name: GitHub-Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Prüfsummen
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Caddy Sentinel ${{ env.VERSION }}
+          generate_release_notes: true
+          prerelease: ${{ contains(env.VERSION, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  docker:
+    name: Docker-Images
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Ausführbar machen
+        run: chmod +x dist/linux_*/*
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image-Namen
+        id: names
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "caddy=ghcr.io/$owner/caddy-sentinel" >> "$GITHUB_OUTPUT"
+          echo "panel=ghcr.io/$owner/caddy-sentinel-panel" >> "$GITHUB_OUTPUT"
+
+      - id: meta-caddy
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.caddy }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.VERSION }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.VERSION }}
+            type=raw,value=latest,enable=${{ !contains(env.VERSION, '-') }}
+
+      - id: meta-panel
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.panel }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.VERSION }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.VERSION }}
+            type=raw,value=latest,enable=${{ !contains(env.VERSION, '-') }}
+
+      - name: Caddy-Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.release
+          target: caddy
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta-caddy.outputs.tags }}
+          labels: ${{ steps.meta-caddy.outputs.labels }}
+          build-args: VERSION=${{ env.VERSION }}
+          cache-from: type=gha,scope=caddy
+          cache-to: type=gha,mode=max,scope=caddy
+
+      - name: Panel-Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.release
+          target: panel
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta-panel.outputs.tags }}
+          labels: ${{ steps.meta-panel.outputs.labels }}
+          build-args: VERSION=${{ env.VERSION }}
+          cache-from: type=gha,scope=panel
+          cache-to: type=gha,mode=max,scope=panel

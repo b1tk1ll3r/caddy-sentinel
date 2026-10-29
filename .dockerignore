@@ -1,0 +1,5 @@
+.git
+**/node_modules
+*.db
+dist/*.tar.gz
+dist/*.sha256
