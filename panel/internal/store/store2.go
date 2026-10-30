@@ -104,6 +104,11 @@ CREATE INDEX IF NOT EXISTS requests_cc ON requests(cc, ts);
 	if err := s.migrateIdentity(); err != nil {
 		return err
 	}
+	// sessions from versions that stored the raw cookie value: invalid now
+	// (stored hashed), remove them – users sign in once more
+	if _, err := s.DB.Exec(`DELETE FROM sessions WHERE token NOT LIKE 'h:%'`); err != nil {
+		return err
+	}
 	return s.migrateAgg()
 }
 
@@ -186,7 +191,7 @@ func (s *Store) UserSessions(uid int64) ([]Session, error) {
 		if err := rows.Scan(&x.Token, &x.UserID, &x.Created, &x.Expires, &x.IP, &x.UA); err != nil {
 			return nil, err
 		}
-		x.ID = x.Token[:12]
+		x.ID = strings.TrimPrefix(x.Token, "h:")[:12]
 		out = append(out, x)
 	}
 	return out, rows.Err()
@@ -196,7 +201,7 @@ func (s *Store) DeleteSessionByPrefix(uid int64, prefix string) error {
 	if len(prefix) < 12 {
 		return errors.New("invalid session id")
 	}
-	_, err := s.Exec(`DELETE FROM sessions WHERE user_id=? AND substr(token,1,12)=?`, uid, prefix)
+	_, err := s.Exec(`DELETE FROM sessions WHERE user_id=? AND substr(token,3,12)=?`, uid, prefix)
 	return err
 }
 

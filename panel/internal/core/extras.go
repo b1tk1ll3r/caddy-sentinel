@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/b1tk1ll3r/caddy-sentinel/panel/internal/caddyx"
+	"github.com/b1tk1ll3r/caddy-sentinel/panel/internal/legal"
 	"github.com/b1tk1ll3r/caddy-sentinel/panel/internal/store"
 	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/geoip"
 )
@@ -45,6 +46,22 @@ func (e *Engine) GeoLookup(ip string) geoip.Result {
 		return geoip.Result{}
 	}
 	return e.geo.Load().Lookup(a)
+}
+
+// handleLegal: licence, NOTICE and third-party licences (all signed-in users).
+func (s *Server) handleLegal(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{
+		"license":     legal.License,
+		"notice":      legal.Notice(),
+		"third_party": legal.ThirdParty(),
+		"geo_credits": s.e.GeoCredits(),
+		"version":     Version,
+	})
+}
+
+// GeoCredits lists the attributions required by the loaded GeoIP databases.
+func (e *Engine) GeoCredits() []geoip.Credit {
+	return e.geo.Load().Credits()
 }
 
 func (e *Engine) GeoStatus() string {
@@ -541,6 +558,8 @@ func sendMailParts(cfg SMTPConfig, to []string, subject, body, html string) erro
 		if err != nil {
 			return err
 		}
+		// a server that accepts but never answers must not block the notifier
+		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 		c, err = smtp.NewClient(conn, cfg.Host)
 		if err != nil {
 			return err
@@ -550,6 +569,7 @@ func sendMailParts(cfg SMTPConfig, to []string, subject, body, html string) erro
 		if err != nil {
 			return err
 		}
+		_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 		c, err = smtp.NewClient(conn, cfg.Host)
 		if err != nil {
 			return err

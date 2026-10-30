@@ -194,7 +194,8 @@ Aufbau:
 | `caddy-etc` | `/etc/caddy` | `/etc/caddy` | Caddyfile, vom Panel bearbeitet |
 | `caddy-admin` | `/run/caddy` | `/run/caddy` | Admin-API als Unix-Socket – kein offener Port |
 | `caddy-data` | `/data` | `/caddy-data` (nur lesend) | Zertifikate, interne CA |
-| `sentinel-data` | `/var/lib/caddy-sentinel` (nur lesend) | `/var/lib/caddy-sentinel` | Datenbank, Agent-Token |
+| `sentinel-data` | – | `/var/lib/caddy-sentinel` | Datenbank des Panels |
+| `sentinel-token` | `/run/sentinel-token` (nur lesend) | `/run/sentinel-token` | nur das Agent-Token – Caddy sieht die Datenbank nicht |
 
 Beide Container laufen als Benutzer `1000:1000`, Caddy darf trotzdem Port 80/443 öffnen (`cap_net_bind_service`). Beim ersten Start wird eine Standard-Caddyfile angelegt; sie enthält `admin unix//run/caddy/admin.sock` – diese Zeile muss bleiben, damit das Panel Caddy steuern kann.
 

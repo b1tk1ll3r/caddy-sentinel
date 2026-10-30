@@ -15,6 +15,7 @@
 #   CADDY_VERSION  leer = Version aus go.mod, sonst z. B. "latest" oder "v2.11.0"
 #   UPGRADE_WAF=1  Coraza und OWASP CRS auf die neueste Version heben
 #   SKIP_TESTS=1   Tests überspringen
+#   RESOLVE_ONLY=1 nur Versionen auflösen und testen, nichts bauen
 #   OUT            Ausgabeverzeichnis (Standard: ./dist)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -69,18 +70,39 @@ done
 for d in sentinel caddy panel; do (cd "$d" && retry host_go mod download); done
 
 if [ "${SKIP_TESTS:-0}" != 1 ] && [ "$GOARCH" = "$(GOOS= GOARCH= go env GOARCH)" ]; then
-  echo "==> Tests"
-  (cd sentinel && GOOS= GOARCH= GOARM= go test ./...)
-  (cd panel && GOOS= GOARCH= GOARM= go vet ./...)
+  echo "==> Tests (mit den aufgelösten Versionen)"
+  (cd sentinel && GOOS= GOARCH= GOARM= go vet ./... && GOOS= GOARCH= GOARM= go test ./...)
+  (cd panel && GOOS= GOARCH= GOARM= CGO_ENABLED=1 go vet ./... && GOOS= GOARCH= GOARM= CGO_ENABLED=1 go test ./...)
 fi
 
+# RESOLVE_ONLY=1: nur Versionen auflösen und testen (CI-Job "resolve"); die
+# go.mod/go.sum-Dateien geben dann allen Architekturen dieselben Versionen vor
+if [ "${RESOLVE_ONLY:-0}" = 1 ]; then
+  echo "==> Aufgelöste Versionen"
+  (cd caddy && host_go list -m github.com/caddyserver/caddy/v2 github.com/corazawaf/coraza/v3 github.com/corazawaf/coraza-coreruleset/v4)
+  exit 0
+fi
+
+# Coraza-Operator @inspectFile (startet externe Programme) nicht mitbauen
+WAF_TAGS="coraza.disabled_operators.inspectFile"
+
+echo "==> Lizenzen der enthaltenen Module"
+# Erst jetzt steht fest, welche Versionen gebaut werden (CADDY_VERSION,
+# UPGRADE_WAF). Die Liste wird ins Panel eingebettet und liegt dem Archiv bei.
+(cd tools/licenses && GOOS= GOARCH= GOARM= CGO_ENABLED=0 go build -o "$OUT/.licenses" .)
+LEGAL="$ROOT/panel/internal/legal/data/THIRD_PARTY_LICENSES.txt"
+CGO_ENABLED=1 "$OUT/.licenses" -o "$LEGAL" "$ROOT/caddy" "$ROOT/panel:sqlite_omit_load_extension,osusergo,netgo"
+cp "$LEGAL" "$BIN/THIRD_PARTY_LICENSES.txt"
+cp NOTICE "$ROOT/panel/internal/legal/data/NOTICE" # im Panel angezeigt
+rm -f "$OUT/.licenses"
+
 echo "==> Caddy"
-(cd caddy && CGO_ENABLED=0 go build -trimpath \
+(cd caddy && CGO_ENABLED=0 go build -trimpath -tags "$WAF_TAGS" \
   -ldflags "-s -w -X ${MOD}/sentinel.Version=${VERSION}" -o "$BIN/caddy" .)
 
 echo "==> Panel (statisch, SQLite)"
 (cd panel && CGO_ENABLED=1 go build -trimpath \
-  -tags 'sqlite_omit_load_extension osusergo netgo' \
+  -tags "sqlite_omit_load_extension osusergo netgo $WAF_TAGS" \
   -ldflags "-s -w -X ${MOD}/panel/internal/core.Version=${VERSION} -linkmode external -extldflags '-static'" \
   -o "$BIN/caddy-sentinel" .)
 
@@ -96,7 +118,7 @@ cp -r deploy "$STAGE/deploy"
 rm -rf "$STAGE/deploy/docker" "$STAGE/deploy/install.sh"
 cp scripts/install.sh scripts/update.sh scripts/uninstall.sh "$STAGE/"
 chmod 0755 "$STAGE/install.sh" "$STAGE/update.sh" "$STAGE/uninstall.sh"
-cp README.md "$STAGE/"
+cp README.md LICENSE NOTICE AUTHORS "$BIN/THIRD_PARTY_LICENSES.txt" "$STAGE/"
 cp -r docs "$STAGE/docs"
 echo "$VERSION" > "$STAGE/VERSION"
 tar -C "$OUT" -czf "$OUT/$NAME.tar.gz" "$NAME"

@@ -1,0 +1,21 @@
+Caddy Sentinel
+Copyright 2026 Die Caddy-Sentinel-Autoren (siehe AUTHORS)
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Die Release-Programme "caddy" und "caddy-sentinel" enthalten Software Dritter,
+u. a.:
+
+  - Caddy (Apache-2.0), Copyright 2015 Matthew Holt and The Caddy Authors
+  - Coraza WAF (Apache-2.0), Copyright 2022 Juan Pablo Tosso and the OWASP Coraza
+    contributors
+  - OWASP CRS (Apache-2.0), Copyright (c) 2006-2020 Trustwave and contributors,
+    Copyright (c) 2021-2026 CRS project
+  - CodeMirror 6 (MIT), Copyright Marijn Haverbeke and others
+  - go-sqlite3 (MIT), Copyright (c) 2014 Yasuhiro Matsumoto, mit SQLite
+    (Public Domain)
+
+Die vollständige Liste mit allen Lizenztexten und den NOTICE-Dateien der
+enthaltenen Komponenten steht in THIRD_PARTY_LICENSES.txt (im Release-Archiv,
+nach der Installation unter /usr/local/share/doc/caddy-sentinel/ und im Panel
+unter Einstellungen › Über & Lizenzen).

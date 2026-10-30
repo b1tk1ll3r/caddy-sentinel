@@ -1,0 +1,9 @@
+OWASP CRS – Core Rule Set (WAF-Regeln, über coraza-coreruleset eingebettet) – Apache-2.0
+
+Copyright (c) 2006-2020 Trustwave and contributors. All rights reserved.
+Copyright (c) 2021-2026 CRS project. All rights reserved.
+
+The OWASP CRS is distributed under Apache Software License (ASL) version 2.
+https://coreruleset.org/ – Quelltext: https://github.com/coreruleset/coreruleset
+Den Lizenztext enthält der Abschnitt "Apache License 2.0" weiter unten
+(github.com/corazawaf/coraza-coreruleset/v4).

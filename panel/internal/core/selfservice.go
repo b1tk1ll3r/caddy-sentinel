@@ -8,6 +8,7 @@ package core
 // session cookie and forwards the steps to /api/agent/auth.
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,10 +17,12 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/b1tk1ll3r/caddy-sentinel/panel/internal/caddyx"
 	"github.com/b1tk1ll3r/caddy-sentinel/panel/internal/store"
 	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/protocol"
 )
@@ -465,6 +468,13 @@ func (e *Engine) passwordReset(req protocol.AuthRequest, a protocol.AuthPolicy) 
 		if e.Store.RecentPWResets(u.Username, time.Now().Add(-15*time.Minute).Unix()) >= 3 {
 			return generic
 		}
+		// The link is built from the Host the client sent. On a catch-all or
+		// wildcard site that could be any name – only mail links to hosts
+		// Caddy actually serves by name.
+		if !e.siteHostKnown(req.Inst, req.Host) {
+			e.access(req, u.Username, "reset", "Passwort-Reset abgelehnt – Host „"+truncateStr(req.Host, 80)+"“ ist keine konfigurierte Site")
+			return generic
+		}
 		tok := RandomToken(24)
 		if err := e.Store.CreatePWReset(resetTokenHash(tok), store.PWReset{Username: u.Username, Host: req.Host, Policy: req.Policy,
 			Expires: time.Now().Add(time.Duration(e.resetMinutes()) * time.Minute).Unix()}); err != nil {
@@ -553,4 +563,49 @@ func (e *Engine) resetMinutes() int {
 func mustJSONDetail(text string) []byte {
 	b, _ := json.Marshal(map[string]string{"message": text})
 	return b
+}
+
+var siteHostCache sync.Map // inst -> siteHosts
+
+type siteHosts struct {
+	at    time.Time
+	hosts []string
+}
+
+// siteHostKnown reports whether host is a site address in the running Caddy
+// config of inst (exact name or "*.domain" wildcard).
+func (e *Engine) siteHostKnown(inst, host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return false
+	}
+	if inst == "" {
+		inst = LocalInstance
+	}
+	var hs []string
+	if v, ok := siteHostCache.Load(inst); ok && time.Since(v.(siteHosts).at) < time.Minute {
+		hs = v.(siteHosts).hosts
+	} else {
+		t, err := e.target(inst)
+		if err != nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cfg, err := t.Admin().Config(ctx)
+		if err != nil {
+			return false
+		}
+		for _, st := range caddyx.SitesFromJSON(cfg) {
+			hs = append(hs, st.Hosts...)
+		}
+		siteHostCache.Store(inst, siteHosts{time.Now(), hs})
+	}
+	for _, h := range hs {
+		h = strings.ToLower(h)
+		if h == host || (strings.HasPrefix(h, "*.") && strings.HasSuffix(host, h[1:]) && !strings.Contains(strings.TrimSuffix(host, h[1:]), ".")) {
+			return true
+		}
+	}
+	return false
 }

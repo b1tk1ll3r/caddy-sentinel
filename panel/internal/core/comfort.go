@@ -540,7 +540,9 @@ func (s *Server) handleSiteWizard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !req.Apply {
+		s.e.cfgMu.Lock() // shares the staging directory with apply/validate
 		res, err := s.e.Validate(r.Context(), inst, map[string]string{file: content}, false)
+		s.e.cfgMu.Unlock()
 		if err != nil {
 			writeErr(w, 502, err.Error())
 			return

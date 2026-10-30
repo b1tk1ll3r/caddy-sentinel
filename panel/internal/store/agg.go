@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS agg_fail (
 	paths   BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS agg_fail_hour ON agg_fail(hour);
+CREATE TABLE IF NOT EXISTS ingest_batches (
+	id TEXT PRIMARY KEY,
+	ts INTEGER NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS agg_done (
 	hour INTEGER PRIMARY KEY,
 	rows INTEGER NOT NULL,
@@ -326,6 +330,16 @@ func (s *Store) RollupHour(ctx context.Context, hour int64) (int, error) {
 			if _, err := sf.Exec(hour, k.inst, k.host, k.policy, k.action, k.detail, k.rule, k.port, k.status, f.count, f.first, f.last, f.maxID, f.ips[:], f.paths[:]); err != nil {
 				return err
 			}
+		}
+		// Rows that arrived while the hour was being read (late agent
+		// batches) are not in this result: leave the hour pending so the next
+		// round includes them.
+		var now int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM requests WHERE ts>=? AND ts<?`, hour, hour+hourMs).Scan(&now); err != nil {
+			return err
+		}
+		if now != n {
+			return nil
 		}
 		_, err = tx.Exec(`INSERT INTO agg_done(hour,rows,at) VALUES(?,?,?) ON CONFLICT(hour) DO UPDATE SET rows=excluded.rows, at=excluded.at`, hour, n, time.Now().Unix())
 		return err

@@ -20,20 +20,23 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
  && apk add --no-cache bash \
  && VERSION="$VERSION" ARCH="$ARCH" CADDY_VERSION="$CADDY_VERSION" UPGRADE_WAF="$UPGRADE_WAF" SKIP_TESTS=1 OUT=/out \
     bash scripts/build-release.sh \
- && mkdir -p /out/bin && cp /out/linux_*/caddy /out/linux_*/caddy-sentinel /out/bin/
+ && mkdir -p /out/bin && cp /out/linux_*/caddy /out/linux_*/caddy-sentinel /out/linux_*/THIRD_PARTY_LICENSES.txt /out/bin/
 
-FROM alpine:3.24 AS base
+FROM alpine:3.22 AS base
 RUN apk add --no-cache ca-certificates tzdata libcap-utils mailcap \
  && addgroup -S -g 1000 caddy \
  && adduser -S -D -H -u 1000 -G caddy -h /data -s /sbin/nologin caddy
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+COPY LICENSE NOTICE AUTHORS /usr/share/doc/caddy-sentinel/
 COPY deploy/docker/Caddyfile /usr/share/caddy-sentinel/Caddyfile.default
 COPY deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 FROM base AS caddy
 COPY --from=build /out/bin/caddy /usr/bin/caddy
+COPY --from=build /out/bin/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
 RUN setcap cap_net_bind_service=+ep /usr/bin/caddy \
- && mkdir -p /data /config /run/caddy /var/lib/caddy-sentinel /srv /etc/caddy/sites \
- && chown -R caddy:caddy /data /config /run/caddy /etc/caddy /srv
+ && mkdir -p /data /config /run/caddy /run/sentinel-token /var/lib/caddy-sentinel /srv /etc/caddy/sites \
+ && chown -R caddy:caddy /data /config /run/caddy /run/sentinel-token /etc/caddy /srv
 ENV XDG_DATA_HOME=/data XDG_CONFIG_HOME=/config \
     SENTINEL_PANEL=http://panel:7600 SENTINEL_TOKEN_FILE=/var/lib/caddy-sentinel/agent.token
 USER caddy
@@ -48,8 +51,9 @@ CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile
 FROM base AS panel
 COPY --from=build /out/bin/caddy-sentinel /usr/bin/caddy-sentinel
 COPY --from=build /out/bin/caddy /usr/bin/caddy
-RUN mkdir -p /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy \
- && chown -R caddy:caddy /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data
+COPY --from=build /out/bin/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
+RUN mkdir -p /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy \
+ && chown -R caddy:caddy /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data
 ENV SENTINEL_LISTEN=0.0.0.0:7600 SENTINEL_DATA=/var/lib/caddy-sentinel \
     SENTINEL_CADDY_ADMIN=unix//run/caddy/admin.sock SENTINEL_CADDYFILE=/etc/caddy/Caddyfile \
     SENTINEL_CADDY_BIN=/usr/bin/caddy SENTINEL_CADDY_DATA=/caddy-data/caddy XDG_DATA_HOME=/data

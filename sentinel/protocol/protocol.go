@@ -286,6 +286,8 @@ type AuthPolicy struct {
 
 // AuthRequest is sent by the agent to /api/agent/auth for a login step.
 type AuthRequest struct {
+	// Inst is set by the panel to the calling instance (never sent).
+	Inst   string `json:"-"`
 	Policy string `json:"policy"`
 	Rule   string `json:"rule,omitempty"` // path rule that applies to the target URL
 	Host   string `json:"host"`
@@ -359,6 +361,9 @@ type AuthUser struct {
 	Display string   `json:"d,omitempty"`
 	Email   string   `json:"e,omitempty"`
 	Groups  []string `json:"g,omitempty"` // group CNs
+	// Source of the account (directory | local | oidc:<id>); stored in the
+	// session so an SSO cookie only opens sites that accept this source.
+	Source string `json:"src,omitempty"`
 }
 
 // SourceAllowed reports whether policy a accepts logins from source
@@ -506,7 +511,14 @@ type Ingest struct {
 	// (independent of sampling), keyed "host|policy|status|action".
 	Counters []Counter `json:"counters"`
 	Dropped  int64     `json:"dropped"`
+	// Batch identifies this batch; a retry after a timeout carries the same
+	// ID so the panel does not store it twice.
+	Batch string `json:"batch,omitempty"`
 }
+
+// MaxBatchRequests is the most request records the agent sends at once
+// (keeps a batch well below the panel's 16 MB body limit).
+const MaxBatchRequests = 2000
 
 type Counter struct {
 	Host    string  `json:"h"`

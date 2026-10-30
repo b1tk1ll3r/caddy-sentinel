@@ -237,7 +237,8 @@ function buildShell(status) {
     el('div.nav-foot', null,
       el('div.row', null, el('span.dot#caddy-dot'), el('span#caddy-label', null, 'Caddy')),
       el('div.row', null, el('span.dot#agent-dot'), el('span#agent-label', null, 'Agent')),
-      el('div.row#version-row', null, el('small.muted', null, 'Version ' + (status.version || '?'))),
+      el('div.row#version-row', null, el('small.muted', null, 'Version ' + (status.version || '?')), el('a.muted', { href: '#/settings?tab=about', style: { marginLeft: '6px', fontSize: '.8em' } }, 'Lizenzen')),
+      (status.geo_credits || []).length ? el('div.row', null, el('small.muted', null, 'IP-Geodaten: ', status.geo_credits.map((c, i) => [i ? ' · ' : '', el('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.text)]))) : null,
       el('div.row', null, el('span.muted', null, status.user?.username || ''), status.user?.role && status.user.role !== 'admin' ? el('span.badge', { title: 'Rolle im Panel' }, roleLabel(status.user.role)) : null, el('button.icon-btn', {
         style: { marginLeft: 'auto' }, title: 'Abmelden', onclick: async () => { await post('/auth/logout'); location.hash = '#/'; start(); },
       }, 'Abmelden'))));

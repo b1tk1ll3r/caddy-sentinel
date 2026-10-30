@@ -288,4 +288,48 @@ AD-Passwörter werden nicht gespeichert; das Panel prüft sie bei jeder Anmeldun
 - Gespeicherte Geheimnisse (SMTP-, LDAP-Dienstkonto-Passwort, OAuth-Client-Secrets, Webhook-Tokens) gibt die API nicht mehr aus; leere Felder behalten den gespeicherten Wert.
 - Panel-API per Token: `curl -H "Authorization: Bearer spt_…" https://<panel>/api/status` (Tokens unter *Einstellungen › API-Tokens*).
 - Das Panel zeigt in der Seitenleiste neue Releases an (GitHub, alle 6 Stunden; `SENTINEL_UPDATE_CHECK=0` schaltet das ab).
-- Getestet in dieser Umgebung mit Caddy 2.10.0, Coraza 3.3.3 und CRS 4.25 (Go 1.24); `build.sh` baut standardmäßig gegen die neuesten Versionen.
+- Getestet mit Caddy 2.10.0, Coraza 3.3.3 und 3.8.1 sowie CRS 4.25 (Go 1.24/1.25). Releases bauen gegen die jeweils neuesten Versionen. Ein CI-Job testet genau diese Kombination, und der Release-Workflow löst die Versionen einmal auf, testet sie und baut alle Architekturen mit demselben Stand.
+
+## Sicherheit
+
+- **Pfade werden normalisiert**, bevor Regeln greifen: `/a/../b`, `//b` und `/./b` gelten als `/b`. Diese Form bekommt auch das Backend. So kommt niemand über Ausnahmen wie `/.well-known/acme-challenge/../admin` am Login oder an Pfadregeln vorbei. Kodierte Pfade (`%2F`) bleiben unverändert.
+- **Identitäts-Header** (`Remote-User` usw.) entfernt Sentinel auf Sites mit Login immer aus Client-Anfragen. Das gilt auch für vertrauenswürdige Quellen und solange noch kein Zustand vom Panel vorliegt.
+- **SSO-Cookies** öffnen nur Sites, die die Anmeldequelle des Kontos zulassen (AD, Zugangskonto, OIDC-Anbieter).
+- **Eigene WAF-Regeln** dürfen nur Regel-Direktiven enthalten: `SecRule`, `SecAction`, `SecMarker`, `SecRuleRemove…`, `SecRuleUpdate…` und `SecDefaultAction`. Alles, was Dateien schreibt (`SecDebugLog`, `SecAuditLog`, `Sec…Dir`), Code nachlädt (`SecRemoteRules`, `Include`) oder Programme startet (`@inspectFile`), wird abgelehnt. `@inspectFile` ist in den Release-Builds außerdem gar nicht enthalten (Build-Tag `coraza.disabled_operators.inspectFile`).
+- **Rollen**: Leser dürfen Caddyfiles nicht mehr über Caddy prüfen lassen, denn das würde Umgebungsvariablen und lesbare Dateien preisgeben. Globale „vertrauenswürdige Quellen“ darf nur ein Administrator freigeben, auch zeitlich begrenzt.
+- **Panel hinter einem Reverse-Proxy**: Die echte Client-IP übernimmt das Panel nur von Proxys in `SENTINEL_TRUSTED_PROXIES` (Standard: localhost). Fehlversuche zählt es pro IP (10 in 15 Minuten) und pro Konto (30 in 15 Minuten).
+- **Panel-Sitzungen** speichert das Panel nur noch als Hash. Nach dem Update auf diese Version muss sich jeder einmal neu anmelden.
+- **Passwort-Reset**: Die Mail wird nur verschickt, wenn der Host der Anfrage als Site-Adresse in Caddy steht (z. B. `wiki.example.com` oder `*.example.com`). Auf einer reinen Catch-all-Site (`:80`) gibt es keinen Reset-Link, sonst ließe sich der Link über den Host-Header auf eine fremde Domain umlenken.
+- **Ratelimits** zählen IPv6-Clients pro /64-Netz. Der Speicher des Ratelimiters ist begrenzt.
+- **Agent ↔ Panel**: Der Agent schickt höchstens 2.000 Einträge pro Stapel, jeweils mit einer ID. Wiederholte Stapel speichert das Panel kein zweites Mal. Lehnt das Panel einen Stapel dauerhaft ab, verwirft der Agent ihn, statt alle späteren Daten dahinter zu blockieren.
+- **Docker**: Caddy bekommt nur das Agent-Token (Volume `sentinel-token`), nicht mehr die Datenbank des Panels.
+
+Bekannte Grenzen:
+- Alle Caddy-Instanzen teilen das Geheimnis, mit dem Site-Sitzungen signiert werden. Wer eine Instanz kompromittiert, kann Sitzungen für alle Sites ausstellen. Instanzen deshalb wie das Panel selbst schützen.
+- Abmelden löscht das Cookie, macht eine kopierte Sitzung aber nicht ungültig. Dafür gibt es „Auf allen Geräten abmelden“.
+- Die Sicherung (*Einstellungen › Sicherung*) enthält gespeicherte Geheimnisse (SMTP, LDAP, OAuth) im Klartext. Sie gehört entsprechend geschützt abgelegt.
+- Hinter einem TLS-terminierenden Load Balancer vor Caddy setzt Sentinel Cookies ohne `Secure`. TLS also möglichst in Caddy terminieren.
+
+## Lizenz
+
+Caddy Sentinel steht unter der **Apache License 2.0** – siehe [`LICENSE`](LICENSE) und [`NOTICE`](NOTICE). Rechteinhaber sind „Die Caddy-Sentinel-Autoren“ ([`AUTHORS`](AUTHORS)).
+
+**Enthaltene Software Dritter.** Die Release-Programme bündeln Caddy, Coraza, das OWASP CRS, CodeMirror, SQLite und rund 150 weitere Go-Module. Alle stehen unter freizügigen Lizenzen (Apache-2.0, MIT, BSD, ISC, CC0). Eine Ausnahme ist der MySQL-Treiber aus Caddys Standardmodulen: Er steht unter MPL-2.0, einem dateibezogenen Copyleft, und ist unverändert enthalten. Sein Quelltext ist öffentlich verfügbar. Die vollständige Liste mit allen Lizenztexten und NOTICE-Dateien liegt an diesen Stellen:
+
+- im Release-Archiv und im Docker-Image als `THIRD_PARTY_LICENSES.txt` (Image: `/usr/share/doc/caddy-sentinel/`),
+- nach der Installation unter `/usr/local/share/doc/caddy-sentinel/`,
+- im Panel unter *Einstellungen › Über & Lizenzen*.
+
+Erzeugt wird die Liste beim Release-Build von [`tools/licenses`](tools/licenses). Das Werkzeug liest die Module, die tatsächlich eingebaut werden, mit `go list -deps` aus. Weil `CADDY_VERSION=latest` und `UPGRADE_WAF=1` die Versionen beim Bauen ändern, passt die Liste so immer zum Build. Findet das Werkzeug für ein neues Modul keine Lizenz, meldet die CI eine Warnung. Dann gehört das Modul in `tools/licenses` (Tabelle `borrow` oder `extra/`).
+
+**Externe Daten, die nicht mitgeliefert werden.** GeoIP-Datenbanken und Threat-Feeds lädt der Betreiber selbst. Es gelten die Bedingungen der Anbieter:
+
+| Quelle | Bedingungen | Pflicht für den Betreiber |
+|---|---|---|
+| DB-IP Lite (Country/ASN) | [CC BY 4.0](https://db-ip.com/db/lite.php) | Quellenangabe „IP Geolocation by DB-IP“ mit Link, wo die Daten angezeigt werden – das Panel blendet sie automatisch in der Seitenleiste ein |
+| MaxMind GeoLite2 | GeoLite2 EULA (Konto nötig) | Quellenangabe „This product includes GeoLite2 data created by MaxMind …“ – ebenfalls automatisch; Datenbank regelmäßig aktualisieren (EULA) |
+| Spamhaus DROP | kostenlos nach den [DROP-Bedingungen](https://www.spamhaus.org/drop/terms/) | Liste nicht weitergeben; den Namen „Spamhaus“ nicht werblich verwenden |
+| abuse.ch Feodo Tracker | CC0, auch kommerziell ([Bedingungen](https://abuse.ch/terms-of-use/)) | – |
+| blocklist.de, Emerging Threats, FireHOL Level 1, Tor-Exit-Liste | Bedingungen der Anbieter | vor kommerzieller Nutzung prüfen |
+
+Beiträge werden unter derselben Lizenz angenommen (Apache-2.0, Abschnitt 5).

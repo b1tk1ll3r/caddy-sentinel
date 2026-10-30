@@ -1,7 +1,9 @@
 package sentinel
 
 import (
+	"crypto/sha256"
 	"hash/maphash"
+	"sort"
 	"sync"
 	"time"
 )
@@ -40,6 +42,9 @@ func (rl *rateLimiter) allow(key string, limit int, window time.Duration, now ti
 	if limit <= 0 || window <= 0 {
 		return true, 0, 0
 	}
+	// fixed-size keys: paths and header values are attacker-controlled
+	sum := sha256.Sum256([]byte(key))
+	key = string(sum[:16])
 	sh := &rl.shards[maphash.String(rl.seed, key)%uint64(len(rl.shards))]
 	n := now.UnixNano()
 	w := int64(window)
@@ -48,6 +53,9 @@ func (rl *rateLimiter) allow(key string, limit int, window time.Duration, now ti
 	defer sh.mu.Unlock()
 	e := sh.m[key]
 	if e == nil || e.window != w {
+		if e == nil && len(sh.m) >= maxRLEntriesPerShard {
+			sh.evict(n)
+		}
 		e = &rlEntry{windowStart: n - n%w, window: w}
 		sh.m[key] = e
 	}
@@ -72,6 +80,33 @@ func (rl *rateLimiter) allow(key string, limit int, window time.Duration, now ti
 	}
 	e.curr++
 	return true, int(estimate) + 1, 0
+}
+
+// maxRLEntriesPerShard bounds memory (64 shards ≈ 3.2 M keys, ~300 MB worst case).
+const maxRLEntriesPerShard = 50000
+
+// evict makes room in a full shard: expired entries first, otherwise the
+// least recently seen eighth. Called with sh.mu held.
+func (sh *rlShard) evict(n int64) {
+	for k, e := range sh.m {
+		if n-e.lastSeen > 2*e.window {
+			delete(sh.m, k)
+		}
+	}
+	if len(sh.m) < maxRLEntriesPerShard {
+		return
+	}
+	seen := make([]int64, 0, len(sh.m))
+	for _, e := range sh.m {
+		seen = append(seen, e.lastSeen)
+	}
+	sort.Slice(seen, func(i, j int) bool { return seen[i] < seen[j] })
+	cut := seen[len(seen)/8]
+	for k, e := range sh.m {
+		if e.lastSeen <= cut {
+			delete(sh.m, k)
+		}
+	}
 }
 
 // gc removes entries that have not been seen for two windows.

@@ -104,6 +104,25 @@ func (t *ticketStore) take(tok string) (ticket, bool) {
 	return v, true
 }
 
+// panelTOTPUse records the last used TOTP step per panel account and rejects
+// a replay of the same (or an older) code.
+var panelTOTPSteps sync.Map // user id -> int64
+
+func panelTOTPUse(uid int64, step int64) bool {
+	for {
+		prev, loaded := panelTOTPSteps.LoadOrStore(uid, step)
+		if !loaded {
+			return true
+		}
+		if prev.(int64) >= step {
+			return false
+		}
+		if panelTOTPSteps.CompareAndSwap(uid, prev, step) {
+			return true
+		}
+	}
+}
+
 // ---------------------------------------------------------------- handlers
 
 func (s *Server) handleTOTPLogin(w http.ResponseWriter, r *http.Request) {
@@ -130,6 +149,10 @@ func (s *Server) handleTOTPLogin(w http.ResponseWriter, r *http.Request) {
 	name := ""
 	if u != nil {
 		name = u.Username
+		if !s.login.allowUser(name) {
+			writeErr(w, http.StatusTooManyRequests, "Zu viele Fehlversuche für dieses Konto – bitte 15 Minuten warten")
+			return
+		}
 	}
 	valid := false
 	if err == nil {
@@ -147,12 +170,13 @@ func (s *Server) handleTOTPLogin(w http.ResponseWriter, r *http.Request) {
 				}
 				valid, _ = s.e.Store.DirUseTOTPStep(u.Username, step)
 			}
-		} else {
-			valid = totpValid(u.TOTPSecret, req.Code, time.Now())
+		} else if step, ok := totpMatch(u.TOTPSecret, req.Code, time.Now()); ok {
+			valid = panelTOTPUse(u.ID, step) // each code only once
 		}
 	}
 	if !valid {
 		s.login.fail(ip)
+		s.login.failUser(name)
 		s.auditLogin(r, name, false, "2FA-Code falsch")
 		// allow a retry with a fresh ticket
 		writeJSON(w, 401, map[string]any{"error": "Code ungültig", "ticket": tickets.issueEnroll(uid, tk.enroll)})
@@ -176,6 +200,7 @@ func (s *Server) ldapPanelLogin(w http.ResponseWriter, r *http.Request, username
 		var de *dirError
 		if errors.Is(err, errBadCredentials) || errors.As(err, &de) {
 			s.login.fail(ip)
+			s.login.failUser(username)
 			why := "falsches Passwort für „" + username + "“ (Verzeichnis)"
 			if de != nil {
 				why += ": " + de.reason
@@ -303,8 +328,8 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cur := ""
-	if c, err := r.Cookie(sessionCookie); err == nil && len(c.Value) >= 12 {
-		cur = c.Value[:12]
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		cur = store.SessionID(c.Value)
 	}
 	writeJSON(w, 200, map[string]any{"sessions": ss, "current": cur})
 }

@@ -22,12 +22,12 @@ export async function render(root, _p, scope, q) {
   const body = el('div.stack');
   const draw = () => {
     history.replaceState(null, '', '#/settings?tab=' + tab);
-    const tabList = [['ids', 'Bedrohungserkennung'], ['alerts', 'Benachrichtigungen'], ['network', 'Netz & Vertrauen'], ['data', 'Telemetrie & Speicher'], ['agent', 'Agent & Caddy'], ['users', 'Benutzer'], ['backup', 'Sicherung'], ['account', 'Konto & Sicherheit'], ['tokens', 'API-Tokens']]
-      .filter(([k]) => isAdmin || k === 'account' || k === 'tokens');
-    if (!isAdmin && tab !== 'tokens') tab = 'account';
+    const tabList = [['ids', 'Bedrohungserkennung'], ['alerts', 'Benachrichtigungen'], ['network', 'Netz & Vertrauen'], ['data', 'Telemetrie & Speicher'], ['agent', 'Agent & Caddy'], ['users', 'Benutzer'], ['backup', 'Sicherung'], ['account', 'Konto & Sicherheit'], ['tokens', 'API-Tokens'], ['about', 'Über & Lizenzen']]
+      .filter(([k]) => isAdmin || ['account', 'tokens', 'about'].includes(k));
+    if (!isAdmin && !['tokens', 'about'].includes(tab)) tab = 'account';
     mount(root, tabs(tabList, tab, (t) => { tab = t; draw(); }), body);
-    setActions(['account', 'tokens'].includes(tab) ? null : saveBtn);
-    ({ ids, alerts, network, dataTab, agent, users, backup, account, tokens })[tab === 'data' ? 'dataTab' : tab]();
+    setActions(['account', 'tokens', 'about'].includes(tab) ? null : saveBtn);
+    ({ ids, alerts, network, dataTab, agent, users, backup, account, tokens, about })[tab === 'data' ? 'dataTab' : tab]();
   };
 
   const num = (obj, key, attrs = {}) => el('input', { type: 'number', value: obj[key] ?? 0, ...attrs, oninput: (e) => { obj[key] = attrs.float ? parseFloat(e.target.value) : +e.target.value; markDirty(); } });
@@ -208,6 +208,36 @@ export async function render(root, _p, scope, q) {
               try { await post('/settings/agent/rotate'); toast('Neues Token erzeugt', 'ok'); agent(); } catch (e) { errToast(e); }
             },
           }, 'Erneuern')))));
+  }
+
+  async function about() {
+    const l = await get('/legal');
+    const tp = l.third_party || '';
+    const filter = el('input', { type: 'search', placeholder: 'Komponente suchen …', style: { maxWidth: '320px' } });
+    const pre = el('pre.block', { style: { maxHeight: '60vh', overflow: 'auto', whiteSpace: 'pre-wrap' } }, tp);
+    filter.oninput = () => {
+      const q = filter.value.trim().toLowerCase();
+      if (!q) { pre.textContent = tp; return; }
+      // nur die Abschnitte zeigen, die den Suchbegriff enthalten
+      const parts = tp.split(/\n(?======)/);
+      pre.textContent = parts.filter(p => p.toLowerCase().includes(q)).join('\n') || 'Nichts gefunden.';
+    };
+    const dl = (name, text) => {
+      const a = el('a.btn', { href: URL.createObjectURL(new Blob([text], { type: 'text/plain' })), download: name }, name + ' herunterladen');
+      return a;
+    };
+    mount(body,
+      panel('Caddy Sentinel', el('div.stack', null,
+        el('p', null, 'Version ', el('b', null, l.version || '?'), ' · Lizenz: ', el('a', { href: 'https://www.apache.org/licenses/LICENSE-2.0', target: '_blank', rel: 'noopener' }, 'Apache License 2.0')),
+        el('pre.block', { style: { whiteSpace: 'pre-wrap' } }, l.notice || ''))),
+      (l.geo_credits || []).length ? panel('GeoIP-Daten', el('div.stack', null,
+        el('p.muted', null, 'Die eingebundenen GeoIP-Datenbanken verlangen diese Quellenangabe. Sie wird auch in der Seitenleiste angezeigt.'),
+        el('ul', null, l.geo_credits.map(c => el('li', null, el('a', { href: c.url, target: '_blank', rel: 'noopener' }, c.text)))))) : null,
+      panel('Externe Datenquellen', el('p.muted', null,
+        'Threat-Feeds (Spamhaus, abuse.ch, blocklist.de, FireHOL, Emerging Threats, Tor-Projekt) und GeoIP-Datenbanken werden nicht mitgeliefert, sondern vom Betreiber geladen. Für sie gelten die Nutzungsbedingungen der jeweiligen Anbieter – vor allem bei kommerzieller Nutzung vorher prüfen.')),
+      panel('Enthaltene Software Dritter', tp
+        ? el('div.stack', null, el('div.row', null, filter, dl('THIRD_PARTY_LICENSES.txt', tp)), pre)
+        : el('p.muted', null, 'In diesem Entwickler-Build ist die Liste nicht enthalten. Sie wird beim Release-Build erzeugt (tools/licenses) und liegt jedem Release-Archiv bei.')));
   }
 
   async function users() {

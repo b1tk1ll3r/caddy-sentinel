@@ -16,8 +16,15 @@ services:
       - "0.0.0.0:7600:7600"
     environment:
       TZ: ${TZ:-Europe/Berlin}
+      # das Agent-Token liegt in einem eigenen Volume – Caddy sieht so nur
+      # das Token, nicht die Datenbank des Panels
+      SENTINEL_TOKEN_FILE: /run/sentinel-token/agent.token
+      # Anfragen über Caddy bzw. den Docker-Proxy: echte Client-IP aus
+      # X-Forwarded-For übernehmen (Anmelde-Sperren, Protokoll)
+      SENTINEL_TRUSTED_PROXIES: 127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
     volumes:
       - sentinel-data:/var/lib/caddy-sentinel
+      - sentinel-token:/run/sentinel-token
       - caddy-etc:/etc/caddy
       - caddy-admin:/run/caddy
       - caddy-data:/caddy-data:ro
@@ -37,17 +44,21 @@ services:
       - "443:443/udp"
     environment:
       TZ: ${TZ:-Europe/Berlin}
+      SENTINEL_TOKEN_FILE: /run/sentinel-token/agent.token
     volumes:
       - caddy-etc:/etc/caddy
       - caddy-data:/data
       - caddy-config:/config
       - caddy-admin:/run/caddy
-      - sentinel-data:/var/lib/caddy-sentinel:ro
+      - sentinel-token:/run/sentinel-token:ro
+      # GeoIP-Datenbanken: derselbe Pfad wie im Panel
+      # - ./geo:/geo:ro
       # eigene Inhalte für file_server:
       # - ./www:/srv:ro
 
 volumes:
   sentinel-data:
+  sentinel-token:
   caddy-etc:
   caddy-data:
   caddy-config:

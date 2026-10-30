@@ -41,7 +41,7 @@ systemctl daemon-reload
 if systemctl list-unit-files caddy.service >/dev/null 2>&1; then
 	systemctl restart caddy.service 2>/dev/null || echo "Caddy startet nicht – vermutlich steht noch \"sentinel\" in der Caddyfile."
 fi
-rm -rf /usr/local/share/caddy-sentinel
+rm -rf /usr/local/share/caddy-sentinel /usr/local/share/doc/caddy-sentinel
 if [ "$PURGE" = 1 ]; then
 	rm -rf /var/lib/caddy-sentinel /var/backups/caddy-sentinel /etc/default/caddy-sentinel
 	echo "Daten gelöscht."

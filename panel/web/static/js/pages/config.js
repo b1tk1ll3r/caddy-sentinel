@@ -1,4 +1,4 @@
-import { select, field, el, mount, get, post, toast, errToast, modal, confirmDialog, prompt, debounce, fmtDateTime, fmtAgo, empty } from '../ui.js';
+import { select, field, el, mount, get, post, toast, errToast, modal, confirmDialog, prompt, debounce, fmtDateTime, fmtAgo, empty, can } from '../ui.js';
 import { createEditor, docFor } from '../editor.js';
 import { withInstance } from '../instancebar.js';
 import { openSiteForm } from '../siteform.js';
@@ -286,6 +286,7 @@ export async function render(root, _p, scope) {
 
   let revalidate = false;
   async function validate(full = false) {
+    if (!can('config')) { statusMsg.replaceChildren(el('span.dot'), ' Prüfen über Caddy erfordert das Recht „Konfiguration“'); return; }
     if (validating) { revalidate = true; return; }
     validating = true;
     statusMsg.replaceChildren(el('span.dot'), full ? ' Vollständige Prüfung läuft …' : ' Prüfe …');

@@ -26,7 +26,8 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK: eigene Adressen ermitteln (DNS-Prüfung neuer Sites)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 CapabilityBoundingSet=
 SystemCallArchitectures=native
 UMask=0027

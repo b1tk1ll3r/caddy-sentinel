@@ -302,6 +302,11 @@ for s in update uninstall; do
 		if [ -f "$f" ]; then install -m 0755 "$f" "/usr/local/sbin/caddy-sentinel-$s"; break; fi
 	done
 done
+# Lizenzhinweise (Apache-2.0 und enthaltene Komponenten Dritter)
+install -d -m 0755 /usr/local/share/doc/caddy-sentinel
+for f in LICENSE NOTICE AUTHORS THIRD_PARTY_LICENSES.txt; do
+	[ -f "$SRC/$f" ] && install -m 0644 "$SRC/$f" /usr/local/share/doc/caddy-sentinel/
+done
 echo "$NEW_VERSION" >"$SHARE_DIR/VERSION"
 echo "$REPO" >"$SHARE_DIR/REPO"
 if [ "$DL" != "https://github.com/$REPO/releases" ]; then echo "$DL" >"$SHARE_DIR/DOWNLOAD"; else rm -f "$SHARE_DIR/DOWNLOAD"; fi

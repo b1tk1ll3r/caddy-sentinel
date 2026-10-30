@@ -49,6 +49,45 @@ func Open(countryPath, asnPath string) *DB {
 	return g
 }
 
+// Credit is an attribution required by the licence of a database.
+type Credit struct {
+	Text string `json:"text"`
+	URL  string `json:"url"`
+}
+
+// Credits returns the attributions the loaded databases require: DB-IP Lite
+// (CC BY 4.0) and MaxMind GeoLite2 (GeoLite2 EULA) must be credited wherever
+// their data is shown. Commercial databases need none.
+func (g *DB) Credits() []Credit {
+	if g == nil {
+		return nil
+	}
+	var out []Credit
+	seen := map[string]bool{}
+	for _, r := range []*maxminddb.Reader{g.country, g.asn} {
+		if r == nil {
+			continue
+		}
+		var c Credit
+		t := strings.ToLower(r.Metadata.DatabaseType)
+		switch {
+		case strings.Contains(t, "dbip") || strings.Contains(t, "db-ip"):
+			c = Credit{"IP Geolocation by DB-IP", "https://db-ip.com"}
+		case strings.Contains(t, "geolite"):
+			c = Credit{"This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com.", "https://www.maxmind.com"}
+		case strings.Contains(t, "ipinfo"):
+			c = Credit{"IP address data powered by IPinfo", "https://ipinfo.io"}
+		default:
+			continue
+		}
+		if !seen[c.Text] {
+			seen[c.Text] = true
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func buildDate(r *maxminddb.Reader) string {
 	return fmt.Sprintf("Build %d", r.Metadata.BuildEpoch)
 }

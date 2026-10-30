@@ -53,7 +53,8 @@ type authSession struct {
 	P   string   `json:"p"` // policy ID, or "sso"
 	H   string   `json:"h"` // host, or SSO domain
 	IP  string   `json:"ip,omitempty"`
-	F   int      `json:"f"` // factors: 1 = password, 2 = password + TOTP
+	S   string   `json:"s,omitempty"` // login source (directory | local | oidc:<id>)
+	F   int      `json:"f"`           // factors: 1 = password, 2 = password + TOTP
 	Iat int64    `json:"iat"`
 	Exp int64    `json:"exp"`
 }
@@ -120,6 +121,10 @@ func (st *runtimeState) session(r *http.Request, pol *cpolicy, host, ip string, 
 			return false
 		}
 		if pol.p.Auth.BindIP && s.IP != ip {
+			return false
+		}
+		// an SSO cookie from a site with other login sources must not open this one
+		if len(pol.p.Auth.Sources) > 0 && !protocol.SourceAllowed(pol.p.Auth, s.S) {
 			return false
 		}
 		if before, ok := st.raw.AuthRevoked[strings.ToLower(s.U)]; ok && s.Iat <= before {
@@ -507,7 +512,7 @@ func (h *Handler) authResult(w http.ResponseWriter, r *http.Request, info *reqIn
 		if f <= 0 {
 			f = 1
 		}
-		ns := &authSession{U: res.User.Name, D: res.User.Display, E: res.User.Email, G: res.User.Groups,
+		ns := &authSession{U: res.User.Name, D: res.User.Display, E: res.User.Email, G: res.User.Groups, S: res.User.Source,
 			P: pol.p.ID, H: info.rec.Host, F: f, Iat: now.Unix(), Exp: now.Unix() + int64(ttl)}
 		if pol.p.Auth.BindIP {
 			ns.IP = addr.String()

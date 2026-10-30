@@ -11,7 +11,9 @@ RUN apk add --no-cache ca-certificates tzdata libcap-utils mailcap \
  && addgroup -S -g 1000 caddy \
  && adduser -S -D -H -u 1000 -G caddy -h /data -s /sbin/nologin caddy
 LABEL org.opencontainers.image.source="https://github.com/b1tk1ll3r/caddy-sentinel" \
-      org.opencontainers.image.version="${VERSION}"
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY LICENSE NOTICE AUTHORS /usr/share/doc/caddy-sentinel/
 COPY deploy/docker/Caddyfile /usr/share/caddy-sentinel/Caddyfile.default
 COPY deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
@@ -20,9 +22,10 @@ FROM base AS caddy
 ARG TARGETARCH
 ARG TARGETVARIANT
 COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy /usr/bin/caddy
+COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
 RUN setcap cap_net_bind_service=+ep /usr/bin/caddy \
- && mkdir -p /data /config /run/caddy /var/lib/caddy-sentinel /srv /etc/caddy/sites \
- && chown -R caddy:caddy /data /config /run/caddy /etc/caddy /srv
+ && mkdir -p /data /config /run/caddy /run/sentinel-token /var/lib/caddy-sentinel /srv /etc/caddy/sites \
+ && chown -R caddy:caddy /data /config /run/caddy /run/sentinel-token /etc/caddy /srv
 ENV XDG_DATA_HOME=/data \
     XDG_CONFIG_HOME=/config \
     SENTINEL_PANEL=http://panel:7600 \
@@ -43,8 +46,9 @@ ARG TARGETVARIANT
 COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy-sentinel /usr/bin/caddy-sentinel
 # Caddy-Binary für "caddy validate"/"caddy fmt" im Editor
 COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy /usr/bin/caddy
-RUN mkdir -p /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy \
- && chown -R caddy:caddy /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data
+COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
+RUN mkdir -p /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy \
+ && chown -R caddy:caddy /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data
 ENV SENTINEL_LISTEN=0.0.0.0:7600 \
     SENTINEL_DATA=/var/lib/caddy-sentinel \
     SENTINEL_CADDY_ADMIN=unix//run/caddy/admin.sock \

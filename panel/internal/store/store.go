@@ -3,7 +3,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -255,15 +257,27 @@ func (s *Store) SetPassword(id int64, hash string) error {
 	return err
 }
 
+// SessionKey is how a panel session is stored: only a hash of the cookie
+// value, so a copy of the database (backups, a process that can read the
+// file) does not yield valid sessions.
+func SessionKey(token string) string {
+	h := sha256.Sum256([]byte("sentinel-panel-session:" + token))
+	return "h:" + hex.EncodeToString(h[:])
+}
+
+// SessionID is the short public ID of a session (shown in the UI).
+func SessionID(token string) string { return SessionKey(token)[2:14] }
+
 func (s *Store) CreateSession(token string, userID int64, ttl time.Duration, ip, ua string) error {
 	now := time.Now()
 	_, err := s.Exec(`INSERT INTO sessions(token,user_id,created,expires,ip,ua) VALUES(?,?,?,?,?,?)`,
-		token, userID, now.Unix(), now.Add(ttl).Unix(), ip, ua)
+		SessionKey(token), userID, now.Unix(), now.Add(ttl).Unix(), ip, ua)
 	return err
 }
 
 func (s *Store) SessionUser(token string) (*User, error) {
 	var uid, exp int64
+	token = SessionKey(token)
 	err := s.DB.QueryRow(`SELECT user_id,expires FROM sessions WHERE token=?`, token).Scan(&uid, &exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -279,7 +293,7 @@ func (s *Store) SessionUser(token string) (*User, error) {
 }
 
 func (s *Store) DeleteSession(token string) error {
-	_, err := s.Exec(`DELETE FROM sessions WHERE token=?`, token)
+	_, err := s.Exec(`DELETE FROM sessions WHERE token=?`, SessionKey(token))
 	return err
 }
 
@@ -629,6 +643,10 @@ func (s *Store) Prune(requestHours, eventDays, rollupDays int) error {
 		}
 	}
 	_, _ = s.Exec(`DELETE FROM sessions WHERE expires<?`, now.Unix())
+	_, _ = s.Exec(`DELETE FROM ingest_batches WHERE ts<?`, now.Add(-6*time.Hour).Unix())
+	// repeat-offender history: one year; Caddyfile versions: newest 200 per instance
+	_, _ = s.Exec(`DELETE FROM offenders WHERE last_ban<?`, now.AddDate(-1, 0, 0).Unix())
+	_, _ = s.Exec(`DELETE FROM config_versions WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY inst ORDER BY id DESC) AS rn FROM config_versions) WHERE rn > 200)`)
 	if eventDays > 0 {
 		_, _ = s.Exec(`DELETE FROM access_log WHERE ts<?`, now.AddDate(0, 0, -eventDays).UnixMilli())
 	}

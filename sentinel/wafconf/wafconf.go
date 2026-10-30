@@ -139,8 +139,54 @@ func crsFiles() []string {
 // CRSFiles exposes the CRS rule file names (for the panel UI).
 func CRSFiles() []string { return crsFiles() }
 
+// allowedDirectives are the SecLang directives custom rules may use: rules
+// and rule tuning only. Everything else configures the engine itself, and
+// several of those write files (SecDebugLog, SecAuditLog, Sec*Dir) or load
+// remote code (SecRemoteRules) – never acceptable from a panel user.
+var allowedDirectives = map[string]bool{
+	"secrule": true, "secaction": true, "secmarker": true, "secdefaultaction": true,
+	"secruleremovebyid": true, "secruleremovebytag": true, "secruleremovebymsg": true,
+	"secruleupdatetargetbyid": true, "secruleupdatetargetbytag": true, "secruleupdatetargetbymsg": true,
+	"secruleupdateactionbyid": true,
+}
+
+// @inspectFile runs an external program for every evaluation.
+var forbiddenOperator = regexp.MustCompile(`(?i)@inspectfile\b`)
+
+// CheckDirectives rejects custom SecLang that is not a plain rule.
+func CheckDirectives(directives string) error {
+	if forbiddenOperator.MatchString(directives) {
+		return fmt.Errorf("der Operator @inspectFile ist nicht erlaubt (startet externe Programme)")
+	}
+	var logical strings.Builder
+	lines := strings.Split(strings.ReplaceAll(directives, "\r\n", "\n"), "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		logical.Reset()
+		logical.WriteString(line)
+		start := i + 1
+		for strings.HasSuffix(line, "\\") && i+1 < len(lines) {
+			i++
+			line = strings.TrimSpace(lines[i])
+			logical.WriteString(" " + line)
+		}
+		stmt := strings.TrimSpace(logical.String())
+		if stmt == "" || strings.HasPrefix(stmt, "#") {
+			continue
+		}
+		name := strings.ToLower(strings.Fields(stmt)[0])
+		if !allowedDirectives[name] {
+			return fmt.Errorf("Zeile %d: Direktive %q ist in eigenen Regeln nicht erlaubt (nur SecRule, SecAction, SecMarker, SecRuleRemove…/SecRuleUpdate…)", start, strings.Fields(stmt)[0])
+		}
+	}
+	return nil
+}
+
 // Build compiles a WAF instance.
 func Build(w protocol.WAF) (coraza.WAF, error) {
+	if err := CheckDirectives(w.Directives); err != nil {
+		return nil, err
+	}
 	cfg := coraza.NewWAFConfig().
 		WithRootFS(coreruleset.FS).
 		WithDirectives(Directives(w))
@@ -150,6 +196,9 @@ func Build(w protocol.WAF) (coraza.WAF, error) {
 // Validate compiles directives only (without CRS, which is fast) to report
 // syntax errors in custom rules.
 func Validate(directives string) error {
+	if err := CheckDirectives(directives); err != nil {
+		return err
+	}
 	cfg := coraza.NewWAFConfig().WithRootFS(coreruleset.FS).WithDirectives("SecRuleEngine On\n" + directives)
 	_, err := coraza.NewWAF(cfg)
 	return err
@@ -206,7 +255,10 @@ func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err 
 	}
 	it := tx.ProcessRequestHeaders()
 	if it == nil {
-		if tx.IsRequestBodyAccessible() && r.Body != nil && r.Body != http.NoBody {
+		// streaming protocols (gRPC) never end the body before the response:
+		// reading it here would stall the connection
+		streaming := strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc")
+		if tx.IsRequestBodyAccessible() && !streaming && r.Body != nil && r.Body != http.NoBody {
 			var rbErr error
 			it, _, rbErr = tx.ReadRequestBodyFrom(r.Body)
 			if rbErr != nil {

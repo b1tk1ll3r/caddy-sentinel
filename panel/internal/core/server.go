@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,6 +100,7 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /api/temp/{id}", s.auth(s.handleTempDelete))
 	m.HandleFunc("PUT /api/bans/{ip}/note", s.auth(s.handleBanNote))
 	// auth
+	m.HandleFunc("GET /api/legal", s.auth(s.handleLegal))
 	m.HandleFunc("GET /api/auth/state", s.handleAuthState)
 	m.HandleFunc("POST /api/auth/setup", s.csrf(s.handleSetup))
 	m.HandleFunc("POST /api/auth/login", s.csrf(s.handleLogin))
@@ -238,14 +241,72 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func readJSON(r *http.Request, v any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, 16<<20))
-	return dec.Decode(v)
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxJSONBody+1))
+	if err := dec.Decode(v); err != nil {
+		if r.ContentLength > maxJSONBody {
+			return errBodyTooLarge
+		}
+		return err
+	}
+	return nil
 }
 
+const maxJSONBody = 16 << 20
+
+var errBodyTooLarge = errors.New("Anfrage zu groß (höchstens 16 MB)")
+
+// trustedProxies may set X-Forwarded-For (SENTINEL_TRUSTED_PROXIES, comma
+// separated; default loopback, i.e. a Caddy on the same host).
+var trustedProxies = sync.OnceValue(func() []netip.Prefix {
+	v := os.Getenv("SENTINEL_TRUSTED_PROXIES")
+	if v == "" {
+		v = "127.0.0.0/8,::1/128"
+	}
+	var out []netip.Prefix
+	for _, f := range strings.Split(v, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(f); err == nil {
+			out = append(out, p.Masked())
+		} else if a, err := netip.ParseAddr(f); err == nil {
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return out
+})
+
+func isTrustedProxy(a netip.Addr) bool {
+	a = a.Unmap()
+	for _, p := range trustedProxies() {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP is the address of the client. Behind a trusted reverse proxy the
+// right-most X-Forwarded-For entry that is not itself a trusted proxy.
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	peer, err := netip.ParseAddr(host)
+	if err != nil || !isTrustedProxy(peer) {
+		return host
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		a, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			break
+		}
+		if !isTrustedProxy(a) {
+			return a.Unmap().String()
+		}
 	}
 	return host
 }
@@ -361,6 +422,8 @@ var patternCap = map[string]string{
 	"DELETE /api/rulesets/{id}":              "policy",
 	"POST /api/rulesets/from-preset":         "policy",
 	"POST /api/config/insert-sentinel":       "config",
+	"POST /api/config/validate":              "config", // runs the Caddyfile through Caddy (env placeholders, imports)
+	"POST /api/sites/wizard":                 "config",
 	"POST /api/config/apply":                 "config",
 	"POST /api/config/versions/{id}/restore": "config",
 	"POST /api/bans":                         "bans",
@@ -404,7 +467,6 @@ var viewerAllowed = map[string]bool{
 	"POST /api/auth/totp/enable":       true,
 	"POST /api/auth/totp/disable":      true,
 	"DELETE /api/auth/sessions/{id}":   true,
-	"POST /api/config/validate":        true,
 	"POST /api/config/format":          true,
 	"POST /api/config/outline":         true,
 	"POST /api/explain":                true,
@@ -414,6 +476,9 @@ var viewerAllowed = map[string]bool{
 	"POST /api/policies/{id}/transfer": true, // preview for everyone, the handler checks "policy" for apply
 	"POST /api/tokens":                 true, // own tokens, role capped by the handler
 	"DELETE /api/tokens/{id}":          true,
+	"POST /api/views":                  true, // own saved views, the handler checks ownership
+	"PUT /api/views/{id}":              true,
+	"DELETE /api/views/{id}":           true,
 }
 
 // admin restricts a handler to administrators (also for GET).
@@ -472,7 +537,11 @@ func (s *Server) handleAgentState(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAgentIngest(w http.ResponseWriter, r *http.Request) {
 	var b ingestBody
 	if err := readJSON(r, &b); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		status := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeErr(w, status, err.Error())
 		return
 	}
 	if err := s.e.Ingest(&b.Ingest, clientIP(r), agentInst(r)); err != nil {
@@ -490,18 +559,35 @@ type loginLimiter struct {
 	m  map[string][]time.Time
 }
 
-func (l *loginLimiter) allow(ip string) bool {
+// allow: at most 10 failures per client IP in 15 minutes.
+func (l *loginLimiter) allow(ip string) bool { return l.allowN(ip, 10) }
+
+// allowUser: at most 30 failures per account in 15 minutes, whatever the
+// source address (spread-out guessing, clients behind one proxy).
+func (l *loginLimiter) allowUser(name string) bool {
+	return l.allowN("u:"+strings.ToLower(strings.TrimSpace(name)), 30)
+}
+
+func (l *loginLimiter) failUser(name string) {
+	l.fail("u:" + strings.ToLower(strings.TrimSpace(name)))
+}
+
+func (l *loginLimiter) allowN(key string, n int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
 	var keep []time.Time
-	for _, t := range l.m[ip] {
+	for _, t := range l.m[key] {
 		if now.Sub(t) < 15*time.Minute {
 			keep = append(keep, t)
 		}
 	}
-	l.m[ip] = keep
-	return len(keep) < 10
+	if len(keep) == 0 {
+		delete(l.m, key)
+	} else {
+		l.m[key] = keep
+	}
+	return len(keep) < n
 }
 
 func (l *loginLimiter) fail(ip string) {
@@ -573,6 +659,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if !s.login.allowUser(req.Username) {
+		writeErr(w, http.StatusTooManyRequests, "Zu viele Fehlversuche für dieses Konto – bitte 15 Minuten warten")
+		return
+	}
 	u, err := s.e.Store.UserByName(req.Username)
 	if dir := s.e.Settings().Directory; dir.Enabled && dir.PanelLogin && (err != nil || u.Source == "ldap") {
 		s.ldapPanelLogin(w, r, req.Username, req.Password)
@@ -580,6 +670,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(u.PWHash), []byte(req.Password)) != nil {
 		s.login.fail(ip)
+		s.login.failUser(req.Username)
 		s.auditLogin(r, req.Username, false, "falsches Passwort für „"+req.Username+"“")
 		time.Sleep(400 * time.Millisecond)
 		writeErr(w, http.StatusUnauthorized, "Benutzername oder Passwort falsch")

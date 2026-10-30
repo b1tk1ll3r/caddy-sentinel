@@ -168,7 +168,19 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 		t := d.ip[r.IP]
 		if t == nil {
 			if len(d.ip) > 250000 {
-				continue // protect memory
+				// full (e.g. a large botnet): make room by dropping the
+				// least suspicious of a random sample, so a new attacker is
+				// still scored
+				victim, low, n := "", math.MaxFloat64, 0
+				for k, v := range d.ip {
+					if v.Score < low {
+						victim, low = k, v.Score
+					}
+					if n++; n >= 64 {
+						break
+					}
+				}
+				delete(d.ip, victim)
 			}
 			t = &ipTrack{FirstSeen: now, Updated: now, Signals: map[string]float64{}, Counts: map[string]int64{}, Hosts: map[string]int64{}}
 			d.ip[r.IP] = t

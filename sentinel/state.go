@@ -40,6 +40,8 @@ type wildHost struct {
 
 type cpolicy struct {
 	p          *protocol.Policy
+	broken     bool // a restricting path rule failed to compile (fail closed)
+	brokenWhy  string
 	allow      *ipSet[struct{}]
 	deny       *ipSet[string]
 	methods    map[string]bool
@@ -114,6 +116,9 @@ func compileState(s *protocol.State, prev *runtimeState) *runtimeState {
 		}
 	}
 	for id, p := range s.Policies {
+		if p == nil {
+			continue
+		}
 		cp, err := compilePolicy(p, rs, prev)
 		if err != nil {
 			rs.errors[id] = err.Error()
@@ -170,10 +175,14 @@ func compilePolicy(p *protocol.Policy, rs, prev *runtimeState) (*cpolicy, error)
 		}
 	}
 	cp.anyAuth = p.Auth.Enabled
+	ruleFailed := ""
 	for i := range p.PathRules {
 		cr, err := protocol.CompilePathRule(&p.PathRules[i])
 		if err != nil {
 			errs = append(errs, err.Error())
+			if pr := &p.PathRules[i]; pr.Enabled && !pr.Test && (pr.Action == "block" || pr.Auth == "on" || len(pr.OnlyNetworks) > 0) {
+				ruleFailed = err.Error()
+			}
 			continue
 		}
 		cp.rules = append(cp.rules, cr)
@@ -237,6 +246,20 @@ func compilePolicy(p *protocol.Policy, rs, prev *runtimeState) (*cpolicy, error)
 				rs.wafs[h] = w
 			}
 		}
+	}
+	if ruleFailed != "" {
+		if prev != nil && prev.policies[p.ID] != nil && !prev.policies[p.ID].broken {
+			// keep the last working rule set of this policy
+			old := prev.policies[p.ID]
+			cp.rules, cp.anyAuth = old.rules, cp.anyAuth || old.anyAuth
+			errs = append(errs, "vorherige Pfadregeln bleiben aktiv")
+		} else {
+			cp.broken, cp.brokenWhy = true, ruleFailed
+			errs = append(errs, "Policy gesperrt (503), bis die Regel korrigiert ist")
+		}
+	}
+	if p.WAF.Mode == "block" && cp.waf == nil {
+		errs = append(errs, "WAF nicht aktiv")
 	}
 	if len(errs) > 0 {
 		return cp, fmt.Errorf("%s", strings.Join(errs, "; "))

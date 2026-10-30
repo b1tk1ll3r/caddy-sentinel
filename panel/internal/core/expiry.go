@@ -70,7 +70,14 @@ func (s *Server) handleTempCreate(w http.ResponseWriter, r *http.Request) {
 		req.Scope = "global"
 	}
 	switch {
-	case req.Scope == "global" && (req.List == "trusted" || req.List == "never_ban"):
+	case req.Scope == "global" && req.List == "trusted":
+		// trusted sources skip WAF, bans and the site login everywhere –
+		// the same weight as the permanent list in the settings (admin only)
+		if u.Role != "admin" {
+			writeErr(w, 403, "Keine Berechtigung – vertrauenswürdige Quellen darf nur ein Administrator freigeben")
+			return
+		}
+	case req.Scope == "global" && req.List == "never_ban":
 		if !RoleCan(u.Role, "bans") {
 			writeErr(w, 403, "Keine Berechtigung – erfordert "+capRoles("bans"))
 			return

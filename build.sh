@@ -35,7 +35,7 @@ echo "==> Caddy mit Sentinel-Modul (Caddy ${CADDY_VERSION})"
   cd "$ROOT/caddy"
   upgrade
   go mod tidy
-  CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X ${MOD}/sentinel.Version=${VERSION}" -o "$OUT/caddy" .
+  CGO_ENABLED=0 go build -trimpath -tags coraza.disabled_operators.inspectFile -ldflags "-s -w -X ${MOD}/sentinel.Version=${VERSION}" -o "$OUT/caddy" .
 )
 "$OUT/caddy" version
 "$OUT/caddy" list-modules | grep -q '^http.handlers.sentinel$' && echo "    Sentinel-Modul enthalten"
@@ -47,7 +47,7 @@ echo "==> Sentinel-Panel"
     go get github.com/corazawaf/coraza/v3@latest github.com/corazawaf/coraza-coreruleset/v4@latest
   fi
   go mod tidy
-  CGO_ENABLED=1 go build -trimpath -ldflags "-s -w -X ${MOD}/panel/internal/core.Version=${VERSION}" -o "$OUT/caddy-sentinel" .
+  CGO_ENABLED=1 go build -trimpath -tags coraza.disabled_operators.inspectFile -ldflags "-s -w -X ${MOD}/panel/internal/core.Version=${VERSION}" -o "$OUT/caddy-sentinel" .
 )
 "$OUT/caddy-sentinel" -version
 

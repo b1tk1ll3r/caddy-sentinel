@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -131,6 +132,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_, ver, _ := s.e.State()
 	out := map[string]any{
 		"version":            Version,
+		"geo_credits":        s.e.GeoCredits(),
 		"caddy_ok":           caddyErr == nil,
 		"caddy_error":        caddyx.Describe(caddyErr),
 		"caddy_admin":        s.e.cfg.CaddyAdmin,
@@ -603,7 +605,40 @@ func (s *Server) handleWAFMeta(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var wafCache sync.Map // hash -> coraza.WAF
+// wafCache keeps a few compiled WAFs for the tester and the request trace.
+// Bounded: every distinct custom rule set builds a full CRS instance (tens
+// of MB), and the tester is open to every signed-in user.
+var wafCache = &boundedCache{max: 12}
+
+type boundedCache struct {
+	mu    sync.Mutex
+	max   int
+	m     map[string]any
+	order []string
+}
+
+func (c *boundedCache) Load(k string) (any, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[k]
+	return v, ok
+}
+
+func (c *boundedCache) Store(k string, v any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]any{}
+	}
+	if _, ok := c.m[k]; !ok {
+		c.order = append(c.order, k)
+	}
+	c.m[k] = v
+	for len(c.order) > c.max {
+		delete(c.m, c.order[0])
+		c.order = c.order[1:]
+	}
+}
 
 func (s *Server) handleWAFTest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -1044,6 +1079,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if u := userFrom(r); u != nil && u.Role != "admin" {
 		st.MetricsToken = ""
+		// for Slack/Teams/Discord/ntfy the URL itself is the credential
+		for i := range st.Webhooks {
+			if pu, err := url.Parse(st.Webhooks[i].URL); err == nil && pu.Host != "" {
+				st.Webhooks[i].URL = pu.Scheme + "://" + pu.Host + "/…"
+			} else if st.Webhooks[i].URL != "" {
+				st.Webhooks[i].URL = "…"
+			}
+		}
 	}
 	writeJSON(w, 200, map[string]any{"settings": st, "signals": SignalNames, "defaults": DefaultSettings(), "secrets_set": secrets})
 }
@@ -1168,7 +1211,9 @@ func (s *Server) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 	}
 	if wh.Token == "" {
 		for _, c := range s.e.Settings().Webhooks {
-			if c.ID == wh.ID && wh.ID != "" {
+			// reuse the stored token only for the stored destination, so it
+			// cannot be sent to another server
+			if c.ID == wh.ID && wh.ID != "" && c.URL == wh.URL && c.Format == wh.Format && c.Room == wh.Room {
 				wh.Token = c.Token
 			}
 		}
@@ -1193,7 +1238,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "metrics disabled (set a metrics token in the settings)", http.StatusNotFound)
 		return
 	}
-	if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") != tok {
+	if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), []byte(tok)) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

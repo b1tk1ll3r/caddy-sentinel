@@ -242,6 +242,7 @@ func (tn *tunnel) RoundTrip(req *http.Request) (*http.Response, error) {
 
 type pendingCmd struct {
 	cmd  protocol.Command
+	inst string // only this instance may answer
 	done chan protocol.CommandResult
 }
 
@@ -286,7 +287,7 @@ func (h *cmdHub) call(ctx context.Context, inst, op string, args, out any, timeo
 		}
 		raw = b
 	}
-	p := &pendingCmd{cmd: protocol.Command{ID: strconv.FormatInt(h.seq.Add(1), 36) + "-" + RandomToken(4), Op: op, Args: raw}, done: make(chan protocol.CommandResult, 1)}
+	p := &pendingCmd{cmd: protocol.Command{ID: strconv.FormatInt(h.seq.Add(1), 36) + "-" + RandomToken(4), Op: op, Args: raw}, inst: inst, done: make(chan protocol.CommandResult, 1)}
 	h.mu.Lock()
 	h.queues[inst] = append(h.queues[inst], p)
 	h.waiting[p.cmd.ID] = p
@@ -353,11 +354,11 @@ func (h *cmdHub) take(ctx context.Context, inst string, wait time.Duration) []pr
 	}
 }
 
-func (h *cmdHub) resolve(res protocol.CommandResult) {
+func (h *cmdHub) resolve(inst string, res protocol.CommandResult) {
 	h.mu.Lock()
 	p := h.waiting[res.ID]
 	h.mu.Unlock()
-	if p != nil {
+	if p != nil && p.inst == inst {
 		select {
 		case p.done <- res:
 		default:
@@ -796,7 +797,7 @@ func (s *Server) handleAgentCommandResult(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.e.cmds.resolve(res)
+	s.e.cmds.resolve(agentInst(r), res)
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -15,7 +15,7 @@ export async function render(root, _p, scope) {
   }
   try { ups = await get('/caddy/upstreams', scope.signal); } catch { }
   const policies = pols.policies;
-  setActions(el('button.btn.primary', { onclick: () => openSiteWizard({ onDone: () => render(root, _p, scope) }) }, 'Neue Site …'));
+  setActions(can('config') ? el('button.btn.primary', { onclick: () => openSiteWizard({ onDone: () => render(root, _p, scope) }) }, 'Neue Site …') : null);
   const now = Date.now() / 1000;
   const maintOn = (p) => p && p.maintenance && (!p.maintenance_from || p.maintenance_from <= now) && (!p.maintenance_until || p.maintenance_until > now);
   const maintenance = (pid) => {

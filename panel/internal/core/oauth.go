@@ -303,6 +303,12 @@ func (s *Server) startFlow(w http.ResponseWriter, r *http.Request, p *OAuthProvi
 	verifier, challenge := pkce()
 	f.verifier, f.nonce, f.provider, f.created = verifier, RandomToken(12), p.ID, time.Now()
 	state := oauthState.putFlow(f)
+	if f.purpose == "panel" {
+		// bind the flow to this browser: a callback URL started by someone
+		// else (login CSRF into the attacker's account) is rejected
+		http.SetCookie(w, &http.Cookie{Name: oauthBindCookie, Value: f.nonce, Path: "/oauth/", MaxAge: 900,
+			HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode})
+	}
 	scopes := p.Scopes
 	if len(scopes) == 0 {
 		scopes = []string{"openid", "profile", "email"}
@@ -334,8 +340,16 @@ func (s *Server) handleOAuthPanel(w http.ResponseWriter, r *http.Request) {
 		s.oauthError(w, &oauthFlow{purpose: "panel"}, "Dieser Anmeldedienst ist für das Panel nicht freigegeben.")
 		return
 	}
+	// the callback comes back to PanelURL: start there so the browser
+	// binding cookie below is sent back
+	if pu, err := url.Parse(s.e.Settings().PanelURL); err == nil && pu.Host != "" && !strings.EqualFold(pu.Host, r.Host) {
+		http.Redirect(w, r, strings.TrimRight(s.e.Settings().PanelURL, "/")+"/oauth/panel?p="+url.QueryEscape(p.ID), http.StatusFound)
+		return
+	}
 	s.startFlow(w, r, p, &oauthFlow{purpose: "panel"})
 }
+
+const oauthBindCookie = "sentinel_oauth"
 
 // handleOAuthSite starts a site login from a signed agent request.
 func (s *Server) handleOAuthSite(w http.ResponseWriter, r *http.Request) {
@@ -397,6 +411,14 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if f == nil {
 		s.oauthError(w, nil, "Die Anmeldung ist abgelaufen oder wurde schon verwendet – bitte erneut starten.")
 		return
+	}
+	if f.purpose == "panel" {
+		c, err := r.Cookie(oauthBindCookie)
+		if err != nil || !hmac.Equal([]byte(c.Value), []byte(f.nonce)) {
+			s.oauthError(w, f, "Die Anmeldung wurde nicht in diesem Browser gestartet – bitte erneut über die Anmeldeseite starten.")
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: oauthBindCookie, Value: "", Path: "/oauth/", MaxAge: -1, HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteLaxMode})
 	}
 	p := s.e.oauthProvider(f.provider)
 	if p == nil {
@@ -789,4 +811,8 @@ func (e *Engine) providersForState() []protocol.AuthProvider {
 		}
 	}
 	return out
+}
+
+func isHTTPS(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }

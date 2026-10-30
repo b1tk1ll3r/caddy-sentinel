@@ -11,6 +11,7 @@ import (
 	"html"
 	"math/bits"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -128,8 +129,19 @@ func verifySolution(secret []byte, ip, token, counter string, now time.Time) err
 	return nil
 }
 
+// safeReturn accepts only a local path. Browsers drop tabs/newlines and treat
+// "\\" like "/", so "/\t/evil" or "/\\evil" would become "//evil".
 func safeReturn(s string) string {
-	if s == "" || !strings.HasPrefix(s, "/") || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "/\\") || strings.ContainsAny(s, "\r\n") {
+	if s == "" || !strings.HasPrefix(s, "/") || strings.HasPrefix(s, "//") || strings.ContainsRune(s, '\\') {
+		return "/"
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return "/"
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "" || u.Host != "" || u.Opaque != "" {
 		return "/"
 	}
 	return s

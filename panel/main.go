@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -67,10 +68,16 @@ func main() {
 		Handler:           core.NewServer(e, static),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		// long polls (agent commands) and live streams end on SIGTERM instead
+		// of holding up the shutdown; database writes use their own context
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// let running requests (e.g. an ingest batch being written) finish
+		sctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
@@ -79,5 +86,10 @@ func main() {
 		log.Error("http server", "err", err)
 		os.Exit(1)
 	}
+	<-shutdownDone
+	if !e.Wait(15 * time.Second) {
+		log.Warn("background tasks still running at shutdown")
+	}
 	_ = e.Store.Close()
+	log.Info("caddy sentinel panel stopped")
 }

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -167,10 +168,16 @@ func (l *liveStats) add(cs []protocol.Counter, now time.Time) {
 		if blocked {
 			slot.Blocked += c.Count
 		}
-		hr := l.hosts[c.Host]
+		host := c.Host
+		if _, known := l.hosts[host]; !known && len(l.hosts) >= maxLiveHosts {
+			// random Host headers on a catch-all site must not grow memory and
+			// the /metrics series without limit
+			host = "(weitere)"
+		}
+		hr := l.hosts[host]
 		if hr == nil {
 			hr = &hostRing{}
-			l.hosts[c.Host] = hr
+			l.hosts[host] = hr
 		}
 		if hr.min[mi] != minute {
 			hr.min[mi], hr.count[mi], hr.s5xx[mi], hr.block[mi] = minute, 0, 0, 0
@@ -182,10 +189,13 @@ func (l *liveStats) add(cs []protocol.Counter, now time.Time) {
 		if blocked {
 			hr.block[mi] += c.Count
 		}
-		l.totals[totalKey{c.Host, statusClass(c.Status), c.Action}] += c.Count
-		l.bytes[c.Host] += c.Bytes
+		l.totals[totalKey{host, statusClass(c.Status), c.Action}] += c.Count
+		l.bytes[host] += c.Bytes
 	}
 }
+
+// maxLiveHosts bounds the per-host live counters (and Prometheus series).
+const maxLiveHosts = 2000
 
 // LivePoint is a per-second datapoint.
 type LivePoint struct {
@@ -275,16 +285,16 @@ func (e *Engine) Ingest(b *protocol.Ingest, remote, inst string) error {
 	for i := range b.Requests {
 		b.Requests[i].Inst = inst
 	}
-	if len(b.Counters) > 0 {
-		if err := e.Store.AddRollups(now.Unix()/60, b.Counters); err != nil {
-			return err
+	if err := e.Store.IngestBatch(b.Batch, now.Unix()/60, b.Counters, b.Requests); err != nil {
+		if errors.Is(err, store.ErrDuplicateBatch) {
+			return nil // retry of a batch that was stored: acknowledge, count nothing twice
 		}
+		return err
+	}
+	if len(b.Counters) > 0 {
 		e.stats.add(b.Counters, now)
 	}
 	if len(b.Requests) > 0 {
-		if err := e.Store.InsertRequests(b.Requests); err != nil {
-			return err
-		}
 		e.IDS.Observe(b.Requests)
 		e.securityEvents(b.Requests)
 		e.Live.PublishRequests(b.Requests)

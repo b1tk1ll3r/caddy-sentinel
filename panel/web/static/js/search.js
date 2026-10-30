@@ -28,6 +28,7 @@ const PAGES = [
   ['Einstellungen', '#/settings', 'Konfiguration'],
   ['Einstellungen › Benachrichtigungen', '#/settings?tab=alerts', 'Webhook Teams Matrix ntfy Telegram E-Mail stummschalten'],
   ['Einstellungen › API-Tokens', '#/settings?tab=tokens', 'Bearer Token API Automatisierung'],
+  ['Einstellungen › Über & Lizenzen', '#/settings?tab=about', 'Lizenz Apache Open Source Drittanbieter Version GeoIP Quellenangabe'],
   ['Einstellungen › Benutzer', '#/settings?tab=users', 'Panel Rollen'],
   ['Einstellungen › Netz & Vertrauen', '#/settings?tab=network', 'vertrauenswürdig GeoIP Proxy'],
 ];

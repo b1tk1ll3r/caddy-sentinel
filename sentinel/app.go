@@ -7,6 +7,8 @@ package sentinel
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -239,7 +241,12 @@ func (c *core) loadCache() {
 		c.log.Warn("sentinel: invalid state cache", zap.Error(err))
 		return
 	}
-	c.state.Store(compileState(&s, nil))
+	rs, err := safeCompile(&s, nil)
+	if err != nil {
+		c.log.Error("sentinel: cached state unusable", zap.Error(err))
+		return
+	}
+	c.state.Store(rs)
 	c.loadCachedFeeds(&s)
 	c.updateGeo(s.GeoIP)
 	c.log.Info("sentinel: loaded cached state", zap.Int64("version", s.Version))
@@ -327,7 +334,10 @@ func (c *core) fetchState(ctx context.Context, cur int64) (bool, error) {
 	start := time.Now()
 	c.syncFeeds(ctx, &s)
 	c.updateGeo(s.GeoIP)
-	rs := compileState(&s, c.state.Load())
+	rs, err := safeCompile(&s, c.state.Load())
+	if err != nil {
+		return false, err // keep enforcing the previous state
+	}
 	c.state.Store(rs)
 	c.saveCache(raw)
 	c.log.Info("sentinel: applied state", zap.Int64("version", s.Version),
@@ -345,8 +355,12 @@ func (c *core) report(r protocol.Request, securityRelevant bool) {
 	k := counterKey{r.Host, r.Policy, r.Status, r.Action}
 	c.cmu.Lock()
 	ct := c.counters[k]
+	if ct == nil && len(c.counters) >= maxCounterKeys {
+		k.host = "(weitere)"
+		ct = c.counters[k]
+	}
 	if ct == nil {
-		ct = &protocol.Counter{Host: r.Host, Policy: r.Policy, Status: r.Status, Action: r.Action, Buckets: make([]int64, len(protocol.LatencyBuckets)+1)}
+		ct = &protocol.Counter{Host: k.host, Policy: r.Policy, Status: r.Status, Action: r.Action, Buckets: make([]int64, len(protocol.LatencyBuckets)+1)}
 		c.counters[k] = ct
 	}
 	ct.Count++
@@ -380,55 +394,92 @@ func (c *core) shipLoop(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	var pending []protocol.Request
+	var inflight *protocol.Ingest // batch being sent; retried unchanged (same ID)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case r := <-c.queue:
 			pending = append(pending, r)
-			if len(pending) < 2000 {
+			if len(pending) < protocol.MaxBatchRequests {
 				continue
 			}
 		case <-t.C:
 		}
-		// drain what is available
-	drain:
-		for len(pending) < 5000 {
-			select {
-			case r := <-c.queue:
-				pending = append(pending, r)
-			default:
-				break drain
+		for {
+			// drain what is available, keep at most 20000 records waiting
+		drain:
+			for {
+				select {
+				case r := <-c.queue:
+					pending = append(pending, r)
+				default:
+					break drain
+				}
 			}
-		}
-		c.cmu.Lock()
-		counters := make([]protocol.Counter, 0, len(c.counters))
-		for _, v := range c.counters {
-			counters = append(counters, *v)
-		}
-		c.counters = map[counterKey]*protocol.Counter{}
-		c.cmu.Unlock()
-
-		batch := protocol.Ingest{
-			Agent:    c.status(),
-			Requests: pending,
-			Counters: counters,
-			Dropped:  c.dropped.Swap(0),
-		}
-		if err := c.send(ctx, &batch); err != nil {
-			c.log.Debug("sentinel: telemetry push failed", zap.Error(err))
-			// keep requests (bounded) and merge counters back
 			if len(pending) > 20000 {
 				c.dropped.Add(int64(len(pending) - 20000))
-				pending = pending[len(pending)-20000:]
+				pending = append(pending[:0:0], pending[len(pending)-20000:]...)
 			}
-			c.mergeCounters(counters)
-			c.dropped.Add(batch.Dropped)
-			continue
+			if inflight == nil {
+				n := min(len(pending), protocol.MaxBatchRequests)
+				inflight = &protocol.Ingest{
+					Requests: append([]protocol.Request(nil), pending[:n]...),
+					Counters: c.takeCounters(),
+					Dropped:  c.dropped.Swap(0),
+					Batch:    newBatchID(),
+				}
+				pending = pending[n:]
+			}
+			inflight.Agent = c.status()
+			err := c.send(ctx, inflight)
+			var perm *permanentError
+			switch {
+			case err == nil:
+				inflight = nil
+			case errors.As(err, &perm):
+				// the panel will never accept this batch: drop it instead
+				// of blocking all later telemetry behind it
+				c.log.Warn("sentinel: telemetry batch rejected by the panel, dropped", zap.Int("requests", len(inflight.Requests)), zap.Error(err))
+				c.dropped.Add(int64(len(inflight.Requests)) + inflight.Dropped)
+				c.mergeCounters(inflight.Counters)
+				inflight = nil
+			default:
+				c.log.Debug("sentinel: telemetry push failed", zap.Error(err))
+			}
+			// catch up without waiting for the next tick while there is a backlog
+			if err != nil || len(pending) < protocol.MaxBatchRequests {
+				break
+			}
 		}
-		pending = pending[:0]
 	}
 }
+
+// maxCounterKeys bounds the per-host counters (random Host headers on a
+// catch-all site would otherwise grow them without limit).
+const maxCounterKeys = 5000
+
+func (c *core) takeCounters() []protocol.Counter {
+	c.cmu.Lock()
+	defer c.cmu.Unlock()
+	counters := make([]protocol.Counter, 0, len(c.counters))
+	for _, v := range c.counters {
+		counters = append(counters, *v)
+	}
+	c.counters = map[counterKey]*protocol.Counter{}
+	return counters
+}
+
+func newBatchID() string {
+	var b [12]byte
+	_, _ = crand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// permanentError: the panel rejected the batch itself (400/413/422).
+type permanentError struct{ status string }
+
+func (e *permanentError) Error() string { return "panel returned " + e.status }
 
 func (c *core) mergeCounters(cs []protocol.Counter) {
 	c.cmu.Lock()
@@ -436,6 +487,11 @@ func (c *core) mergeCounters(cs []protocol.Counter) {
 	for _, v := range cs {
 		k := counterKey{v.Host, v.Policy, v.Status, v.Action}
 		ct := c.counters[k]
+		if ct == nil && len(c.counters) >= maxCounterKeys {
+			k.host = "(weitere)"
+			ct = c.counters[k]
+			v.Host = k.host
+		}
 		if ct == nil {
 			cp := v
 			c.counters[k] = &cp
@@ -476,6 +532,10 @@ func (c *core) send(ctx context.Context, b *protocol.Ingest) error {
 	if resp.StatusCode/100 != 2 {
 		if resp.StatusCode == http.StatusUnauthorized {
 			c.tokenRejected()
+		}
+		switch resp.StatusCode {
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+			return &permanentError{resp.Status}
 		}
 		return errors.New("panel returned " + resp.Status)
 	}
@@ -616,4 +676,15 @@ func hostAddrs() []string {
 	}
 	addrCache.at, addrCache.list = time.Now(), out
 	return out
+}
+
+// safeCompile compiles a state from the panel; a malformed state must never
+// take Caddy down, so a panic is turned into an error.
+func safeCompile(s *protocol.State, prev *runtimeState) (rs *runtimeState, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			rs, err = nil, fmt.Errorf("compile state: %v", p)
+		}
+	}()
+	return compileState(s, prev), nil
 }

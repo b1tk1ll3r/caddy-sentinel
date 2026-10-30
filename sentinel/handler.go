@@ -7,6 +7,8 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -75,7 +77,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		clientIP, _, _ = net.SplitHostPort(r.RemoteAddr)
 	}
 	addr := parseAddr(clientIP)
-	host := hostOnly(r.Host)
+	host := truncate(hostOnly(r.Host), 253)
+
+	// Match rules against the path the backend will resolve: "/a/../b",
+	// "//b" and "/./b" all mean "/b" to file servers, PHP and most proxies.
+	// Only rewritten when needed, so encoded paths stay untouched.
+	if cp := canonicalPath(r.URL.Path); cp != r.URL.Path {
+		r.URL.Path, r.URL.RawPath = cp, ""
+	}
 
 	info := &reqInfo{start: start, html: wantsHTML(r) && r.Method != http.MethodHead}
 	info.rec = protocol.Request{
@@ -97,6 +106,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	st := c.state.Load()
 	if st == nil {
+		// unknown policies: never let clients inject identity headers
+		stripAuthHeaders(r)
 		if c.failClosed {
 			return h.finish(w, info, http.StatusServiceUnavailable, "", "sentinel has no state yet", 0)
 		}
@@ -119,6 +130,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	info.policy = pol
 	if pol != nil {
 		info.rec.Policy = pol.p.ID
+		// identity headers only ever come from Sentinel's own login, also
+		// for trusted sources and disabled policies
+		if pol.anyAuth {
+			stripAuthHeaders(r)
+		}
 	}
 
 	// trusted sources bypass everything
@@ -137,6 +153,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	if pol == nil || !pol.p.Enabled {
 		return h.passThrough(w, r, next, info)
+	}
+	if pol.broken && !strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
+		// a restricting rule could not be compiled and there is no earlier
+		// version of it: fail closed instead of leaving the area open
+		info.rec.Why = "Regel der Policy fehlerhaft: " + pol.brokenWhy
+		return h.finish(w, info, http.StatusServiceUnavailable, protocol.ActionPathBlock, "service unavailable", 0)
 	}
 	p := pol.p
 
@@ -366,7 +388,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				if n <= 0 {
 					n = 10
 				}
-				if ok, _, retry := c.rl.allow(p.ID+"|bot|"+b.Name+"|"+addr.String(), n, time.Minute, start); !ok {
+				if ok, _, retry := c.rl.allow(p.ID+"|bot|"+b.Name+"|"+rlClient(addr), n, time.Minute, start); !ok {
 					why := fmt.Sprintf("%s: mehr als %d Anfragen pro Minute", label, n)
 					if p.Test.Filters {
 						testMark(protocol.ActionBotLimit, b.Name, why)
@@ -398,7 +420,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				userKey = t.User
 			}
 		}
-		key := l.key(p.ID, addr.String(), userKey, r)
+		key := l.key(p.ID, rlClient(addr), userKey, r)
 		if key == "" {
 			continue
 		}
@@ -466,9 +488,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	// site login (AD/LDAP + TOTP)
 	if pol.anyAuth {
-		for _, hd := range authHeaders {
-			r.Header.Del(hd)
-		}
 		if strings.HasPrefix(r.URL.Path, authPrefix) {
 			return h.serveAuth(w, r, info, st, pol, addr)
 		}
@@ -691,7 +710,7 @@ func (l *crl) key(policy, ip, user string, r *http.Request) string {
 		}
 		return base + "u:" + strings.ToLower(user)
 	case l.rl.Key == "ip_path":
-		return base + ip + "|" + r.URL.Path
+		return base + ip + "|" + truncate(r.URL.Path, 256)
 	case l.rl.Key == "global":
 		return base + "*"
 	case strings.HasPrefix(l.rl.Key, "header:"):
@@ -699,7 +718,7 @@ func (l *crl) key(policy, ip, user string, r *http.Request) string {
 		if v == "" {
 			return base + ip
 		}
-		return base + "h:" + v
+		return base + "h:" + truncate(v, 256)
 	}
 	return base + ip
 }
@@ -837,4 +856,39 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request, info *reqInfo
 	info.rec.Dur = float64(time.Since(info.start).Microseconds()) / 1000
 	h.core.report(info.rec, false)
 	return nil
+}
+
+// stripAuthHeaders removes identity headers a client may have sent.
+func stripAuthHeaders(r *http.Request) {
+	for _, hd := range authHeaders {
+		r.Header.Del(hd)
+	}
+}
+
+// canonicalPath resolves "." and ".." segments and merges slashes; a
+// trailing slash is kept. Non-absolute paths ("*" for OPTIONS) stay as they are.
+func canonicalPath(p string) string {
+	if !strings.HasPrefix(p, "/") {
+		return p
+	}
+	if !strings.Contains(p, "//") && !strings.Contains(p, "/.") {
+		return p
+	}
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && c != "/" {
+		c += "/"
+	}
+	return c
+}
+
+// rlClient is the client identity for rate limits: the address for IPv4,
+// the /64 network for IPv6 (one subscriber usually owns a whole /64, so
+// rotating addresses inside it must not reset the counters).
+func rlClient(a netip.Addr) string {
+	if a.Is6() && !a.Is4In6() {
+		if p, err := a.Prefix(64); err == nil {
+			return p.String()
+		}
+	}
+	return a.String()
 }

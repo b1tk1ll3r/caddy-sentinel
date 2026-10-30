@@ -45,6 +45,7 @@ export { tags } from "@lezer/highlight";
 TS
 
 go run github.com/evanw/esbuild/cmd/esbuild@v0.25.10 entry.ts --bundle --format=esm --minify --target=es2020 --legal-comments=none \
+  --banner:js="/*! CodeMirror 6 (@codemirror/*, @lezer/*, style-mod, w3c-keyname, crelt, find-cluster-break) | (c) Marijn Haverbeke and others | MIT License | vendor/LICENSE-codemirror.txt */" \
   --alias:@codemirror/state=./state/src/index.ts --alias:@codemirror/view=./view/src/index.ts \
   --alias:@codemirror/commands=./commands/src/commands.ts --alias:@codemirror/language=./language/src/index.ts \
   --alias:@codemirror/search=./search/src/search.ts --alias:@codemirror/autocomplete=./autocomplete/src/index.ts \

@@ -26,6 +26,7 @@ DATA_DIR=${SENTINEL_DATA:-/var/lib/caddy-sentinel}
 BACKUP_ROOT=/var/backups/caddy-sentinel
 CADDYFILE=/etc/caddy/Caddyfile
 KEEP_BACKUPS=5
+KEEP_DB_BACKUPS=2
 
 MODE=update
 VERSION=""
@@ -103,7 +104,12 @@ panel_url() {
 	local l
 	l=$(sed -n 's/^SENTINEL_LISTEN=//p' /etc/default/caddy-sentinel 2>/dev/null | tail -n1)
 	l=${l:-127.0.0.1:7600}
-	echo "http://${l/0.0.0.0/127.0.0.1}"
+	case "$l" in
+	0.0.0.0:*) l=127.0.0.1:${l#0.0.0.0:} ;;
+	"[::]:"*) l="[::1]:${l#\[::\]:}" ;;
+	:*) l=127.0.0.1$l ;;
+	esac
+	echo "http://$l"
 }
 http_ok() { curl -fsS -o /dev/null --max-time 3 "$1" 2>/dev/null || wget -q -O /dev/null -T 3 "$1" 2>/dev/null; }
 
@@ -128,24 +134,38 @@ wait_caddy() {
 }
 
 # ------------------------------------------------------------ Sicherung
+# Platz für die Sicherung prüfen, bevor etwas gestoppt wird
+check_backup_space() {
+	local need avail
+	install -d -m 0700 "$BACKUP_ROOT"
+	need=$(du -sk "$BIN_DIR/caddy-sentinel" "$BIN_DIR/caddy" "$DATA_DIR"/sentinel.db* 2>/dev/null | awk '{s+=$1} END {print int(s*1.1)+51200}')
+	avail=$(df -Pk "$BACKUP_ROOT" | awk 'NR==2 {print $4}')
+	[ -n "$avail" ] && [ "$avail" -lt "$need" ] && die "Zu wenig Platz in $BACKUP_ROOT für die Sicherung ($((need / 1024)) MB nötig, $((avail / 1024)) MB frei). Alte Sicherungen löschen oder Platz schaffen."
+	return 0
+}
+
+# setzt BACKUP; bricht bei jedem Fehler ab (kein "$(…)": dort gilt set -e nicht)
 backup() {
 	local dir
 	dir="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$CURRENT"
-	install -d -m 0700 "$dir"
-	cp -a "$BIN_DIR/caddy-sentinel" "$dir/"
-	[ "$HAS_CADDY" = 1 ] && cp -a "$BIN_DIR/caddy" "$dir/"
+	install -d -m 0700 "$dir" || return 1
+	cp -a "$BIN_DIR/caddy-sentinel" "$dir/" || return 1
+	if [ "$HAS_CADDY" = 1 ]; then cp -a "$BIN_DIR/caddy" "$dir/" || return 1; fi
 	cp -a /etc/systemd/system/caddy-sentinel.service "$dir/" 2>/dev/null || true
 	cp -a /etc/systemd/system/caddy.service.d/sentinel.conf "$dir/caddy-override.conf" 2>/dev/null || true
 	cp -a /etc/default/caddy-sentinel "$dir/caddy-sentinel.env" 2>/dev/null || true
 	cp -a "$CADDYFILE" "$dir/Caddyfile" 2>/dev/null || true
 	# Datenbank konsistent sichern: Panel ist zu diesem Zeitpunkt gestoppt
 	for f in "$DATA_DIR"/sentinel.db "$DATA_DIR"/sentinel.db-wal "$DATA_DIR"/sentinel.db-shm; do
-		[ -f "$f" ] && cp -a "$f" "$dir/"
+		if [ -f "$f" ]; then cp -a "$f" "$dir/" || return 1; fi
 	done
-	echo "$CURRENT" >"$dir/VERSION"
-	# alte Sicherungen aufräumen
+	echo "$CURRENT" >"$dir/VERSION" || return 1
+	sync
+	# alte Sicherungen aufräumen: Programme der letzten $KEEP_BACKUPS Versionen,
+	# die (große) Datenbank nur in den letzten $KEEP_DB_BACKUPS
 	find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KEEP_BACKUPS" | xargs -r rm -rf
-	echo "$dir"
+	find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KEEP_DB_BACKUPS" | while read -r d; do rm -f "$d"/sentinel.db*; done
+	BACKUP=$dir
 }
 
 restore() { # dir with_db
@@ -253,6 +273,7 @@ if [ "$AGENT" = 1 ]; then
 	install -d -m 0700 "$BACKUP"
 	cp -a "$BIN_DIR/caddy" "$BACKUP/caddy"
 	echo "$CURRENT" >"$BACKUP/VERSION"
+	find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KEEP_BACKUPS" | xargs -r rm -rf
 	say "Installiere Caddy $("$SRC/caddy" version | awk '{print $1}')"
 	install -m 0755 "$SRC/caddy" "$BIN_DIR/caddy"
 	command -v setcap >/dev/null && setcap cap_net_bind_service=+ep "$BIN_DIR/caddy" || true
@@ -262,6 +283,10 @@ if [ "$AGENT" = 1 ]; then
 		systemctl restart caddy || true
 		die "Update fehlgeschlagen, alte Version ist wieder aktiv."
 	fi
+	install -d -m 0755 /usr/local/share/doc/caddy-sentinel
+	for f in LICENSE NOTICE AUTHORS THIRD_PARTY_LICENSES.txt; do
+		[ -f "$SRC/$f" ] && install -m 0644 "$SRC/$f" /usr/local/share/doc/caddy-sentinel/
+	done
 	for s in update uninstall; do
 		[ -f "$SRC/$s.sh" ] && install -m 0755 "$SRC/$s.sh" "/usr/local/sbin/caddy-sentinel-$s"
 	done
@@ -272,8 +297,12 @@ fi
 
 # ------------------------------------------------------------ Panel
 say "Sichere aktuelle Installation"
+check_backup_space
 systemctl stop caddy-sentinel
-BACKUP=$(backup)
+if ! backup; then
+	systemctl start caddy-sentinel || true
+	die "Sicherung nach $BACKUP_ROOT fehlgeschlagen – Update abgebrochen, die bisherige Version läuft weiter."
+fi
 echo "    $BACKUP"
 
 rollback() {
@@ -296,6 +325,10 @@ if [ "$HAS_CADDY" = 1 ] && [ -f "$SRC/deploy/caddy-override.conf" ]; then
 		say "Caddy-Override aktualisiert"
 	fi
 fi
+install -d -m 0755 /usr/local/share/doc/caddy-sentinel
+for f in LICENSE NOTICE AUTHORS THIRD_PARTY_LICENSES.txt; do
+	[ -f "$SRC/$f" ] && install -m 0644 "$SRC/$f" /usr/local/share/doc/caddy-sentinel/
+done
 for s in update uninstall; do
 	[ -f "$SRC/$s.sh" ] && install -m 0755 "$SRC/$s.sh" "/usr/local/sbin/caddy-sentinel-$s"
 done

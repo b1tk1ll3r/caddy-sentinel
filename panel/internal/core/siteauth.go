@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -308,6 +309,7 @@ func (s *Server) handleAgentAuth(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	req.Inst = agentInst(r)
 	writeJSON(w, 200, s.e.siteLogin(req))
 }
 
@@ -529,6 +531,13 @@ func (e *Engine) afterPrimary(req protocol.AuthRequest, a protocol.AuthPolicy, i
 func (e *Engine) loginOK(req protocol.AuthRequest, id *DirIdentity, a protocol.AuthPolicy, detail string, factors int) *protocol.AuthResponse {
 	_ = e.Store.DirLogin(id.Username, req.IP, req.Host)
 	e.access(req, id.Username, "ok", detail)
+	src := ""
+	if du, err := e.Store.DirUser(id.Username); err == nil {
+		src = du.Source
+		if src == store.SourceLDAP {
+			src = "directory" // name used in AuthPolicy.Sources
+		}
+	}
 	// only hand out groups relevant for access decisions plus a few more;
 	// the agent re-checks them against the policy on every request
 	groups := id.Groups
@@ -545,7 +554,7 @@ func (e *Engine) loginOK(req protocol.AuthRequest, id *DirIdentity, a protocol.A
 	}
 	return &protocol.AuthResponse{
 		Status:         "ok",
-		User:           &protocol.AuthUser{Name: id.Username, Display: id.Display, Email: id.Email, Groups: groups},
+		User:           &protocol.AuthUser{Name: id.Username, Display: id.Display, Email: id.Email, Groups: groups, Source: src},
 		SessionSeconds: a.SessionHours * 3600,
 		Factors:        factors,
 	}
@@ -681,7 +690,11 @@ func (s *Server) handleDirTest(w http.ResponseWriter, r *http.Request) {
 	}
 	d := s.e.Settings().Directory
 	if req.Directory != nil {
-		if req.Directory.BindPassword == "" {
+		// reuse the stored bind password only for the same servers and
+		// account – never hand it to a server typed into the form
+		probe := *req.Directory
+		_ = normalizeDirectory(&probe)
+		if req.Directory.BindPassword == "" && slices.Equal(probe.URLs, d.URLs) && strings.EqualFold(strings.TrimSpace(probe.BindDN), strings.TrimSpace(d.BindDN)) {
 			req.Directory.BindPassword = d.BindPassword
 		}
 		d = *req.Directory

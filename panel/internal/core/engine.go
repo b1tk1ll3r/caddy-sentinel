@@ -68,6 +68,8 @@ type Engine struct {
 	feeds           *feedManager
 	mon             *monitorRunner
 	geo             atomic.Pointer[geoip.DB]
+	loops           sync.WaitGroup // background loops (Run), awaited on shutdown
+	rebuildMu       sync.Mutex
 	challengeSecret string
 
 	cfgMu sync.Mutex // serialises Caddyfile apply
@@ -136,15 +138,27 @@ func (e *Engine) Cfg() Config { return e.cfg }
 
 // Run starts background loops.
 func (e *Engine) Run(ctx context.Context) {
-	go e.Notify.run(ctx)
-	go e.IDS.run(ctx)
-	go e.alerts.run(ctx)
-	go e.maintenanceLoop(ctx)
-	go e.aggLoop(ctx)
-	go e.feeds.run(ctx)
-	go e.mon.run(ctx)
-	go e.certLoop(ctx)
-	go e.reportLoop(ctx)
+	for _, f := range []func(context.Context){e.Notify.run, e.IDS.run, e.alerts.run, e.maintenanceLoop,
+		e.aggLoop, e.feeds.run, e.mon.run, e.certLoop, e.reportLoop} {
+		e.loops.Add(1)
+		go func() {
+			defer e.loops.Done()
+			f(ctx)
+		}()
+	}
+}
+
+// Wait blocks until the background loops started by Run have returned
+// (after ctx was cancelled), at most d.
+func (e *Engine) Wait(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { e.loops.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 func (e *Engine) maintenanceLoop(ctx context.Context) {
@@ -806,6 +820,10 @@ func (e *Engine) BuildState() (*protocol.State, map[string][]string) {
 
 // Rebuild recomputes the agent state and wakes long-polling agents.
 func (e *Engine) Rebuild(reason string) {
+	// One rebuild at a time: a rebuild that started later always reads the
+	// newer data (e.g. a ban the IDS just stored) and publishes last.
+	e.rebuildMu.Lock()
+	defer e.rebuildMu.Unlock()
 	st, errs := e.BuildState()
 	e.stateMu.Lock()
 	v := time.Now().UnixMilli()

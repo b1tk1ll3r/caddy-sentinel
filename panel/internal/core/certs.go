@@ -126,7 +126,11 @@ func (e *Engine) certLoop(ctx context.Context) {
 	}
 	t := time.NewTicker(1 * time.Hour)
 	defer t.Stop()
-	time.Sleep(30 * time.Second)
+	select { // let Caddy start first; end at once on shutdown
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
 	check()
 	for {
 		select {

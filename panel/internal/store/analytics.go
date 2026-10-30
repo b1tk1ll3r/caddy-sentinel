@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -18,7 +19,11 @@ func (s *Store) InsertRequests(reqs []protocol.Request) error {
 	if len(reqs) == 0 {
 		return nil
 	}
-	return s.Tx(context.Background(), func(tx *sql.Tx) error {
+	return s.Tx(context.Background(), func(tx *sql.Tx) error { return s.insertRequestsTx(tx, reqs) })
+}
+
+func (s *Store) insertRequestsTx(tx *sql.Tx, reqs []protocol.Request) error {
+	{
 		st, err := tx.Prepare(`INSERT INTO requests(ts,host,method,path,query,ip,ua,ref,proto,status,bytes,dur,policy,action,detail,waf_score,hits,sampled,cc,asn,aso,usr,sref,why,rule,port,inst)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
@@ -53,6 +58,33 @@ func (s *Store) InsertRequests(reqs []protocol.Request) error {
 			}
 		}
 		return nil
+	}
+}
+
+// ErrDuplicateBatch: this ingest batch was stored before (agent retry).
+var ErrDuplicateBatch = errors.New("batch already stored")
+
+// IngestBatch stores the counters and request records of one agent batch in
+// a single transaction. A non-empty batch ID is recorded in the same
+// transaction, so a retried batch is recognised and never stored twice.
+func (s *Store) IngestBatch(batch string, minute int64, cs []protocol.Counter, reqs []protocol.Request) error {
+	return s.Tx(context.Background(), func(tx *sql.Tx) error {
+		if batch != "" {
+			res, err := tx.Exec(`INSERT OR IGNORE INTO ingest_batches(id, ts) VALUES(?, ?)`, batch, time.Now().Unix())
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return ErrDuplicateBatch
+			}
+		}
+		if err := s.addRollupsTx(tx, minute, cs); err != nil {
+			return err
+		}
+		if len(reqs) > 0 {
+			return s.insertRequestsTx(tx, reqs)
+		}
+		return nil
 	})
 }
 
@@ -61,7 +93,11 @@ func (s *Store) AddRollups(minute int64, cs []protocol.Counter) error {
 	if len(cs) == 0 {
 		return nil
 	}
-	return s.Tx(context.Background(), func(tx *sql.Tx) error {
+	return s.Tx(context.Background(), func(tx *sql.Tx) error { return s.addRollupsTx(tx, minute, cs) })
+}
+
+func (s *Store) addRollupsTx(tx *sql.Tx, minute int64, cs []protocol.Counter) error {
+	{
 		for _, c := range cs {
 			var existing string
 			err := tx.QueryRow(`SELECT buckets FROM rollups WHERE minute=? AND inst=? AND host=? AND policy=? AND status=? AND action=?`,
@@ -82,7 +118,7 @@ func (s *Store) AddRollups(minute int64, cs []protocol.Counter) error {
 			}
 		}
 		return nil
-	})
+	}
 }
 
 func addBuckets(a, b []int64) []int64 {
