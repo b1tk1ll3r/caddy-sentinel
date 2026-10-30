@@ -152,6 +152,38 @@ func (e *Engine) collectWarnings(ctx context.Context, only string) []Warning {
 			add(Warning{Severity: ev.Severity, Kind: "spike", Inst: ev.Inst, Title: ev.Title, Href: d.Link, Detail: "vor " + time.Since(time.UnixMilli(ev.TS)).Round(time.Minute).String()})
 		}
 	}
+	// maintenance and things that end soon
+	now := time.Now()
+	for _, p := range e.Policies() {
+		if p.MaintenanceActive(now.Unix()) {
+			d := "Besucher sehen die Wartungsseite (503)."
+			if p.MaintenanceUntil > 0 {
+				d = "Endet planmäßig " + time.Unix(p.MaintenanceUntil, 0).Format("02.01. 15:04") + ". " + d
+			} else {
+				d = "Ohne geplantes Ende – nach der Wartung ausschalten. " + d
+			}
+			add(Warning{Severity: 2, Kind: "maintenance", Title: "Wartungsmodus aktiv: „" + p.Name + "“", Detail: d, Href: "#/policies/" + p.ID + "?tab=general"})
+		} else if p.Maintenance && p.MaintenanceFrom > now.Unix() && p.MaintenanceFrom-now.Unix() < 7*86400 {
+			add(Warning{Severity: 1, Kind: "maintenance", Title: "Wartung geplant: „" + p.Name + "“ ab " + time.Unix(p.MaintenanceFrom, 0).Format("02.01. 15:04"), Href: "#/policies/" + p.ID + "?tab=general"})
+		}
+		for _, r := range p.PathRules {
+			if r.Enabled && r.Until > now.Unix() && r.Until-now.Unix() < 86400 {
+				add(Warning{Severity: 1, Kind: "expiry", Title: "Pfad-Regel „" + r.Name + "“ in „" + p.Name + "“ endet " + time.Unix(r.Until, 0).Format("02.01. 15:04"),
+					Detail: "Danach schaltet Sentinel sie aus. Zum Verlängern das Enddatum ändern.", Href: "#/policies/" + p.ID + "?tab=rules"})
+			}
+		}
+	}
+	if ts, err := e.Store.SiteTokens(""); err == nil {
+		n := 0
+		for _, t := range ts {
+			if t.Expires > now.Unix() && t.Expires-now.Unix() < 7*86400 {
+				n++
+			}
+		}
+		if n > 0 {
+			add(Warning{Severity: 1, Kind: "expiry", Title: fmt.Sprintf("%d Zugriffstoken laufen in den nächsten 7 Tagen ab", n), Detail: "Skripte und Dienste mit diesen Tokens werden danach abgewiesen.", Href: "#/access?tab=tokens"})
+		}
+	}
 	if e.Settings().IDS.DryRun {
 		add(Warning{Severity: 1, Kind: "ids", Title: "Bedrohungserkennung im Probebetrieb", Detail: "Das IDS sperrt keine IPs, es meldet nur.", Href: "#/settings?tab=ids"})
 	}

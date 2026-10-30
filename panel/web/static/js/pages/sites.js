@@ -1,4 +1,6 @@
-import { el, mount, get, put, panel, fmtInt, fmtMs, empty, select, toast, errToast } from '../ui.js';
+import { el, mount, get, put, panel, fmtInt, fmtMs, empty, select, toast, errToast, modal, field, untilInput, fmtUnix, can, linesInput } from '../ui.js';
+import { setActions } from '../app.js';
+import { openSiteWizard } from '../sitewizard.js';
 import { withInstance } from '../instancebar.js';
 import { spark } from '../charts.js';
 
@@ -13,6 +15,32 @@ export async function render(root, _p, scope) {
   }
   try { ups = await get('/caddy/upstreams', scope.signal); } catch { }
   const policies = pols.policies;
+  setActions(el('button.btn.primary', { onclick: () => openSiteWizard({ onDone: () => render(root, _p, scope) }) }, 'Neue Site …'));
+  const now = Date.now() / 1000;
+  const maintOn = (p) => p && p.maintenance && (!p.maintenance_from || p.maintenance_from <= now) && (!p.maintenance_until || p.maintenance_until > now);
+  const maintenance = (pid) => {
+    const p = policies.find(x => x.id === pid);
+    if (!p) return;
+    if (maintOn(p)) {
+      put('/policies/' + p.id, { ...p, maintenance: false, maintenance_from: 0, maintenance_until: 0 }).then(() => { toast(`Wartung für „${p.name}“ beendet`, 'ok'); render(root, _p, scope); }).catch(errToast);
+      return;
+    }
+    const st = { msg: p.maintenance_message || '', until: Math.floor(now) + 3600, allow: [...(p.maintenance_allow || [])] };
+    const myIP = window.__status?.client_ip;
+    modal(`Wartung: „${p.name}“`, el('div.stack', null,
+      el('p.muted', { style: { margin: 0 } }, 'Alle Sites dieser Policy (' + ((p.hosts || []).join(', ') || 'Standard') + ') zeigen eine Wartungsseite. Nach dem Ende schaltet Sentinel sie selbst wieder frei.'),
+      field('Meldung', el('input', { value: st.msg, placeholder: 'Wartungsarbeiten – bitte später erneut versuchen.', oninput: (e) => { st.msg = e.target.value; } })),
+      el('label.field', null, el('span', null, 'Endet'), untilInput(st.until, (v) => { st.until = v; })),
+      field('Trotzdem erreichbar für', linesInput(st.allow, (v) => { st.allow = v; }, { rows: 2, placeholder: myIP || '192.168.10.0/24' }), myIP ? 'Deine IP: ' + myIP : '')), {
+      actions: [{ label: 'Abbrechen' }, {
+        label: 'Wartung starten', kind: 'danger', onClick: async () => {
+          await put('/policies/' + p.id, { ...p, maintenance: true, maintenance_message: st.msg, maintenance_from: 0, maintenance_until: st.until, maintenance_allow: st.allow });
+          toast('Wartungsmodus aktiv' + (st.until ? ' bis ' + fmtUnix(st.until) : ''), 'ok');
+          render(root, _p, scope);
+        },
+      }],
+    });
+  };
 
   const assign = async (host, policyId) => {
     try {
@@ -50,7 +78,10 @@ export async function render(root, _p, scope) {
               : el('div.row', { style: { gap: '6px' } }, el('span.badge.ok', null, 'aktiv'),
                 hostKey ? select(policies.map(p => [p.id, p.name + (p.id === pols.default ? ' (Standard)' : '')]), s.policy, (v) => assign(hostKey, v), { 'aria-label': 'Policy für ' + host })
                   : el('a', { href: '#/policies/' + s.policy }, s.policy_name)))
-            : el('span.badge.warn', null, 'fehlt')),
+            : el('span.badge.warn', null, 'fehlt'),
+            s.sentinel && can('policy') ? el('div', { style: { marginTop: '4px' } }, maintOn(policies.find(x => x.id === s.policy))
+              ? el('button.btn.sm.danger', { onclick: () => maintenance(s.policy), title: 'Wartung beenden' }, '⚒ Wartung aktiv – beenden')
+              : el('button.btn.sm.ghost', { onclick: () => maintenance(s.policy) }, '⚒ Wartung …')) : null),
           el('td', null, spark(s.spark || [], { width: 140 }), el('small', null, fmtInt(s.requests))),
           el('td.num', { style: { color: s.errors ? 'var(--bad)' : null } }, fmtInt(s.errors)),
           el('td.num', null, fmtInt(s.blocked)),

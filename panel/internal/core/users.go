@@ -466,6 +466,16 @@ var auditLabels = map[string]string{
 	"PUT /api/instances/{id}":                "Caddy-Instanz geändert",
 	"DELETE /api/instances/{id}":             "Caddy-Instanz entfernt",
 	"POST /api/instances/{id}/rotate":        "Instanz-Token erneuert",
+	"POST /api/access/accounts":              "Zugangskonto angelegt",
+	"PUT /api/access/users/{name}":           "Konto geändert",
+	"POST /api/access/users/{name}/password": "Passwort eines Zugangskontos gesetzt",
+	"POST /api/access/users/{name}/{action}": "Konto",
+	"DELETE /api/access/users/{name}":        "Konto entfernt",
+	"POST /api/access/tokens":                "Zugriffstoken erstellt",
+	"DELETE /api/access/tokens/{id}":         "Zugriffstoken widerrufen",
+	"PUT /api/bans/{ip}/note":                "Notiz zur Sperre geändert",
+	"DELETE /api/temp/{id}":                  "Befristeter Eintrag entfernt",
+	"DELETE /api/mutes/{key}":                "Stummschaltung aufgehoben",
 }
 
 type statusRecorder struct {

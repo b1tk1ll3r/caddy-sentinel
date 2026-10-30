@@ -1,7 +1,7 @@
-import { del, el, mount, get, post, put, panel, tabs, field, toggle, select, linesInput, toast, errToast, confirmDialog, copy, fmtBytes, fmtAgo, empty, ROLES, roleLabel, modal } from '../ui.js';
+import { del, el, mount, get, post, put, panel, tabs, field, toggle, select, linesInput, toast, errToast, confirmDialog, copy, fmtBytes, fmtAgo, empty, ROLES, roleLabel, modal, untilInput, fmtUnix, fmtUntil, can } from '../ui.js';
 import { setActions } from '../app.js';
 
-const SIGNALS = { waf_block: 'WAF-Block', waf_detect: 'WAF-Treffer (je 5 Score)', honeypot: 'Honeypot-Treffer', not_found: '404-Antwort', auth_fail: '401/403 / Login fehlgeschlagen', path_block: 'Pfad-Sperre (Regel)', bad_request: '400-Antwort', scanner_ua: 'Angriffstool erkannt', rate_limit: 'Ratelimit überschritten', user_agent: 'Gesperrter User-Agent', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß', geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed-Block', challenge: 'Challenge ausgeliefert' };
+const SIGNALS = { waf_block: 'WAF-Block', waf_detect: 'WAF-Treffer (je 5 Score)', honeypot: 'Honeypot-Treffer', not_found: '404-Antwort', auth_fail: '401/403 / Login fehlgeschlagen', path_block: 'Pfad-Sperre (Regel)', bad_request: '400-Antwort', scanner_ua: 'Angriffstool erkannt', rate_limit: 'Ratelimit überschritten', user_agent: 'Gesperrter User-Agent', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß', geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed-Block', challenge: 'Challenge ausgeliefert', bot_fake: 'Gefälschter Suchmaschinen-Bot', bot: 'Crawler gesperrt/gebremst' };
 
 export async function render(root, _p, scope, q) {
   const data = await get('/settings', scope.signal);
@@ -22,11 +22,12 @@ export async function render(root, _p, scope, q) {
   const body = el('div.stack');
   const draw = () => {
     history.replaceState(null, '', '#/settings?tab=' + tab);
-    const tabList = [['ids', 'Bedrohungserkennung'], ['alerts', 'Benachrichtigungen'], ['network', 'Netz & Vertrauen'], ['data', 'Telemetrie & Speicher'], ['agent', 'Agent & Caddy'], ['users', 'Benutzer'], ['backup', 'Sicherung'], ['account', 'Konto & Sicherheit']]
-      .filter(([k]) => isAdmin || k === 'account');
-    if (!isAdmin) tab = 'account';
+    const tabList = [['ids', 'Bedrohungserkennung'], ['alerts', 'Benachrichtigungen'], ['network', 'Netz & Vertrauen'], ['data', 'Telemetrie & Speicher'], ['agent', 'Agent & Caddy'], ['users', 'Benutzer'], ['backup', 'Sicherung'], ['account', 'Konto & Sicherheit'], ['tokens', 'API-Tokens']]
+      .filter(([k]) => isAdmin || k === 'account' || k === 'tokens');
+    if (!isAdmin && tab !== 'tokens') tab = 'account';
     mount(root, tabs(tabList, tab, (t) => { tab = t; draw(); }), body);
-    ({ ids, alerts, network, dataTab, agent, users, backup, account })[tab === 'data' ? 'dataTab' : tab]();
+    setActions(['account', 'tokens'].includes(tab) ? null : saveBtn);
+    ({ ids, alerts, network, dataTab, agent, users, backup, account, tokens })[tab === 'data' ? 'dataTab' : tab]();
   };
 
   const num = (obj, key, attrs = {}) => el('input', { type: 'number', value: obj[key] ?? 0, ...attrs, oninput: (e) => { obj[key] = attrs.float ? parseFloat(e.target.value) : +e.target.value; markDirty(); } });
@@ -87,9 +88,10 @@ export async function render(root, _p, scope, q) {
         el('button.btn.sm', { onclick: async () => { try { await post('/settings/webhooks/test', w); toast('Testnachricht gesendet', 'ok'); } catch (e) { errToast(e); } } }, 'Testen'),
         el('button.icon-btn', { onclick: () => { s.webhooks.splice(i, 1); markDirty(); drawHooks(); } }, '✕')),
       el('div.rule-body', null, el('div.fields', null,
-        field('Format', select([['email', 'E-Mail'], ['discord', 'Discord'], ['slack', 'Slack / Mattermost / Rocket.Chat'], ['teams', 'Microsoft Teams'], ['ntfy', 'ntfy'], ['gotify', 'Gotify'], ['json', 'Generisches JSON']], w.format, (v) => { w.format = v; markDirty(); drawHooks(); })),
-        el('div.field', { style: { gridColumn: 'span 2' } }, el('span', null, w.format === 'email' ? 'Empfänger' : 'URL'), el('input.mono', { value: w.url, placeholder: w.format === 'email' ? 'admin@example.com, it@example.com' : 'https://…', oninput: (e) => { w.url = e.target.value; markDirty(); } })),
-        field('Token (optional)', el('input', { value: w.token || '', type: 'password', autocomplete: 'off', oninput: (e) => { w.token = e.target.value; markDirty(); } }), 'ntfy/JSON: Bearer, Gotify: App-Token'),
+        field('Format', select([['email', 'E-Mail'], ['teams', 'Microsoft Teams (Workflows)'], ['matrix', 'Matrix'], ['ntfy', 'ntfy (Handy)'], ['telegram', 'Telegram'], ['slack', 'Slack / Mattermost / Rocket.Chat'], ['discord', 'Discord'], ['gotify', 'Gotify'], ['json', 'Generisches JSON']], w.format, (v) => { w.format = v; markDirty(); drawHooks(); })),
+        w.format === 'telegram' ? null : el('div.field', { style: { gridColumn: 'span 2' } }, el('span', null, { email: 'Empfänger', matrix: 'Homeserver' }[w.format] || 'URL'), el('input.mono', { value: w.url, placeholder: { email: 'admin@example.com, it@example.com', matrix: 'https://matrix.example.org', ntfy: 'https://ntfy.sh/mein-geheimes-thema', teams: 'https://…logic.azure.com/workflows/…' }[w.format] || 'https://…', oninput: (e) => { w.url = e.target.value; markDirty(); } })),
+        w.format === 'matrix' || w.format === 'telegram' ? field(w.format === 'matrix' ? 'Raum-ID' : 'Chat-ID', el('input.mono', { value: w.room || '', placeholder: w.format === 'matrix' ? '!abcdef:example.org' : '-1001234567890', oninput: (e) => { w.room = e.target.value.trim(); markDirty(); } })) : null,
+        w.format === 'email' ? null : field({ matrix: 'Access-Token', telegram: 'Bot-Token', gotify: 'App-Token' }[w.format] || 'Token (optional)', el('input', { value: w.token || '', type: 'password', autocomplete: 'off', placeholder: data.secrets_set?.['webhook_' + w.id] ? '•••••• gespeichert' : '', oninput: (e) => { w.token = e.target.value; markDirty(); } }), { ntfy: 'Bearer-Token, falls das Thema geschützt ist', json: 'wird als Bearer gesendet', matrix: 'Token eines Bot-Kontos, das im Raum ist', telegram: 'von @BotFather' }[w.format] || ''),
         field('Mindest-Schwere', select([[0, 'Info'], [1, 'Niedrig'], [2, 'Mittel'], [3, 'Hoch'], [4, 'Kritisch']], w.min_severity, (v) => { w.min_severity = +v; markDirty(); })),
         field('Arten', el('input', { value: (w.types || []).join(', '), placeholder: 'alle (z. B. ban, alert, waf, config)', oninput: (e) => { w.types = e.target.value.split(',').map(x => x.trim()).filter(Boolean); markDirty(); } })))))) : el('p.muted', null, 'Noch keine Benachrichtigungen eingerichtet.'));
     drawHooks();
@@ -116,8 +118,23 @@ export async function render(root, _p, scope, q) {
         field('Absender', el('input', { value: s.smtp.from || '', placeholder: 'sentinel@example.com', oninput: (e) => { s.smtp.from = e.target.value; markDirty(); } })),
         field('Benutzer', el('input', { value: s.smtp.username || '', autocomplete: 'off', oninput: (e) => { s.smtp.username = e.target.value; markDirty(); } })),
         field('Passwort', el('input', { type: 'password', value: '', placeholder: data.secrets_set?.smtp_password ? '•••••• gespeichert – leer lassen zum Beibehalten' : '', autocomplete: 'new-password', oninput: (e) => { s.smtp.password = e.target.value; markDirty(); } })))),
-      panel('Webhooks & E-Mail-Empfänger', el('div.stack', null, hooks,
-        el('div.row', null, el('button.btn', { onclick: () => { s.webhooks.push({ id: '', name: 'Neuer Webhook', url: '', format: 'discord', min_severity: 2, types: ['ban', 'alert', 'agent'], enabled: true }); markDirty(); drawHooks(); } }, 'Webhook hinzufügen')))));
+      panel('Benachrichtigungen', el('div.stack', null,
+        el('p.muted', { style: { margin: 0 } }, 'Mit eingetragener Panel-URL enthalten Nachrichten Knöpfe: „IP 24 h sperren“ bzw. „Sperre aufheben“, „24 h stummschalten“ und „Im Panel öffnen“. Die Links sind 24 Stunden gültig, nur einmal verwendbar und fragen vor der Aktion nach (Link-Vorschauen lösen nichts aus). Bei ntfy führen die Knöpfe die Aktion direkt aus.'),
+        !s.panel_url ? el('div.callout.warn', null, 'Ohne Panel-URL (oben unter Alarme) gibt es keine Knöpfe in den Nachrichten.') : null,
+        hooks,
+        el('div.row', null, el('button.btn', { onclick: () => { s.webhooks.push({ id: '', name: 'Neue Benachrichtigung', url: '', format: 'teams', min_severity: 2, types: ['ban', 'alert', 'agent'], enabled: true }); markDirty(); drawHooks(); } }, 'Benachrichtigung hinzufügen')))),
+      panel('Stummgeschaltet', mutesBox()));
+  }
+
+  function mutesBox() {
+    const box = el('div');
+    const load = () => get('/mutes').then(list => mount(box, list.length ? el('table', null,
+      el('thead', null, el('tr', null, el('th', null, 'Benachrichtigung'), el('th', null, 'Bis'), el('th', null, 'Von'), el('th'))),
+      el('tbody', null, list.map(m => el('tr', null, el('td', null, m.title || m.key), el('td.nowrap', { title: fmtUnix(m.until) }, fmtUntil(m.until)), el('td.muted', null, m.author),
+        el('td.right', null, can('bans') ? el('button.btn.sm', { onclick: async () => { try { await del('/mutes/' + encodeURIComponent(m.key)); load(); } catch (e) { errToast(e); } } }, 'Wieder melden') : null)))))
+      : el('p.muted', null, 'Nichts stummgeschaltet. Stummschalten geht über den Knopf in einer Benachrichtigung.'))).catch(e => mount(box, el('div.callout.bad', null, e.message)));
+    load();
+    return box;
   }
 
   function network() {
@@ -259,11 +276,13 @@ export async function render(root, _p, scope, q) {
   function account() {
     let cur, n1, n2;
     const theme = localStorage.getItem('sentinel.theme') || 'auto';
-    if (me.source === 'ldap') {
+    if (me.source && me.source !== 'local') {
       mount(body,
         panel('Verzeichniskonto', el('div.stack', null,
-          el('p', null, 'Du bist mit deinem Active-Directory-Konto ', el('b', null, me.username), ' angemeldet. Passwort und Gruppen verwaltest du im Verzeichnis; der zweite Faktor ist derselbe wie bei der Site-Anmeldung.'),
-          el('p.muted', null, 'Deine Rolle (', roleLabel(me.role), ') ergibt sich bei jeder Anmeldung aus den Gruppen unter Site-Login › Verzeichnis.'))),
+          me.source === 'ldap'
+            ? el('p', null, 'Du bist mit deinem Active-Directory-Konto ', el('b', null, me.username), ' angemeldet. Passwort und Gruppen verwaltest du im Verzeichnis; der zweite Faktor ist derselbe wie bei der Site-Anmeldung.')
+            : el('p', null, 'Du bist über ', el('b', null, me.source.replace(/^oidc:/, '')), ' (OAuth/OIDC) als ', el('b', null, me.username), ' angemeldet. Passwort und zweiter Faktor liegen beim Anbieter.'),
+          el('p.muted', null, 'Deine Rolle (', roleLabel(me.role), ') ergibt sich bei jeder Anmeldung aus den Gruppen.'))),
         panel('Aktive Sitzungen', sessionsBox()));
       return;
     }
@@ -317,6 +336,43 @@ export async function render(root, _p, scope, q) {
     };
     drawBox();
     return box;
+  }
+
+  function tokens() {
+    const box = el('div');
+    const load = () => get('/tokens' + (isAdmin ? '?all=1' : '')).then(list => mount(box, list.length ? el('div.table-wrap', null, el('table', null,
+      el('thead', null, el('tr', null, el('th', null, 'Name'), isAdmin ? el('th', null, 'Konto') : null, el('th', null, 'Rolle'), el('th', null, 'Token'), el('th', null, 'Läuft ab'), el('th', null, 'Zuletzt benutzt'), el('th'))),
+      el('tbody', null, list.map(t => el('tr', null, el('td', null, el('b', null, t.name)), isAdmin ? el('td', null, t.username) : null, el('td', null, roleLabel(t.role)),
+        el('td.mono', null, t.prefix + '…'), el('td.nowrap', null, t.expires ? fmtUntil(t.expires) : 'nie'),
+        el('td.nowrap', null, t.last_used ? [fmtAgo(t.last_used * 1000), el('div', null, el('small.muted', null, t.last_ip))] : 'noch nie'),
+        el('td.right', null, el('button.btn.sm.danger', { onclick: async () => { if (!await confirmDialog('Token widerrufen', `„${t.name}“ ist sofort ungültig.`, 'Widerrufen')) return; try { await del('/tokens/' + t.id); load(); } catch (e) { errToast(e); } } }, 'Widerrufen'))))))) :
+      el('p.muted', null, 'Noch keine API-Tokens.'))).catch(e => mount(box, el('div.callout.bad', null, e.message)));
+    load();
+    const create = () => {
+      const st = { name: '', role: 'viewer', expires: Math.floor(Date.now() / 1000) + 90 * 86400 };
+      const myRank = { viewer: 1, support: 2, editor: 3, admin: 4 }[me.role] || 1;
+      modal('API-Token erstellen', el('div.stack', null,
+        field('Name', el('input', { placeholder: 'z. B. Monitoring, Ansible, Ticketsystem', oninput: (e) => { st.name = e.target.value; } })),
+        field('Rolle', select(ROLES.filter(([r]) => ({ viewer: 1, support: 2, editor: 3, admin: 4 }[r] <= myRank)).map(([r, l, d]) => [r, `${l} – ${d}`]), st.role, (v) => { st.role = v; }), 'Höchstens deine eigene Rolle. Das Token verliert Rechte mit deinem Konto.'),
+        el('label.field', null, el('span', null, 'Läuft ab'), untilInput(st.expires, (v) => { st.expires = v; }))), {
+        actions: [{ label: 'Abbrechen' }, {
+          label: 'Erstellen', kind: 'primary', onClick: async () => {
+            const r = await post('/tokens', st);
+            load();
+            modal('API-Token erstellt', el('div.stack', null,
+              el('p', null, 'Das Token wird nur jetzt angezeigt – Sentinel speichert nur eine Prüfsumme.'),
+              el('pre.mono', { style: { userSelect: 'all', whiteSpace: 'pre-wrap' } }, r.token),
+              el('p.muted', null, 'Verwendung:'),
+              el('pre.mono', { style: { whiteSpace: 'pre-wrap' } }, `curl -H "Authorization: Bearer ${r.token}" ${location.origin}/api/status`)), {
+              actions: [{ label: 'Kopieren', onClick: () => { copy(r.token); return false; } }, { label: 'Fertig', kind: 'primary' }],
+            });
+          },
+        }],
+      });
+    };
+    mount(body, panel('API-Tokens für das Panel', el('div.stack', null,
+      el('p.muted', { style: { margin: 0 } }, 'Für Skripte, Monitoring und Automatisierung: Anfragen an die Panel-API mit „Authorization: Bearer spt_…“ statt Anmeldung. Ein Token handelt im Namen seines Kontos mit der gewählten Rolle (höchstens der eigenen). Für den Zugriff auf geschützte Sites gibt es eigene Zugriffstokens unter Site-Login.'),
+      box, el('div.row', null, el('button.btn.primary', { onclick: create }, 'Token erstellen')))));
   }
 
   function sessionsBox() {

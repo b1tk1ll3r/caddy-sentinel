@@ -67,6 +67,36 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /api/access/users/{name}", s.admin(s.handleDirUserDelete))
 	m.HandleFunc("GET /api/access/log", s.auth(s.handleAccessLog))
 	m.HandleFunc("POST /api/access/test", s.admin(s.handleDirTest))
+	m.HandleFunc("POST /api/access/accounts", s.admin(s.handleAccountCreate))
+	m.HandleFunc("PUT /api/access/users/{name}", s.admin(s.handleAccountUpdate))
+	m.HandleFunc("POST /api/access/users/{name}/password", s.admin(s.handleAccountPassword))
+	m.HandleFunc("GET /api/access/tokens", s.admin(s.handleSiteTokens))
+	m.HandleFunc("POST /api/access/tokens", s.admin(s.handleSiteTokenCreate))
+	m.HandleFunc("DELETE /api/access/tokens/{id}", s.admin(s.handleSiteTokenDelete))
+	m.HandleFunc("POST /api/access/oauth/test", s.admin(s.handleOAuthTest))
+
+	// OAuth2 / OIDC (browser redirects, no session needed)
+	m.HandleFunc("GET /oauth/panel", s.handleOAuthPanel)
+	m.HandleFunc("GET /oauth/site", s.handleOAuthSite)
+	m.HandleFunc("GET /oauth/callback", s.handleOAuthCallback)
+
+	// one-click actions from notifications (signed links)
+	m.HandleFunc("GET /act/{tok}", s.handleAction)
+	m.HandleFunc("POST /act/{tok}", s.handleAction)
+	m.HandleFunc("GET /api/mutes", s.auth(s.handleMutes))
+	m.HandleFunc("DELETE /api/mutes/{key}", s.auth(s.handleMuteDelete))
+	m.HandleFunc("GET /api/auth/providers", s.handleOAuthProviders)
+
+	// personal API tokens
+	m.HandleFunc("GET /api/tokens", s.auth(s.handleAPITokens))
+	m.HandleFunc("POST /api/tokens", s.auth(s.handleAPITokenCreate))
+	m.HandleFunc("DELETE /api/tokens/{id}", s.auth(s.handleAPITokenDelete))
+
+	// temporary list entries
+	m.HandleFunc("GET /api/temp", s.auth(s.handleTempEntries))
+	m.HandleFunc("POST /api/temp", s.auth(s.handleTempCreate))
+	m.HandleFunc("DELETE /api/temp/{id}", s.auth(s.handleTempDelete))
+	m.HandleFunc("PUT /api/bans/{ip}/note", s.auth(s.handleBanNote))
 	// auth
 	m.HandleFunc("GET /api/auth/state", s.handleAuthState)
 	m.HandleFunc("POST /api/auth/setup", s.csrf(s.handleSetup))
@@ -130,6 +160,14 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/bans", s.auth(s.handleBanCreate))
 	m.HandleFunc("DELETE /api/bans/{ip}", s.auth(s.handleBanDelete))
 	m.HandleFunc("GET /api/ip/{ip}", s.auth(s.handleIP))
+	m.HandleFunc("GET /api/ip/{ip}/extra", s.auth(s.handleIPExtra))
+	m.HandleFunc("GET /api/search", s.auth(s.handleSearch))
+	m.HandleFunc("GET /api/views", s.auth(s.handleViews))
+	m.HandleFunc("POST /api/views", s.auth(s.handleViewSave))
+	m.HandleFunc("PUT /api/views/{id}", s.auth(s.handleViewSave))
+	m.HandleFunc("DELETE /api/views/{id}", s.auth(s.handleViewDelete))
+	m.HandleFunc("GET /api/sites/dnscheck", s.auth(s.handleDNSCheck))
+	m.HandleFunc("POST /api/sites/wizard", s.auth(s.handleSiteWizard))
 	// policies & rules
 	m.HandleFunc("GET /api/policies", s.auth(s.handlePolicies))
 	m.HandleFunc("POST /api/policies", s.auth(s.handlePolicySave))
@@ -142,6 +180,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/policies/{id}/testmode", s.auth(s.handleTestMode))
 	m.HandleFunc("GET /api/policies/{id}/waf-analyze", s.auth(s.handleWAFAnalyze))
 	m.HandleFunc("POST /api/policies/{id}/waf-exclude", s.auth(s.handleWAFExclude))
+	m.HandleFunc("POST /api/policies/{id}/transfer", s.auth(s.handlePolicyTransfer))
 	m.HandleFunc("GET /api/rulesets", s.auth(s.handleRulesets))
 	m.HandleFunc("POST /api/rulesets", s.auth(s.handleRulesetSave))
 	m.HandleFunc("PUT /api/rulesets/{id}", s.auth(s.handleRulesetSave))
@@ -224,7 +263,7 @@ func (s *Server) csrf(h http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
-	return s.csrf(func(w http.ResponseWriter, r *http.Request) {
+	cookieAuth := s.csrf(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookie)
 		if err != nil {
 			writeErr(w, http.StatusUnauthorized, "nicht angemeldet")
@@ -235,41 +274,59 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "Sitzung abgelaufen")
 			return
 		}
-		r = r.WithContext(contextWithUser(r.Context(), u))
-		if r.Method != http.MethodGet && !viewerAllowed[r.Pattern] {
-			need := patternCap[r.Pattern]
-			if !RoleCan(u.Role, need) {
-				writeErr(w, http.StatusForbidden, "Keine Berechtigung – diese Aktion erfordert "+capRoles(need))
+		s.authorized(w, r.WithContext(contextWithUser(r.Context(), u)), u, h)
+	})
+	return func(w http.ResponseWriter, r *http.Request) {
+		// API tokens: "Authorization: Bearer spt_…" (no cookie, no CSRF risk)
+		if raw := apiBearer(r); raw != "" {
+			u, err := s.e.apiTokenUser(raw, clientIP(r))
+			if err != nil {
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+				writeErr(w, http.StatusUnauthorized, "API-Token ungültig oder abgelaufen")
 				return
 			}
-		}
-		if r.Method == http.MethodGet {
-			h(w, r)
+			s.authorized(w, r.WithContext(contextWithUser(r.Context(), u)), u, h)
 			return
 		}
-		rec := &statusRecorder{ResponseWriter: w, status: 200}
-		h(rec, r)
-		if label, ok := auditLabels[r.Pattern]; ok && rec.status < 400 {
-			detail := map[string]any{}
-			for _, k := range []string{"id", "ip", "name", "action"} {
-				if v := r.PathValue(k); v != "" {
-					detail[k] = v
-				}
-			}
-			title := label
-			if v := r.PathValue("action"); v != "" {
-				title += " – " + v
-			}
-			if v := r.PathValue("id"); v != "" {
-				title += " (" + v + ")"
-			} else if v := r.PathValue("ip"); v != "" {
-				title += " (" + v + ")"
-			} else if v := r.PathValue("name"); v != "" {
-				title += " (" + v + ")"
-			}
-			s.auditEvent(r, u.Username, title, detail)
+		cookieAuth(w, r)
+	}
+}
+
+// authorized checks the role and writes the audit trail.
+func (s *Server) authorized(w http.ResponseWriter, r *http.Request, u *store.User, h http.HandlerFunc) {
+	if r.Method != http.MethodGet && !viewerAllowed[r.Pattern] {
+		need := patternCap[r.Pattern]
+		if !RoleCan(u.Role, need) {
+			writeErr(w, http.StatusForbidden, "Keine Berechtigung – diese Aktion erfordert "+capRoles(need))
+			return
 		}
-	})
+	}
+	if r.Method == http.MethodGet {
+		h(w, r)
+		return
+	}
+	rec := &statusRecorder{ResponseWriter: w, status: 200}
+	h(rec, r)
+	if label, ok := auditLabels[r.Pattern]; ok && rec.status < 400 {
+		detail := map[string]any{}
+		for _, k := range []string{"id", "ip", "name", "action"} {
+			if v := r.PathValue(k); v != "" {
+				detail[k] = v
+			}
+		}
+		title := label
+		if v := r.PathValue("action"); v != "" {
+			title += " – " + v
+		}
+		if v := r.PathValue("id"); v != "" {
+			title += " (" + v + ")"
+		} else if v := r.PathValue("ip"); v != "" {
+			title += " (" + v + ")"
+		} else if v := r.PathValue("name"); v != "" {
+			title += " (" + v + ")"
+		}
+		s.auditEvent(r, u.Username, title, detail)
+	}
 }
 
 // Roles: admin (everything), editor (configuration, policies, rule sets,
@@ -307,6 +364,10 @@ var patternCap = map[string]string{
 	"POST /api/config/apply":                 "config",
 	"POST /api/config/versions/{id}/restore": "config",
 	"POST /api/bans":                         "bans",
+	"PUT /api/bans/{ip}/note":                "bans",
+	"POST /api/temp":                         "bans", // the handler also checks "policy" for policy lists
+	"DELETE /api/temp/{id}":                  "bans",
+	"DELETE /api/mutes/{key}":                "bans",
 	"DELETE /api/bans/{ip}":                  "bans",
 }
 
@@ -338,18 +399,21 @@ func ValidRole(r string) bool { _, ok := roleCaps[r]; return ok }
 
 // viewerAllowed lists state-changing endpoints read-only users may call.
 var viewerAllowed = map[string]bool{
-	"POST /api/auth/password":        true,
-	"POST /api/auth/totp/setup":      true,
-	"POST /api/auth/totp/enable":     true,
-	"POST /api/auth/totp/disable":    true,
-	"DELETE /api/auth/sessions/{id}": true,
-	"POST /api/config/validate":      true,
-	"POST /api/config/format":        true,
-	"POST /api/config/outline":       true,
-	"POST /api/explain":              true,
-	"POST /api/rules/compile":        true,
-	"POST /api/waf/test":             true,
-	"POST /api/flow/trace":           true,
+	"POST /api/auth/password":          true,
+	"POST /api/auth/totp/setup":        true,
+	"POST /api/auth/totp/enable":       true,
+	"POST /api/auth/totp/disable":      true,
+	"DELETE /api/auth/sessions/{id}":   true,
+	"POST /api/config/validate":        true,
+	"POST /api/config/format":          true,
+	"POST /api/config/outline":         true,
+	"POST /api/explain":                true,
+	"POST /api/rules/compile":          true,
+	"POST /api/waf/test":               true,
+	"POST /api/flow/trace":             true,
+	"POST /api/policies/{id}/transfer": true, // preview for everyone, the handler checks "policy" for apply
+	"POST /api/tokens":                 true, // own tokens, role capped by the handler
+	"DELETE /api/tokens/{id}":          true,
 }
 
 // admin restricts a handler to administrators (also for GET).
@@ -383,11 +447,12 @@ func (s *Server) handleAgentState(w http.ResponseWriter, r *http.Request) {
 	if wait <= 0 || wait > 55 {
 		wait = 25
 	}
-	body, v, ch := s.e.State()
+	inst := agentInst(r)
+	body, v, ch := s.e.StateFor(inst)
 	if v == since {
 		select {
 		case <-ch:
-			body, v, _ = s.e.State()
+			body, v, _ = s.e.StateFor(inst)
 		case <-time.After(time.Duration(wait) * time.Second):
 			w.WriteHeader(http.StatusNotModified)
 			return
@@ -459,8 +524,8 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 func (s *Server) setSession(w http.ResponseWriter, r *http.Request, uid int64) error {
 	tok := RandomToken(32)
 	ttl := 7 * 24 * time.Hour
-	if u, err := s.e.Store.UserByID(uid); err == nil && u.Source == "ldap" {
-		ttl = 12 * time.Hour // directory accounts re-check group membership daily
+	if u, err := s.e.Store.UserByID(uid); err == nil && u.Source != "local" && u.Source != "" {
+		ttl = 12 * time.Hour // directory/OAuth accounts re-check group membership daily
 	}
 	if err := s.e.Store.CreateSession(tok, uid, ttl, clientIP(r), r.UserAgent()); err != nil {
 		return err
@@ -543,8 +608,8 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
-	if u.Source == "ldap" {
-		writeErr(w, 400, "Das Passwort von Verzeichniskonten wird im Active Directory geändert")
+	if u.Source != "local" && u.Source != "" {
+		writeErr(w, 400, "Das Passwort von Verzeichnis- und OAuth-Konten wird beim jeweiligen Anbieter geändert")
 		return
 	}
 	var req struct {

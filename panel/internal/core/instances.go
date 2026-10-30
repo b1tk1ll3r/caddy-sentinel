@@ -859,6 +859,30 @@ func (s *Server) handleInstanceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.e.AddEvent(store.Event{Type: "config", Severity: 2, Title: "Caddy-Instanz entfernt: " + name}, false)
+	// policies limited to the removed instance lose that entry
+	for _, p := range s.e.Policies() {
+		if len(p.Instances) == 0 {
+			continue
+		}
+		cp := clonePolicy(p)
+		keep := []string{}
+		for _, i := range cp.Instances {
+			if i != id {
+				keep = append(keep, i)
+			}
+		}
+		if len(keep) != len(cp.Instances) {
+			if len(keep) == 0 {
+				cp.Enabled = false // was only active there: keep it, but off
+				s.e.AddEvent(store.Event{Type: "config", Severity: 2, Policy: p.ID, Title: "Policy „" + p.Name + "“ ausgeschaltet: sie galt nur auf der entfernten Instanz"}, false)
+			}
+			cp.Instances = keep
+			if err := s.e.SavePolicy(cp, false); err != nil {
+				s.e.log.Warn("instance delete: policy update", "policy", p.ID, "err", err)
+			}
+		}
+	}
+	s.e.Rebuild("instance deleted")
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 

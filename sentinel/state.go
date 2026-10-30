@@ -1,7 +1,10 @@
 package sentinel
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -26,6 +29,8 @@ type runtimeState struct {
 	wafs       map[string]coraza.WAF // hash -> instance (kept for reuse)
 	challenges *ipSet[protocol.Ban]
 	secret     []byte
+	tokens     map[string]*protocol.AuthToken // raw SHA-256 -> token
+	sources    map[string]bool                // password sources available
 }
 
 type wildHost struct {
@@ -52,6 +57,7 @@ type cpolicy struct {
 	rules      []*protocol.CompiledRule
 	anyAuth    bool // policy or a path rule requires a login
 	ssoDomain  string
+	maintAllow *ipSet[struct{}]
 }
 
 type crl struct {
@@ -75,6 +81,20 @@ func compileState(s *protocol.State, prev *runtimeState) *runtimeState {
 		wafs:       map[string]coraza.WAF{},
 		challenges: newIPSet[protocol.Ban](),
 		secret:     challengeSecret(s.ChallengeSecret),
+	}
+	rs.tokens = map[string]*protocol.AuthToken{}
+	for i := range s.AuthTokens {
+		t := &s.AuthTokens[i]
+		if b, err := hex.DecodeString(t.Hash); err == nil && len(b) == sha256.Size {
+			rs.tokens[string(b)] = t
+		}
+	}
+	rs.sources = map[string]bool{}
+	for _, f := range s.AuthFeatures {
+		rs.sources["feature:"+f] = true
+	}
+	for _, src := range s.AuthSources {
+		rs.sources[src] = true
 	}
 	for _, c := range s.Challenges {
 		rs.challenges.add(c.IP, c)
@@ -141,6 +161,12 @@ func compilePolicy(p *protocol.Policy, rs, prev *runtimeState) (*cpolicy, error)
 	for _, n := range p.Auth.TOTPSkipNetworks {
 		if !cp.totpSkip.add(n, struct{}{}) {
 			errs = append(errs, "invalid totp skip network "+n)
+		}
+	}
+	cp.maintAllow = newIPSet[struct{}]()
+	for _, n := range p.MaintenanceAllow {
+		if !cp.maintAllow.add(n, struct{}{}) {
+			errs = append(errs, "invalid maintenance network "+n)
 		}
 	}
 	cp.anyAuth = p.Auth.Enabled
@@ -243,6 +269,30 @@ func (rs *runtimeState) policyFor(host, explicit string) *cpolicy {
 		}
 	}
 	return rs.policies[rs.defPolicy]
+}
+
+// token returns the valid access token presented as raw value, if any.
+func (rs *runtimeState) token(raw string, now int64) *protocol.AuthToken {
+	if !strings.HasPrefix(raw, protocol.TokenPrefix) || len(rs.tokens) == 0 {
+		return nil
+	}
+	h := sha256.Sum256([]byte(raw))
+	t := rs.tokens[string(h[:])]
+	if t == nil || (t.Expires > 0 && now >= t.Expires) {
+		return nil
+	}
+	return t
+}
+
+// bearer extracts a site access token from the Authorization header.
+func bearer(r *http.Request) string {
+	v := r.Header.Get("Authorization")
+	if len(v) > 7 && strings.EqualFold(v[:7], "bearer ") {
+		if t := strings.TrimSpace(v[7:]); strings.HasPrefix(t, protocol.TokenPrefix) {
+			return t
+		}
+	}
+	return ""
 }
 
 func (rs *runtimeState) challenged(a netip.Addr, now int64) bool {

@@ -697,7 +697,11 @@ func (e *Engine) policyStages(p *PolicyDoc, st *protocol.State) []FlowStage {
 	if st != nil {
 		bans = len(st.Bans)
 	}
-	add("bans", "Sperren & Vertrauen", true, fmt.Sprintf("%d aktive Sperren, %d vertrauenswürdige Netze", bans, len(settings.Trusted)))
+	trusted := len(settings.Trusted)
+	if st != nil {
+		trusted = len(st.Trusted)
+	}
+	add("bans", "Sperren & Vertrauen", true, fmt.Sprintf("%d aktive Sperren, %d vertrauenswürdige Netze", bans, trusted))
 	if !p.Enabled {
 		add("policy", "Policy aus", false, "nur Messung – Sperren gelten weiter")
 		return out
@@ -705,11 +709,34 @@ func (e *Engine) policyStages(p *PolicyDoc, st *protocol.State) []FlowStage {
 	var ruleItems []string
 	for _, r := range p.PathRules {
 		if r.Enabled {
-			ruleItems = append(ruleItems, r.Name)
+			n := r.Name
+			if r.Schedule.Mode != "" {
+				n += " (Zeitplan)"
+			}
+			if r.Until > 0 {
+				n += " (bis " + time.Unix(r.Until, 0).Format("02.01.") + ")"
+			}
+			ruleItems = append(ruleItems, n)
 		}
 	}
 	add("rules", "Pfad-Regeln", len(ruleItems) > 0, plural(len(ruleItems), "Regel", "Regeln"), ruleItems...)
-	add("maintenance", "Wartung", p.Maintenance, onOff(p.Maintenance, "aktiv – Besucher erhalten 503", "aus"))
+	now := time.Now().Unix()
+	switch {
+	case p.MaintenanceActive(now):
+		sum := "aktiv – Besucher erhalten 503"
+		if p.MaintenanceUntil > 0 {
+			sum += " (bis " + time.Unix(p.MaintenanceUntil, 0).Format("02.01. 15:04") + ")"
+		}
+		var items []string
+		if len(p.MaintenanceAllow) > 0 {
+			items = append(items, "trotzdem erreichbar für "+strings.Join(p.MaintenanceAllow, ", "))
+		}
+		add("maintenance", "Wartung", true, sum, items...)
+	case p.Maintenance && p.MaintenanceFrom > now:
+		add("maintenance", "Wartung", false, "geplant ab "+time.Unix(p.MaintenanceFrom, 0).Format("02.01. 15:04"))
+	default:
+		add("maintenance", "Wartung", false, "aus")
+	}
 	ipSum := "alle zugelassen"
 	if p.IP.Mode == "allowlist" {
 		ipSum = fmt.Sprintf("nur %d freigegebene Netze", len(p.IP.Allow))
@@ -746,6 +773,18 @@ func (e *Engine) policyStages(p *PolicyDoc, st *protocol.State) []FlowStage {
 		filt = append(filt, fmt.Sprintf("Body ≤ %d MiB", p.MaxBodyBytes>>20))
 	}
 	add("filters", "Filter", len(filt) > 0, firstOr(filt, "keine"), filt...)
+	var bots []string
+	lbl := map[string]string{"block": "gesperrt", "limit": "gebremst"}
+	if v := lbl[p.Bots.AI]; v != "" {
+		bots = append(bots, "KI-Crawler "+v)
+	}
+	if v := lbl[p.Bots.SEO]; v != "" {
+		bots = append(bots, "SEO-Crawler "+v)
+	}
+	if p.Bots.VerifySearch {
+		bots = append(bots, "Suchmaschinen per DNS geprüft")
+	}
+	add("bots", "Bots & Crawler", len(bots) > 0, firstOr(bots, "alle erlaubt"), bots...)
 	var rls []string
 	for _, rl := range p.RateLimits {
 		rls = append(rls, fmt.Sprintf("%s: %d/%ds", rl.Name, rl.Requests, rl.WindowSeconds))
@@ -767,7 +806,7 @@ func (e *Engine) policyStages(p *PolicyDoc, st *protocol.State) []FlowStage {
 		if p.Auth.SSO {
 			items = append(items, "SSO")
 		}
-		sum := "AD-Login"
+		sum := e.loginMethods(p.Auth)
 		if p.Auth.RequireTOTP {
 			sum += " + 2FA"
 		}

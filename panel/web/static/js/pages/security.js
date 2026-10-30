@@ -1,4 +1,5 @@
-import { el, mount, get, post, del, qs, panel, tabs, empty, fmtInt, fmtCompact, fmtUntil, fmtAgo, fmtDateTime, ipLink, rangeState, toast, errToast, modal, field, select, confirmDialog, debounce, ACTIONS, actionLabel } from '../ui.js';
+import { el, mount, get, post, put, del, qs, panel, tabs, empty, fmtInt, fmtCompact, fmtUntil, fmtAgo, fmtDateTime, ipLink, rangeState, toast, errToast, modal, field, select, confirmDialog, debounce, ACTIONS, actionLabel, can } from '../ui.js';
+import { tempPanelBody, tempDialog } from '../temp.js';
 import { timeChart } from '../charts.js';
 import { kpi, eventList, topTable, seg } from '../widgets.js';
 import { bus } from '../app.js';
@@ -13,7 +14,7 @@ export async function render(root, _p, scope, q) {
   const body = el('div.stack');
   const draw = () => {
     history.replaceState(null, '', '#/security' + (tab === 'overview' ? '' : '?tab=' + tab));
-    mount(root, tabs([['overview', 'Lage'], ['events', 'Ereignisse'], ['bans', 'Sperren'], ['scores', 'Bedrohungs-Scores'], ['audit', 'Audit-Log']], tab, (t) => { tab = t; draw(); }), body);
+    mount(root, tabs([['overview', 'Lage'], ['events', 'Ereignisse'], ['bans', 'Sperren & Freigaben'], ['scores', 'Bedrohungs-Scores'], ['audit', 'Audit-Log']], tab, (t) => { tab = t; draw(); }), body);
     ({ overview, events, bans, scores, audit })[tab](body, scope);
   };
   const onRange = () => draw();
@@ -105,25 +106,40 @@ async function bans(body, scope) {
     el('thead', null, el('tr', null, el('th', null, 'IP / Netz'), el('th', null, 'Grund'), el('th', null, 'Quelle'), el('th', null, 'Seit'), el('th', null, 'Dauer'), el('th.num', null, 'Sperren gesamt'), el('th', null, ''))),
     el('tbody', null, list.map(b => el('tr', null,
       el('td', null, b.ip.includes('/') ? el('span.mono', null, b.ip) : ipLink(b.ip)),
-      el('td', null, b.reason),
+      el('td', null, b.reason, el('div', null, b.note ? el('small', null, '📝 ' + b.note + (b.author ? ' (' + b.author + ')' : '')) : null,
+        can('bans') ? el('a.small-link', { href: '#', onclick: (e) => { e.preventDefault(); noteDialog(b, () => bans(body, scope)); } }, b.note ? ' ändern' : '+ Notiz') : null)),
       el('td', null, el('span.badge' + (b.source === 'ids' ? '.bad' : b.source === 'manual' ? '.primary' : ''), null, { ids: 'IDS', manual: 'manuell', rate: 'Ratelimit' }[b.source] || b.source)),
       el('td.nowrap', { title: fmtDateTime(b.created * 1000) }, fmtAgo(b.created * 1000)),
       el('td.nowrap', null, fmtUntil(b.until)),
       el('td.num', null, b.bans || 1),
       el('td', null, el('button.btn.sm', { onclick: () => unban(b.ip) }, 'Aufheben'))))))) : empty('Keine aktiven Sperren', 'Gesperrte IPs erhalten sofort 403 auf allen Sites mit Sentinel.'));
-  mount(body, panel(`Aktive Sperren (${list.length})`, box, el('button.btn.primary', { onclick: () => banDialog(() => bans(body, scope)) }, 'IP sperren')));
+  const pols = (await get('/policies', scope.signal)).policies;
+  const temp = tempPanelBody('', Object.fromEntries(pols.map(p => [p.id, p.name])), scope.signal);
+  mount(body,
+    panel(`Aktive Sperren (${list.length})`, box, el('button.btn.primary', { onclick: () => banDialog(() => bans(body, scope)) }, 'IP sperren')),
+    panel('Befristete Freigaben und Sperren', el('div.stack', null,
+      el('p.muted', { style: { margin: 0 } }, 'Einträge mit Enddatum: global „vertrauenswürdig“ (alle Prüfungen übersprungen, z. B. für einen Pentest) oder „nie sperren“, pro Policy Erlaubt- und Sperrliste. Sie laufen von selbst ab.'),
+      temp), can('bans') ? el('button.btn', { onclick: () => tempDialog({ policies: pols, onDone: () => temp.reload() }, modal) }, 'Befristet eintragen …') : null));
+}
+
+function noteDialog(b, onDone) {
+  let note = b.note || '';
+  modal('Notiz zur Sperre von ' + b.ip, field('Notiz', el('input', { value: note, placeholder: 'z. B. Ticket #4711, Rücksprache mit …', oninput: (e) => { note = e.target.value; } })), {
+    actions: [{ label: 'Abbrechen' }, { label: 'Speichern', kind: 'primary', onClick: async () => { await put('/bans/' + encodeURIComponent(b.ip) + '/note', { note }); onDone(); } }],
+  });
 }
 
 export function banDialog(onDone, ip = '') {
-  let ipIn, dur, reason;
+  let ipIn, dur, reason, note;
   modal('IP oder Netz sperren', [
     field('IP oder CIDR', ipIn = el('input', { value: ip, placeholder: '203.0.113.7 oder 198.51.100.0/24', required: true })),
     field('Dauer', dur = select([[3600, '1 Stunde'], [86400, '1 Tag'], [604800, '7 Tage'], [2592000, '30 Tage'], [0, 'dauerhaft']], 86400, () => { })),
     field('Grund', reason = el('input', { placeholder: 'z. B. Spam, Scraper …' })),
+    field('Notiz (optional)', note = el('input', { placeholder: 'Ticket, Ansprechpartner, Hintergrund …' })),
   ], {
     actions: [{ label: 'Abbrechen' }, {
       label: 'Sperren', kind: 'danger', onClick: async () => {
-        await post('/bans', { ip: ipIn.value.trim(), seconds: +dur.value, reason: reason.value });
+        await post('/bans', { ip: ipIn.value.trim(), seconds: +dur.value, reason: reason.value, note: note.value });
         toast(`${ipIn.value} gesperrt`, 'ok');
         onDone?.();
       },

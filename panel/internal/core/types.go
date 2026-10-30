@@ -40,6 +40,48 @@ type Settings struct {
 	Directory DirectoryConfig `json:"directory"`
 	// SSO: one login for all SSO-enabled sites below a common domain.
 	SSO SSOConfig `json:"sso"`
+	// OAuth: OAuth2/OpenID Connect providers for site and panel login.
+	OAuth []OAuthProvider `json:"oauth"`
+	// SelfService: account page features (password reset by e-mail).
+	SelfService SelfServiceConfig `json:"self_service"`
+}
+
+// OAuthProvider is an OAuth2 / OpenID Connect identity provider (Microsoft
+// Entra ID, Google, Keycloak, Authentik, GitLab, GitHub …). The panel is the
+// client; the redirect URI is <PanelURL>/oauth/callback.
+type OAuthProvider struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// Preset only steers the form (entra, google, keycloak, authentik,
+	// gitlab, github, generic).
+	Preset string `json:"preset"`
+	// Kind: "oidc" (discovery via Issuer) or "oauth2" (explicit URLs).
+	Kind         string   `json:"kind"`
+	Issuer       string   `json:"issuer"`
+	AuthURL      string   `json:"auth_url"`
+	TokenURL     string   `json:"token_url"`
+	UserInfoURL  string   `json:"userinfo_url"`
+	ClientID     string   `json:"client_id"`
+	ClientSecret string   `json:"client_secret,omitempty"`
+	Scopes       []string `json:"scopes"`
+	// Claims: username (default preferred_username, then email, then sub),
+	// groups (default "groups").
+	UsernameClaim string `json:"username_claim"`
+	GroupsClaim   string `json:"groups_claim"`
+	// AllowedDomains restricts logins to e-mail domains (empty = all).
+	AllowedDomains []string `json:"allowed_domains"`
+	// TrustMFA: the provider enforces MFA – the login counts as two
+	// factors, Sentinel does not ask for its own TOTP code.
+	TrustMFA bool `json:"trust_mfa"`
+	// SiteLogin offers the provider on login pages of protected sites.
+	SiteLogin bool `json:"site_login"`
+	// PanelLogin allows signing in to this panel; the role follows the groups.
+	PanelLogin         bool     `json:"panel_login"`
+	PanelAdminGroups   []string `json:"panel_admin_groups"`
+	PanelEditorGroups  []string `json:"panel_editor_groups"`
+	PanelSupportGroups []string `json:"panel_support_groups"`
+	PanelViewerGroups  []string `json:"panel_viewer_groups"`
 }
 
 type SSOConfig struct {
@@ -163,7 +205,8 @@ type Webhook struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	URL         string   `json:"url"`
-	Format      string   `json:"format"` // json | discord | slack | ntfy | gotify | teams
+	Format      string   `json:"format"`         // json | discord | slack | ntfy | gotify | teams | matrix | telegram | email
+	Room        string   `json:"room,omitempty"` // Matrix room ID / Telegram chat ID
 	Token       string   `json:"token,omitempty"`
 	MinSeverity int      `json:"min_severity"`
 	Types       []string `json:"types"` // empty = all
@@ -174,7 +217,7 @@ type Webhook struct {
 var SignalNames = []string{
 	"waf_block", "waf_detect", "honeypot", "not_found", "auth_fail", "path_block", "bad_request",
 	"scanner_ua", "rate_limit", "user_agent", "method", "ip_deny", "burst", "body_limit",
-	"geo_block", "feed_block", "challenge",
+	"geo_block", "feed_block", "challenge", "bot_fake", "bot",
 }
 
 func DefaultSettings() Settings {
@@ -243,6 +286,8 @@ func DefaultWeights() map[string]float64 {
 		"geo_block":   2,
 		"feed_block":  20,
 		"challenge":   1,
+		"bot_fake":    40,
+		"bot":         0,
 	}
 }
 
@@ -258,7 +303,9 @@ func DefaultScannerUAs() []string {
 // PolicyDoc is the panel-side representation of a policy.
 type PolicyDoc struct {
 	protocol.Policy
-	Hosts          []string  `json:"hosts"`
+	Hosts []string `json:"hosts"`
+	// Instances limits the policy to these Caddy instances (empty = all).
+	Instances      []string  `json:"instances"`
 	Rulesets       []string  `json:"rulesets"`
 	Rules          []Rule    `json:"rules"`
 	DisabledGroups []string  `json:"disabled_groups"` // CRS groups like "913"

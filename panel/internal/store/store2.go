@@ -98,7 +98,13 @@ CREATE INDEX IF NOT EXISTS requests_cc ON requests(cc, ts);
 	if err != nil {
 		return err
 	}
-	return s.migrateDirectory()
+	if err := s.migrateDirectory(); err != nil {
+		return err
+	}
+	if err := s.migrateIdentity(); err != nil {
+		return err
+	}
+	return s.migrateAgg()
 }
 
 // ---------------------------------------------------------------- users
@@ -129,6 +135,12 @@ func (s *Store) DeleteUser(id int64) error {
 	_, err := s.Exec(`DELETE FROM users WHERE id=?`, id)
 	if err == nil {
 		_, err = s.Exec(`DELETE FROM sessions WHERE user_id=?`, id)
+	}
+	if err == nil {
+		_, err = s.Exec(`DELETE FROM api_tokens WHERE user_id=?`, id)
+	}
+	if err == nil {
+		_, err = s.Exec(`DELETE FROM saved_views WHERE user_id=? AND shared=0`, id)
 	}
 	return err
 }

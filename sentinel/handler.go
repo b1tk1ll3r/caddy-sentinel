@@ -203,13 +203,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	allow := pr != nil && pr.Action == "allow"
 
-	if p.Maintenance && !allow && (pr == nil || !pr.SkipMaintenance) {
-		msg := p.MaintenanceMessage
-		if msg == "" {
-			msg = "Wartungsarbeiten – bitte später erneut versuchen."
+	if p.MaintenanceActive(now) && !allow && (pr == nil || !pr.SkipMaintenance) {
+		if _, ok := pol.maintAllow.lookup(addr); !ok {
+			msg := p.MaintenanceMessage
+			if msg == "" {
+				msg = "Wartungsarbeiten – bitte später erneut versuchen."
+			}
+			retry := 300
+			if p.MaintenanceUntil > 0 {
+				msg += " Voraussichtlich wieder erreichbar ab " + localTime(p.MaintenanceUntil) + "."
+				if d := int(p.MaintenanceUntil - now); d > 0 && d < 86400 {
+					retry = d
+				}
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(retry))
+			return h.finish(w, info, http.StatusServiceUnavailable, protocol.ActionMaintenance, msg, 0)
 		}
-		w.Header().Set("Retry-After", "300")
-		return h.finish(w, info, http.StatusServiceUnavailable, protocol.ActionMaintenance, msg, 0)
 	}
 
 	if !pol.deny.empty() {
@@ -318,6 +327,59 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
+	// AI/SEO crawlers and fake search engine bots
+	if bp := p.Bots; !allow && (bp.VerifySearch || (bp.AI != "" && bp.AI != "allow") || (bp.SEO != "" && bp.SEO != "allow")) {
+		if b := protocol.ClassifyBot(r.UserAgent()); b != nil {
+			act := ""
+			switch b.Class {
+			case "ai":
+				act = bp.AI
+			case "seo":
+				act = bp.SEO
+			case "search":
+				if bp.VerifySearch {
+					if ok, host := c.bots.verify(addr, b); !ok {
+						why := "gibt sich als " + b.Name + " aus, Reverse-DNS passt nicht"
+						if host != "" {
+							why += " (" + host + ")"
+						}
+						if p.Test.Filters {
+							testMark(protocol.ActionBotFake, b.Name, why)
+						} else {
+							info.rec.Detail, info.rec.Why = b.Name, why
+							return h.block(w, info, pol, protocol.ActionBotFake, "fake crawler", http.StatusForbidden)
+						}
+					}
+				}
+			}
+			label := map[string]string{"ai": "KI-Crawler", "seo": "SEO-Crawler"}[b.Class]
+			switch act {
+			case "block":
+				if p.Test.Filters {
+					testMark(protocol.ActionBot, b.Name, label)
+				} else {
+					info.rec.Detail, info.rec.Why = b.Name, label+" gesperrt (Bot-Einstellungen der Policy)"
+					return h.block(w, info, pol, protocol.ActionBot, label+" blocked", http.StatusForbidden)
+				}
+			case "limit":
+				n := bp.LimitPerMinute
+				if n <= 0 {
+					n = 10
+				}
+				if ok, _, retry := c.rl.allow(p.ID+"|bot|"+b.Name+"|"+addr.String(), n, time.Minute, start); !ok {
+					why := fmt.Sprintf("%s: mehr als %d Anfragen pro Minute", label, n)
+					if p.Test.Filters {
+						testMark(protocol.ActionBotLimit, b.Name, why)
+					} else {
+						info.rec.Detail, info.rec.Why = b.Name, why
+						w.Header().Set("Retry-After", strconv.Itoa(retry))
+						return h.finish(w, info, http.StatusTooManyRequests, protocol.ActionBotLimit, "too many requests", 0)
+					}
+				}
+			}
+		}
+	}
+
 	// rate limits
 	skipRL := allow || (pr != nil && pr.SkipRateLimits)
 	userKey, userKeyDone := "", false
@@ -332,6 +394,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			userKeyDone = true
 			if sess := st.session(r, pol, host, addr.String(), start); sess != nil {
 				userKey = sess.U
+			} else if t := st.token(bearer(r), now); t != nil {
+				userKey = t.User
 			}
 		}
 		key := l.key(p.ID, addr.String(), userKey, r)
@@ -524,6 +588,18 @@ func (h *Handler) finish(w http.ResponseWriter, info *reqInfo, status int, actio
 
 // newRef returns a short reference that users can read out and admins can
 // search for in the panel (unambiguous characters only).
+// localTime formats a unix time for visitors (time zone of the schedules).
+func localTime(unix int64) string {
+	t := time.Unix(unix, 0)
+	if loc, err := time.LoadLocation(protocol.DefaultTZ); err == nil {
+		t = t.In(loc)
+	}
+	if time.Until(t) < 20*time.Hour {
+		return t.Format("15:04") + " Uhr"
+	}
+	return t.Format("02.01. 15:04") + " Uhr"
+}
+
 func newRef() string {
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	b := make([]byte, 8)
@@ -555,7 +631,7 @@ func blockPage(status int, action, msg, ref string, at time.Time) []byte {
 	title := "Zugriff verweigert"
 	hint := "Diese Anfrage wurde aus Sicherheitsgründen abgelehnt."
 	switch action {
-	case protocol.ActionRateLimit, protocol.ActionRateBan:
+	case protocol.ActionRateLimit, protocol.ActionRateBan, protocol.ActionBotLimit:
 		title, hint = "Zu viele Anfragen", "Bitte warte einen Moment und versuche es dann erneut."
 	case protocol.ActionMaintenance:
 		title, hint = "Wartungsarbeiten", "Diese Seite ist vorübergehend nicht erreichbar."
@@ -563,10 +639,10 @@ func blockPage(status int, action, msg, ref string, at time.Time) []byte {
 		title = "Methode nicht erlaubt"
 	case protocol.ActionBodyLimit:
 		title, hint = "Anfrage zu groß", "Die gesendeten Daten überschreiten die erlaubte Größe."
-	case protocol.ActionAPIKey, protocol.ActionAuth:
+	case protocol.ActionAPIKey, protocol.ActionAuth, protocol.ActionToken:
 		title, hint = "Anmeldung erforderlich", "Für diesen Bereich ist eine Anmeldung bzw. ein Zugangsschlüssel nötig."
 	}
-	if msg != "" && msg != "Forbidden" && action != protocol.ActionRateLimit && action != protocol.ActionRateBan {
+	if msg != "" && msg != "Forbidden" && action != protocol.ActionRateLimit && action != protocol.ActionRateBan && action != protocol.ActionBotLimit {
 		hint = msg
 	}
 	esc := html.EscapeString

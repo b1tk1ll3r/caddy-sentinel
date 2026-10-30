@@ -1,5 +1,7 @@
 import { el, mount, get, post, api, toast, errToast, Scope, fmtInt, rangePicker, rangeState, modal, instState, select, roleLabel } from './ui.js';
 import { canLeave } from './instancebar.js';
+import { installIPDrawer } from './ipdrawer.js';
+import { openSearch, installSearchKey } from './search.js';
 
 try { const th = localStorage.getItem('sentinel.theme'); if (th && th !== 'auto') document.documentElement.setAttribute('data-theme', th); } catch { }
 
@@ -50,7 +52,7 @@ function logo(size = 26) {
 const NAV = [
   [null, [['/', 'dashboard', 'Übersicht'], ['/live', 'live', 'Live-Traffic'], ['/analytics', 'analytics', 'Analysen'], ['/failures', 'failures', 'Fehleranalyse'], ['/sites', 'sites', 'Sites'], ['/flow', 'flow', 'Request-Fluss'], ['/uptime', 'uptime', 'Verfügbarkeit'], ['/certs', 'certs', 'Zertifikate'], ['/pki', 'pki', 'Interne CA']]],
   ['Konfiguration', [['/instances', 'instances', 'Caddy-Instanzen'], ['/editor', 'editor', 'Caddyfile-Editor'], ['/policies', 'policies', 'Policies'], ['/rulesets', 'rulesets', 'Regelsätze']]],
-  ['Schutz', [['/security', 'security', 'Sicherheit'], ['/access', 'access', 'Site-Login'], ['/feeds', 'feeds', 'Threat-Feeds'], ['/waf', 'waf', 'WAF-Tester']]],
+  ['Schutz', [['/security', 'security', 'Sicherheit'], ['/access', 'access', 'Site-Login & Konten'], ['/feeds', 'feeds', 'Threat-Feeds'], ['/waf', 'waf', 'WAF-Tester']]],
   [null, [['/settings', 'settings', 'Einstellungen']]],
 ];
 
@@ -72,7 +74,7 @@ const ROUTES = [
   [/^\/pki$/, 'pki', 'Interne CA'],
   [/^\/flow$/, 'flow', 'Request-Fluss'],
   [/^\/instances$/, 'instances', 'Caddy-Instanzen'],
-  [/^\/access$/, 'access', 'Site-Login (AD + 2FA)'],
+  [/^\/access$/, 'access', 'Site-Login & Konten'],
   [/^\/ip\/(.+)$/, 'ip', 'IP-Details', true],
 ];
 
@@ -139,6 +141,7 @@ function loginScreen(setup) {
       start();
     } catch (err) { errEl.textContent = err.message; }
   };
+  const providers = el('div.stack', { style: { gap: '8px' } });
   mount(document.getElementById('app'), el('div.login', null, el('form.login-box', { onsubmit: submit },
     el('div.brand', null, logo(30), el('span', null, 'Caddy Sentinel', el('small', null, setup ? 'Ersteinrichtung' : 'Anmelden'))),
     setup ? el('p.muted', null, 'Lege das Administratorkonto an. Das Panel ist danach nur mit diesem Login erreichbar.') : null,
@@ -146,7 +149,13 @@ function loginScreen(setup) {
     el('label.field', null, el('span', null, 'Passwort'), pw = el('input', { type: 'password', autocomplete: setup ? 'new-password' : 'current-password', required: true, minlength: setup ? 10 : null })),
     setup ? el('label.field', null, el('span', null, 'Passwort wiederholen'), pw2 = el('input', { type: 'password', autocomplete: 'new-password', required: true })) : null,
     errEl = el('div.err', { role: 'alert' }),
-    el('button.btn.primary', { type: 'submit' }, setup ? 'Konto anlegen' : 'Anmelden'))));
+    el('button.btn.primary', { type: 'submit' }, setup ? 'Konto anlegen' : 'Anmelden'),
+    providers)));
+  if (!setup) {
+    fetch('/api/auth/providers').then(r => r.ok ? r.json() : []).then(list => {
+      if (list.length) mount(providers, el('div.or', null, el('span', null, 'oder')), list.map(p => el('a.btn', { href: p.href }, 'Mit ' + p.name + ' anmelden')));
+    }).catch(() => { });
+  }
   setTimeout(() => (setup ? pw : user).focus(), 30);
 }
 
@@ -239,7 +248,7 @@ function buildShell(status) {
   const shell = el('div.shell', null, nav, el('div.main', null,
     el('header.topbar', null,
       el('button.btn.ghost.menu-btn', { 'aria-label': 'Menü', onclick: () => shell.classList.toggle('nav-open') }, '☰'),
-      title, pulse(), instBox, actions),
+      title, el('button.search-btn', { onclick: openSearch, title: 'Suche (Strg+K oder /)' }, el('span', null, '⌕'), el('span.lbl', null, 'Suchen'), el('kbd', null, navigator.platform?.includes('Mac') ? '⌘K' : 'Strg K')), pulse(), instBox, actions),
     content));
   mount(document.getElementById('app'), shell);
   shellEls = { shell, title, actions, content, navLinks, navCount, instBox };
@@ -351,6 +360,8 @@ async function start() {
 }
 
 window.addEventListener('hashchange', () => route());
+installIPDrawer();
+installSearchKey();
 window.addEventListener('sentinel:unauthorized', () => { if (shellEls) { shellEls = null; es?.close(); loginScreen(false); } });
 setInterval(() => { if (shellEls && !document.hidden) get('/status').then(updateStatus).catch(() => { }); }, 15000);
 bus.addEventListener('event', (e) => {

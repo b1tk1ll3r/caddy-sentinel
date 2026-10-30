@@ -1,6 +1,7 @@
 import { countryLabel, el, mount, get, qs, fmtInt, fmtCompact, fmtMs, fmtBytes, fmtPct, rangeState, panel, select, debounce, ACTIONS, statusBadge, actionLabel } from '../ui.js';
 import { timeChart, legend } from '../charts.js';
 import { topTable, requestTable, kpi, seg } from '../widgets.js';
+import { viewsBar } from '../views.js';
 
 export async function render(root, _p, scope, q) {
   const f = {
@@ -47,7 +48,7 @@ export async function render(root, _p, scope, q) {
     el('button.btn.ghost', { onclick: () => { Object.keys(f).forEach(k => f[k] = ''); syncURL(); render(root, _p, scope, new URLSearchParams()); } }, 'Zurücksetzen'));
 
   mount(root,
-    panel('Filter', filterBar),
+    panel('Filter', el('div.stack', { style: { gap: '8px' } }, filterBar, viewsBar('analytics', scope))),
     kpis,
     panel(null, el('div.stack', null, chart, legend(series, () => chart.update({})))),
     el('div.grid.g2', null, dims.map(([d, title]) => panel(title, tops[d]))),

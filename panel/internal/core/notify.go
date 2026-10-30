@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -37,6 +39,9 @@ func (n *Notifier) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-n.queue:
+			if n.e.muted(ev) {
+				continue
+			}
 			for _, wh := range n.e.Settings().Webhooks {
 				if !wh.Enabled || ev.Severity < wh.MinSeverity || !typeMatch(wh.Types, ev.Type) {
 					continue
@@ -76,7 +81,6 @@ func (n *Notifier) Test(ctx context.Context, wh Webhook) error {
 }
 
 func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) error {
-	base := strings.TrimRight(n.e.Settings().PanelURL, "/")
 	text := ev.Title
 	var lines []string
 	if ev.Host != "" {
@@ -84,55 +88,182 @@ func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) erro
 	}
 	if ev.IP != "" {
 		lines = append(lines, "IP: "+ev.IP)
-		if base != "" {
-			lines = append(lines, base+"/#/ip/"+ev.IP)
-		}
+	}
+	if inst := ev.Inst; inst != "" && len(n.e.Instances()) > 1 {
+		lines = append(lines, "Caddy: "+n.e.InstanceName(inst))
 	}
 	body := strings.Join(lines, "\n")
+	links := n.e.actionLinks(ev)
+	sev := SeverityName(ev.Severity)
 	var payload []byte
+	method, target := http.MethodPost, wh.URL
 	headers := map[string]string{"Content-Type": "application/json"}
 	if wh.Format == "email" {
 		to := splitRecipients(wh.URL)
 		if len(to) == 0 {
 			return fmt.Errorf("keine gültigen Empfänger")
 		}
-		mail := fmt.Sprintf("%s\n\nSchwere: %s\nArt: %s\nZeit: %s\n", text, SeverityName(ev.Severity), ev.Type, time.UnixMilli(ev.TS).Format("02.01.2006 15:04:05"))
+		mail := fmt.Sprintf("%s\n\nSchwere: %s\nArt: %s\nZeit: %s\n", text, sev, ev.Type, time.UnixMilli(ev.TS).Format("02.01.2006 15:04:05"))
 		if body != "" {
 			mail += body + "\n"
 		}
+		for _, l := range links {
+			mail += "\n" + l.Label + ": " + l.URL
+		}
 		if d := eventJSON(ev); d != "" {
-			mail += "\nDetails:\n" + d + "\n"
+			mail += "\n\nDetails:\n" + d + "\n"
 		}
 		return sendMail(n.e.Settings().SMTP, to, "[Sentinel] "+text, mail)
 	}
+	mdLinks := func(f func(l actionLink) string) string {
+		var parts []string
+		for _, l := range links {
+			parts = append(parts, f(l))
+		}
+		return strings.Join(parts, " · ")
+	}
 	switch wh.Format {
 	case "discord":
-		payload, _ = json.Marshal(map[string]any{"username": "Caddy Sentinel", "content": fmt.Sprintf("**[%s] %s**\n%s", SeverityName(ev.Severity), text, body)})
-	case "slack":
-		payload, _ = json.Marshal(map[string]any{"text": fmt.Sprintf("*[%s] %s*\n%s", SeverityName(ev.Severity), text, body)})
-	case "teams":
-		payload, _ = json.Marshal(map[string]any{"@type": "MessageCard", "@context": "http://schema.org/extensions", "summary": text, "title": text, "text": strings.ReplaceAll(body, "\n", "<br>")})
-	case "ntfy":
-		payload = []byte(body)
-		if body == "" {
-			payload = []byte(text)
+		msg := fmt.Sprintf("**[%s] %s**\n%s", sev, text, body)
+		if len(links) > 0 {
+			msg += "\n" + mdLinks(func(l actionLink) string { return "[" + l.Label + "](<" + l.URL + ">)" })
 		}
-		headers = map[string]string{"Content-Type": "text/plain; charset=utf-8", "Title": encodeHeader(text), "Priority": fmt.Sprint(min(ev.Severity+1, 5)), "Tags": "shield"}
+		payload, _ = json.Marshal(map[string]any{"username": "Caddy Sentinel", "content": msg})
+	case "slack":
+		blocks := []any{map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": fmt.Sprintf("*[%s] %s*\n%s", sev, text, body)}}}
+		if len(links) > 0 {
+			var els []any
+			for _, l := range links {
+				els = append(els, map[string]any{"type": "button", "text": map[string]any{"type": "plain_text", "text": l.Label}, "url": l.URL})
+			}
+			blocks = append(blocks, map[string]any{"type": "actions", "elements": els})
+		}
+		payload, _ = json.Marshal(map[string]any{"text": fmt.Sprintf("[%s] %s", sev, text), "blocks": blocks})
+	case "teams":
+		// Teams "Workflows" webhook (the old Office 365 connectors are retired):
+		// an Adaptive Card with link buttons.
+		var facts []any
+		for _, l := range lines {
+			k, v, _ := strings.Cut(l, ": ")
+			facts = append(facts, map[string]any{"title": k, "value": v})
+		}
+		var acts []any
+		for _, l := range links {
+			acts = append(acts, map[string]any{"type": "Action.OpenUrl", "title": l.Label, "url": l.URL})
+		}
+		card := map[string]any{
+			"type": "AdaptiveCard", "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "version": "1.4",
+			"body": []any{
+				map[string]any{"type": "TextBlock", "text": "Caddy Sentinel · " + sev, "isSubtle": true, "size": "Small"},
+				map[string]any{"type": "TextBlock", "text": text, "weight": "Bolder", "wrap": true},
+				map[string]any{"type": "FactSet", "facts": facts},
+			},
+			"actions": acts,
+		}
+		payload, _ = json.Marshal(map[string]any{"type": "message", "attachments": []any{map[string]any{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}}})
+	case "ntfy":
+		// JSON publishing (UTF-8 labels and action buttons without header encoding)
+		u, err := url.Parse(wh.URL)
+		if err != nil {
+			return err
+		}
+		topic := strings.Trim(u.Path, "/")
+		if i := strings.LastIndexByte(topic, '/'); i >= 0 {
+			topic = topic[i+1:]
+		}
+		u.Path = strings.TrimSuffix(strings.TrimSuffix(u.Path, "/"), topic)
+		target = strings.TrimRight(u.String(), "/") + "/"
+		msg := body
+		if msg == "" {
+			msg = text
+		}
+		var acts []any
+		click := ""
+		for i, l := range links {
+			if i == 3 {
+				break // ntfy shows at most three actions
+			}
+			if strings.Contains(l.URL, "/act/") {
+				acts = append(acts, map[string]any{"action": "http", "label": l.Label, "url": l.URL, "method": "POST", "clear": true})
+			} else {
+				acts = append(acts, map[string]any{"action": "view", "label": l.Label, "url": l.URL})
+				click = l.URL
+			}
+		}
+		pl := map[string]any{"topic": topic, "title": text, "message": msg, "priority": min(ev.Severity+1, 5), "tags": []string{"shield"}}
+		if len(acts) > 0 {
+			pl["actions"] = acts
+		}
+		if click != "" {
+			pl["click"] = click
+		}
+		payload, _ = json.Marshal(pl)
 		if wh.Token != "" {
 			headers["Authorization"] = "Bearer " + wh.Token
 		}
 	case "gotify":
-		payload, _ = json.Marshal(map[string]any{"title": text, "message": body + " ", "priority": ev.Severity * 2})
+		msg := body
+		if len(links) > 0 {
+			msg += "\n\n" + mdLinks(func(l actionLink) string { return "[" + l.Label + "](" + l.URL + ")" })
+		}
+		extras := map[string]any{"client::display": map[string]any{"contentType": "text/markdown"}}
+		for _, l := range links {
+			if !strings.Contains(l.URL, "/act/") {
+				extras["client::notification"] = map[string]any{"click": map[string]any{"url": l.URL}}
+			}
+		}
+		payload, _ = json.Marshal(map[string]any{"title": text, "message": msg + " ", "priority": ev.Severity * 2, "extras": extras})
 		if wh.Token != "" {
 			headers["X-Gotify-Key"] = wh.Token
 		}
+	case "matrix":
+		// URL = homeserver, Room = room ID (!abc:example.org), Token = access token
+		if wh.Room == "" || wh.Token == "" {
+			return fmt.Errorf("Matrix braucht Raum-ID und Access-Token")
+		}
+		htmlBody := "<b>[" + htmlEsc(sev) + "] " + htmlEsc(text) + "</b>"
+		if body != "" {
+			htmlBody += "<br>" + strings.ReplaceAll(htmlEsc(body), "\n", "<br>")
+		}
+		plain := "[" + sev + "] " + text + "\n" + body
+		if len(links) > 0 {
+			htmlBody += "<br>" + mdLinks(func(l actionLink) string { return `<a href="` + htmlEsc(l.URL) + `">` + htmlEsc(l.Label) + `</a>` })
+			plain += "\n" + mdLinks(func(l actionLink) string { return l.Label + ": " + l.URL })
+		}
+		payload, _ = json.Marshal(map[string]any{"msgtype": "m.text", "body": plain, "format": "org.matrix.custom.html", "formatted_body": htmlBody})
+		method = http.MethodPut
+		target = strings.TrimRight(wh.URL, "/") + "/_matrix/client/v3/rooms/" + url.PathEscape(wh.Room) + "/send/m.room.message/sentinel-" + RandomToken(8)
+		headers["Authorization"] = "Bearer " + wh.Token
+	case "telegram":
+		// Token = bot token, Room = chat ID
+		if wh.Room == "" || wh.Token == "" {
+			return fmt.Errorf("Telegram braucht Bot-Token und Chat-ID")
+		}
+		msg := "<b>[" + htmlEsc(sev) + "] " + htmlEsc(text) + "</b>"
+		if body != "" {
+			msg += "\n" + htmlEsc(body)
+		}
+		req := map[string]any{"chat_id": wh.Room, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": true}
+		if len(links) > 0 {
+			var row []any
+			for _, l := range links {
+				row = append(row, map[string]any{"text": l.Label, "url": l.URL})
+			}
+			req["reply_markup"] = map[string]any{"inline_keyboard": []any{row}}
+		}
+		payload, _ = json.Marshal(req)
+		base := strings.TrimRight(wh.URL, "/")
+		if base == "" {
+			base = "https://api.telegram.org"
+		}
+		target = base + "/bot" + wh.Token + "/sendMessage"
 	default:
-		payload, _ = json.Marshal(map[string]any{"source": "caddy-sentinel", "event": ev, "severity_name": SeverityName(ev.Severity)})
+		payload, _ = json.Marshal(map[string]any{"source": "caddy-sentinel", "event": ev, "severity_name": SeverityName(ev.Severity), "actions": links})
 		if wh.Token != "" {
 			headers["Authorization"] = "Bearer " + wh.Token
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.URL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -141,6 +272,9 @@ func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) erro
 	}
 	resp, err := n.client.Do(req)
 	if err != nil {
+		if wh.Format == "telegram" {
+			return fmt.Errorf("Telegram nicht erreichbar")
+		}
 		return err
 	}
 	resp.Body.Close()
@@ -149,6 +283,8 @@ func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) erro
 	}
 	return nil
 }
+
+func htmlEsc(s string) string { return html.EscapeString(s) }
 
 // encodeHeader keeps HTTP header values ASCII (ntfy supports RFC 2047).
 func encodeHeader(s string) string {

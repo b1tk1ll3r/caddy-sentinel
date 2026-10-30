@@ -348,6 +348,23 @@ type Backup struct {
 	Rulesets []*Ruleset      `json:"rulesets"`
 	Feeds    []store.Feed    `json:"feeds"`
 	Monitors []store.Monitor `json:"monitors"`
+	// Version 2: local site-login accounts (with password hash and TOTP
+	// secret), site access tokens (hashes) and temporary list entries.
+	Accounts    []backupAccount   `json:"accounts,omitempty"`
+	SiteTokens  []backupToken     `json:"site_tokens,omitempty"`
+	TempEntries []store.TempEntry `json:"temp_entries,omitempty"`
+}
+
+type backupAccount struct {
+	store.DirUser
+	PWHash     string   `json:"pw_hash"`
+	TOTPSecret string   `json:"totp_secret,omitempty"`
+	Recovery   []string `json:"recovery,omitempty"` // hashes of unused recovery codes
+}
+
+type backupToken struct {
+	store.SiteToken
+	Hash string `json:"hash"`
 }
 
 func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
@@ -364,6 +381,20 @@ func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
 		b.Feeds = append(b.Feeds, f)
 	}
 	b.Monitors, _ = s.e.Store.ListMonitors()
+	b.Version = 2
+	if us, err := s.e.Store.DirUsers(); err == nil {
+		for _, u := range us {
+			if u.Source == store.SourceLocal {
+				b.Accounts = append(b.Accounts, backupAccount{DirUser: u, PWHash: u.PWHash, TOTPSecret: u.TOTPSecret, Recovery: u.Recovery})
+			}
+		}
+	}
+	if ts, err := s.e.Store.SiteTokens(""); err == nil {
+		for _, t := range ts {
+			b.SiteTokens = append(b.SiteTokens, backupToken{SiteToken: t, Hash: t.Hash})
+		}
+	}
+	b.TempEntries, _ = s.e.Store.TempEntries("")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="caddy-sentinel-backup-%s.json"`, time.Now().Format("2006-01-02")))
 	writeJSON(w, 200, b)
 }
@@ -417,6 +448,42 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	for _, m := range b.Monitors {
 		if err := s.e.Store.PutMonitor(m); err == nil {
 			n["monitors"]++
+		}
+	}
+	for _, a := range b.Accounts {
+		if _, err := s.e.Store.DirUser(a.Username); err == nil {
+			continue // keep existing accounts
+		}
+		u := a.DirUser
+		if err := s.e.Store.CreateLocalAccount(&u, a.PWHash); err != nil {
+			errs = append(errs, "Konto "+a.Username+": "+err.Error())
+			continue
+		}
+		if a.MustChange {
+			_ = s.e.Store.SetMustChange(a.Username, true)
+		}
+		if len(a.Recovery) > 0 {
+			_ = s.e.Store.SetRecoveryCodes(a.Username, a.Recovery)
+		}
+		if a.TOTPSecret != "" && a.TOTPEnabled {
+			_ = s.e.Store.DirSetTOTP(a.Username, a.TOTPSecret, true)
+		}
+		n["accounts"]++
+	}
+	for _, t := range b.SiteTokens {
+		tt := t.SiteToken
+		tt.Hash = t.Hash
+		if tt.Hash == "" {
+			continue
+		}
+		if err := s.e.Store.CreateSiteToken(&tt); err == nil {
+			n["site_tokens"]++
+		}
+	}
+	for _, t := range b.TempEntries {
+		tt := t
+		if tt.Until > time.Now().Unix() && s.e.Store.PutTempEntry(&tt) == nil {
+			n["temp_entries"]++
 		}
 	}
 	if req.Settings && b.Settings != nil {

@@ -400,18 +400,30 @@ type Ban struct {
 	Until   int64   `json:"until"` // 0 = permanent
 	Score   float64 `json:"score"`
 	Bans    int     `json:"bans"` // total bans of this IP (offender history)
+	Note    string  `json:"note"`
+	Author  string  `json:"author"`
 }
 
 func (s *Store) PutBan(b Ban) error {
 	return s.Tx(context.Background(), func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`INSERT INTO bans(ip,reason,source,created,until,score) VALUES(?,?,?,?,?,?)
-			ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason,source=excluded.source,created=excluded.created,until=excluded.until,score=excluded.score`,
-			b.IP, b.Reason, b.Source, b.Created, b.Until, b.Score); err != nil {
+		if _, err := tx.Exec(`INSERT INTO bans(ip,reason,source,created,until,score,note,author) VALUES(?,?,?,?,?,?,?,?)
+			ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason,source=excluded.source,created=excluded.created,until=excluded.until,score=excluded.score,note=excluded.note,author=excluded.author`,
+			b.IP, b.Reason, b.Source, b.Created, b.Until, b.Score, b.Note, b.Author); err != nil {
 			return err
 		}
 		_, err := tx.Exec(`INSERT INTO offenders(ip,bans,last_ban) VALUES(?,1,?) ON CONFLICT(ip) DO UPDATE SET bans=bans+1,last_ban=excluded.last_ban`, b.IP, b.Created)
 		return err
 	})
+}
+
+// SetBanNote changes the note of an active ban.
+func (s *Store) SetBanNote(ip, note, author string) (bool, error) {
+	res, err := s.Exec(`UPDATE bans SET note=?, author=CASE WHEN author='' THEN ? ELSE author END WHERE ip=?`, note, author, ip)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *Store) DeleteBan(ip string) (bool, error) {
@@ -426,7 +438,7 @@ func (s *Store) DeleteBan(ip string) (bool, error) {
 // ActiveBans returns non-expired bans.
 func (s *Store) ActiveBans() ([]Ban, error) {
 	now := time.Now().Unix()
-	rows, err := s.DB.Query(`SELECT b.ip,COALESCE(b.reason,''),COALESCE(b.source,''),b.created,b.until,COALESCE(b.score,0),COALESCE(o.bans,0)
+	rows, err := s.DB.Query(`SELECT b.ip,COALESCE(b.reason,''),COALESCE(b.source,''),b.created,b.until,COALESCE(b.score,0),COALESCE(o.bans,0),COALESCE(b.note,''),COALESCE(b.author,'')
 		FROM bans b LEFT JOIN offenders o ON o.ip=b.ip WHERE b.until=0 OR b.until>? ORDER BY b.created DESC`, now)
 	if err != nil {
 		return nil, err
@@ -435,7 +447,7 @@ func (s *Store) ActiveBans() ([]Ban, error) {
 	var out []Ban
 	for rows.Next() {
 		var b Ban
-		if err := rows.Scan(&b.IP, &b.Reason, &b.Source, &b.Created, &b.Until, &b.Score, &b.Bans); err != nil {
+		if err := rows.Scan(&b.IP, &b.Reason, &b.Source, &b.Created, &b.Until, &b.Score, &b.Bans, &b.Note, &b.Author); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -592,9 +604,19 @@ func (s *Store) Events(f EventFilter) ([]Event, error) {
 func (s *Store) Prune(requestHours, eventDays, rollupDays int) error {
 	now := time.Now()
 	if requestHours > 0 {
-		if _, err := s.Exec(`DELETE FROM requests WHERE ts<?`, now.Add(-time.Duration(requestHours)*time.Hour).UnixMilli()); err != nil {
-			return err
+		cut := now.Add(-time.Duration(requestHours) * time.Hour).UnixMilli()
+		// in portions, so ingest and queries are not blocked for long
+		for i := 0; i < 10000; i++ {
+			res, err := s.Exec(`DELETE FROM requests WHERE id IN (SELECT id FROM requests WHERE ts<? ORDER BY ts LIMIT 5000)`, cut)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n < 5000 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
+		s.PruneAgg(cut)
 	}
 	if eventDays > 0 {
 		if _, err := s.Exec(`DELETE FROM events WHERE ts<?`, now.AddDate(0, 0, -eventDays).UnixMilli()); err != nil {

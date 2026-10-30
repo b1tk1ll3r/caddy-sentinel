@@ -40,6 +40,20 @@ Firewall mit eigenen Regelsätzen und Limits pro Site.
 - **Fehlalarm-Assistent für die WAF**: schlägt anhand echter Blockaden die engste Ausnahme vor (Regel nur für einen Parameter unter einem Pfad → Regel unter einem Pfad → WAF dort nur melden → Regel ganz aus), jeweils mit der Zahl der Blockaden, die sie verhindert hätte, und einem Hinweis, wenn es eher nach echtem Angriff aussieht
 - Dashboard „Was Aufmerksamkeit braucht“: ablaufende Zertifikate, ausfallende Backends, offline Caddy-Instanzen, fehlerhafte Policies, Monitore, Testmodus, aktuelle Anstiege
 
+**Schneller ans Ziel**
+- **Globale Suche** (Strg+K bzw. ⌘K oder `/`): Seiten und Einstellungen, Hosts, IPs und Netze, Referenzen von Fehlerseiten (`ABCD-EFGH`), Policies, Pfad-Regeln, Ratelimits, Konten, Instanzen, Feeds, Monitore, befristete Einträge und gespeicherte Ansichten
+- **IP-Steckbrief**: Klick auf eine IP öffnet einen Seitenbereich mit Land, Netz, Reverse-DNS, Score, Instanzen, Anmeldungen und den Listen, in denen die IP steht – mit „1 h/24 h sperren“, „Sperre aufheben“ und „Dulden …“ (befristet vertrauenswürdig); Strg+Klick öffnet die ganze Seite
+- **Live-Ansicht** mit Filtern für Host, Status, Aktion, IP und Volltext (in der URL, damit teilbar); beim Überfahren mit der Maus hält der Stream an
+- **Gespeicherte Ansichten** für Analysen, Fehleranalyse und Live-Ansicht: Filter, Zeitraum und Instanz unter einem Namen, privat oder für alle
+- **Site-Assistent**: neue Site in drei Schritten (Reverse Proxy, statische Dateien, PHP, Weiterleitung) mit DNS-Prüfung gegen die Adressen des Servers, `tls internal` für interne Namen, Policy-Zuordnung, optionalem Monitor und Prüfung durch Caddy vor dem Anlegen
+
+**Weniger Handarbeit**
+- **Ablaufdatum und Zeitplan**: Pfad-Regeln mit Enddatum („Freigabe bis Freitag“) und Wochenplan („/admin nur Mo–Fr 7–19 Uhr“, auch über Mitternacht, mit Zeitzone); befristete IP-Einträge (global vertrauenswürdig/nie sperren, je Policy Erlaubt-/Sperrliste); WAF-Ausnahmen befristen. Abgelaufenes räumt Sentinel selbst auf und vermerkt es im Ereignisprotokoll
+- **Notizen** an Pfad-Regeln, Ratelimits, Sperren, befristeten Einträgen und Konten – mit Autor und Datum
+- **Wartungsmodus mit Zeitfenster**: Beginn und Ende planen, Netze freigeben (z. B. die IT zum Testen), die Wartungsseite nennt die Uhrzeit des Endes; Schnellschalter auf der Sites-Seite
+- **Policies verteilen**: eine Policy auf ausgewählte Caddy-Instanzen beschränken und Bereiche (Ratelimits, Pfad-Regeln, WAF, Bots, Anmeldung …) mit Diff-Vorschau in andere Policies übertragen
+- **Bots & Crawler**: KI-Crawler (GPTBot, ClaudeBot, PerplexityBot, CCBot …) und SEO-Crawler (AhrefsBot, SemrushBot …) pro Policy erlauben, bremsen oder sperren; vorgebliche Googlebots, Bingbots & Co. per Reverse-DNS mit Gegenprobe entlarven
+
 **Änderungen sicher einführen**
 - **Vorschau vor dem Speichern**: Beim Speichern einer Policy wird der gespeicherte Verkehr der letzten 24 Stunden gegen den Entwurf nachgespielt – „neu blockiert“, „neu durchgelassen“ mit Beispielen. Ohne Auswirkung wird direkt gespeichert
 - **Testmodus** für IP-Regeln, Geo & Feeds, Filter, einzelne Ratelimits und Pfad-Regeln: Treffer werden als „Test: …“ protokolliert, die Anfrage geht durch. Auswertung „was wäre blockiert worden“ mit Knöpfen zum Scharfschalten
@@ -65,7 +79,7 @@ Firewall mit eigenen Regelsätzen und Limits pro Site.
 - Score zerfällt exponentiell; ab der Schwelle automatische Sperre – mit Eskalation für Wiederholungstäter und optional dauerhaft
 - Sperren greifen innerhalb von Millisekunden auf allen Sites, bleiben bei Panel-Ausfall aktiv (lokaler Cache im Agent)
 - Testmodus, Ausnahmelisten, manuelle Sperren (IP/CIDR), IP-Detailseite mit Verlauf
-- Alarme für Fehlerquoten, Traffic-Spitzen, Angriffswellen und Agent-Ausfall; Webhooks für Discord, Slack/Mattermost, Teams, ntfy, Gotify, JSON
+- Alarme für Fehlerquoten, Traffic-Spitzen, Angriffswellen und Agent-Ausfall an Microsoft Teams (Workflows), Matrix, ntfy, Telegram, Slack/Mattermost, Discord, Gotify, E-Mail oder JSON – **mit Knöpfen**: „IP 24 h sperren“ bzw. „Sperre aufheben“, „24 h stummschalten“, „Im Panel öffnen“ (signierte Links, 24 h gültig, nur einmal verwendbar, mit Bestätigungsseite; bei ntfy direkt ausführbar)
 
 **WAF**
 - Coraza mit OWASP CRS 4, Modus Aus/Erkennen/Blockieren, Paranoia-Level, Anomalie-Schwelle, Body-Prüfung
@@ -90,17 +104,22 @@ Firewall mit eigenen Regelsätzen und Limits pro Site.
 - **Alle ausgestellten Zertifikate**: über `acme_server` an Clients (aus der step-ca-Datenbank von Caddy, inkl. ACME-Konto, Provisioner, Widerruf mit Grund) und per `tls internal` an Caddy selbst; Suche, Filter (gültig/abgelaufen/widerrufen, Quelle, Intermediate, nur neuestes je Name), Detailansicht und PEM-Download
 - ACME-Endpunkte aus der laufenden Konfiguration (Directory-URL, Laufzeit, Policy) und Alarm, wenn Root oder Intermediate ablaufen bzw. nicht erneuert wurden
 
-**Site-Login mit Active Directory + 2FA**
-- Beliebige Sites hinter Caddy pro Policy mit einer Anmeldung schützen: Domänenkonto (AD/LDAP, auch `FIRMA\name` oder UPN) plus TOTP-Code; den Authenticator richten Benutzer beim ersten Login selbst per QR-Code ein
+**Site-Login: AD, Zugangskonten, OAuth2/OIDC, Tokens + 2FA**
+- Beliebige Sites hinter Caddy pro Policy mit einer Anmeldung schützen – wahlweise mit **Domänenkonto** (AD/LDAP, auch `FIRMA\name` oder UPN), **lokalem Zugangskonto** (für Partner, Dienstleister, Notfälle; mit Gruppen, Ablaufdatum und Notiz) oder über **OAuth2/OpenID Connect** (Microsoft Entra ID, Google, Keycloak, Authentik, GitLab, GitHub oder jeder OIDC-Anbieter), optional plus TOTP-Code; den Authenticator richten Benutzer beim ersten Login selbst per QR-Code ein
+- Welche Methoden eine Site anbietet, ist pro Policy wählbar. Das Panel ist der OAuth-Client für alle Sites (eine Redirect-URI), der Ablauf nutzt PKCE, State und Nonce; „MFA beim Anbieter“ ersetzt auf Wunsch den eigenen Code
+- **Zugriffstokens** (`Authorization: Bearer sst_…`) für Skripte, Monitoring und Dienste: gehören zu einem Konto (dessen Gruppen gelten), optional auf einzelne Sites beschränkt und befristet, nur als Hash gespeichert und direkt in Caddy geprüft
 - Zugriff über AD-Gruppen (verschachtelt) oder einzelne Konten, Sitzungsdauer, Pfad- und Netz-Ausnahmen, „ohne 2FA aus dem Büro-LAN“, optional an die IP gebunden
 - Weitergabe an das Backend als `Remote-User`, `Remote-Name`, `Remote-Email`, `Remote-Groups` (Client-Header werden entfernt) und als Platzhalter `{http.vars.sentinel.user}`
 - Sperre nach Fehlversuchen, Replay-Schutz für Codes, Fehlversuche fließen ins IDS; Benutzerliste mit 2FA-Reset, „überall abmelden“ und Sperren; Anmeldeprotokoll
-- Auch das Panel selbst akzeptiert auf Wunsch AD-Konten (Rolle aus Gruppen, 2FA Pflicht) – lokale Konten bleiben als Notfallzugang
+- **Kontoseite mit Self-Service** auf jeder geschützten Site (`/.sentinel/auth/me`): Authenticator-App auf ein neues Gerät umziehen (bestätigt mit dem aktuellen Code oder einem Wiederherstellungscode), zehn **Wiederherstellungscodes** erzeugen (auf der Anmeldeseite unter „Gerät nicht zur Hand?“ nutzbar), Passwort von Zugangskonten ändern, **auf allen Geräten abmelden**, letzte Anmeldungen und Änderungen mit IP und Gerät
+- Zugangskonten legen beim ersten Login ein **eigenes Passwort** fest (vom Admin gesetzte Passwörter gelten nur einmal); **„Passwort vergessen?“** per E-Mail-Link (einmalig, befristet, mit 2FA-Code falls eingerichtet; verrät nicht, ob ein Konto existiert)
+- Auch das Panel selbst akzeptiert auf Wunsch AD-Konten (Rolle aus Gruppen, 2FA Pflicht) und OAuth/OIDC-Konten (Rolle aus Gruppen) – lokale Konten bleiben als Notfallzugang
+- **API-Tokens fürs Panel** (`Authorization: Bearer spt_…`) für Automatisierung: Rolle höchstens die eigene, mit Ablaufdatum und „zuletzt benutzt“
 
 **Request-Fluss (grafisch)**
 - Matrix aller Sites: TLS, Sentinel/Policy, Pfad-Regeln, Wartung, IP, Geo/Feeds, Filter, Limits, Challenge, Anmeldung, WAF und Ziele auf einen Blick
 - Fluss-Diagramm pro Site von links nach rechts (oder von oben nach unten): Client → Eingang (Port, TLS, Zertifikat) → Sentinel mit allen Stufen der Policy und den Pfad-Regeln → Caddy-Routen (Matcher, Middleware wie Header/Kompression/Rewrite) → Ziele (Upstreams mit Status, Dateien, Antworten, Weiterleitungen) – Routen ohne Sentinel sind gestrichelt
-- Simulator: Methode, Pfad, Client-IP, Browser/API, angemeldeter Benutzer mit Gruppen und 2FA, API-Schlüssel – der Weg des Requests wird im Diagramm hervorgehoben, inklusive Grund für eine Sperre und optionaler echter WAF-Prüfung
+- Simulator: Methode, Pfad, Client-IP, Browser/API/Crawler, Zeitpunkt (für Zeitpläne, Ablauf, Wartung), angemeldeter Benutzer mit Gruppen und 2FA, Zugriffstoken, API-Schlüssel – der Weg des Requests wird im Diagramm hervorgehoben, inklusive Grund für eine Sperre und optionaler echter WAF-Prüfung
 
 **Pfad-Regeln (Ausnahmen pro Bereich)**
 - Pro Policy beliebig viele Regeln nach Pfad (Präfix, exakt, Platzhalter, Regex), Methode und Client-Netz – die erste passende gilt
@@ -114,12 +133,12 @@ Firewall mit eigenen Regelsätzen und Limits pro Site.
 **Betrieb**
 - Verfügbarkeits-Monitore mit Statusbalken, Uptime (24 h/7 T/30 T), Antwortzeit, Schlüsselwort- und Statusprüfung; Alarm bei Ausfall und Wiederherstellung
 - Zertifikats-Übersicht aus dem Caddy-Speicher mit Warnung, wenn eine Erneuerung hängt
-- Benutzer mit Rollen (Administrator/Leser), Zwei-Faktor-Anmeldung (TOTP mit QR-Code), Sitzungsverwaltung, Audit-Log aller Änderungen und Anmeldungen
-- E-Mail-Benachrichtigungen per SMTP (zusätzlich zu Discord, Slack, Teams, ntfy, Gotify, JSON)
-- Backup/Import von Einstellungen, Policies, Regelsätzen, Feeds und Monitoren (auch zum Übertragen auf einen zweiten Server)
+- Benutzer mit Rollen, Zwei-Faktor-Anmeldung (TOTP mit QR-Code), Sitzungsverwaltung, Audit-Log aller Änderungen und Anmeldungen
+- E-Mail-Benachrichtigungen per SMTP (zusätzlich zu Teams, Matrix, ntfy, Telegram, Slack, Discord, Gotify, JSON)
+- Backup/Import von Einstellungen, Policies, Regelsätzen, Feeds, Monitoren, Zugangskonten, Zugriffstokens und befristeten Einträgen (auch zum Übertragen auf einen zweiten Server)
 
 **Pro Site (Policy)**
-Hosts → Policy-Zuordnung (oder fest per `sentinel <policy>`), je Policy: Wartungsmodus, Länder-/ASN-Regeln, Threat-Feed-Aktionen, Bot-Challenge, IP-Frei-/Sperrlisten, erlaubte Methoden, gesperrte User-Agents, Honeypot-Pfade, Body-Limit, beliebig viele Ratelimits (pro IP, IP+Pfad, global, Header) mit 429 oder Sperre, WAF-Einstellungen, Sicherheits-Header, eigene IDS-Schwellen und -Gewichte.
+Hosts → Policy-Zuordnung (oder fest per `sentinel <policy>`), optional nur auf bestimmten Caddy-Instanzen, je Policy: Wartungsmodus mit Zeitfenster, Bots & Crawler, Länder-/ASN-Regeln, Threat-Feed-Aktionen, Bot-Challenge, IP-Frei-/Sperrlisten, erlaubte Methoden, gesperrte User-Agents, Honeypot-Pfade, Body-Limit, beliebig viele Ratelimits (pro IP, IP+Pfad, global, Header) mit 429 oder Sperre, WAF-Einstellungen, Sicherheits-Header, eigene IDS-Schwellen und -Gewichte.
 
 ## Aufbau
 
@@ -201,6 +220,8 @@ sentinel.example.com {
 
 Das Panel hat eine eigene Anmeldung mit Brute-Force-Schutz. Zusätzlich empfiehlt sich eine IP-Freigabeliste in der Policy dieser Site.
 
+Wer OAuth/OIDC für den Site-Login nutzt, muss `/oauth/*` für alle Benutzer erreichbar lassen (dorthin kommen die Browser vom Anbieter zurück) – eine IP-Freigabeliste dann per Pfad-Regel auf alles außer `/oauth/` beschränken. Dasselbe gilt für `/act/*`, wenn die Knöpfe in Benachrichtigungen von unterwegs funktionieren sollen.
+
 ### GeoIP-Datenbanken
 
 Für Länder/ASN werden `.mmdb`-Dateien benötigt, z. B. kostenlos von DB-IP („IP to Country Lite“, „IP to ASN Lite“, CC BY 4.0) oder MaxMind GeoLite2 (kostenloses Konto):
@@ -230,13 +251,20 @@ ca.firma.local {
 }
 ```
 
-### Site-Login (Active Directory + TOTP)
+### Site-Login (AD, Zugangskonten, OAuth2/OIDC, Tokens)
 
-1. *Site-Login › Verzeichnis*: Server (`ldaps://dc1.firma.local`), Dienstkonto mit Leserechten, Base-DN eintragen, ggf. das CA-Zertifikat der Domänencontroller einfügen – mit „Verbindung prüfen“ und „Anmeldung testen“ kontrollieren.
-2. In der Policy der Site (Reiter *Anmeldung*) den Login einschalten, erlaubte Gruppen eintragen, 2FA an/aus.
-3. Die Site muss die `sentinel`-Direktive haben. Login: `/.sentinel/auth/login`, Abmelden: `/.sentinel/auth/logout`.
+1. Anmeldemethode einrichten – eine oder mehrere:
+   - *Site-Login › Verzeichnis (AD)*: Server (`ldaps://dc1.firma.local`), Dienstkonto mit Leserechten, Base-DN, ggf. CA-Zertifikat der Domänencontroller – mit „Verbindung prüfen“ und „Anmeldung testen“ kontrollieren.
+   - *Site-Login › Konten › Zugangskonto anlegen*: lokale Konten mit Gruppen und optionalem Ablaufdatum (das Passwort erzeugt Sentinel auf Wunsch).
+   - *Site-Login › OAuth / OIDC*: öffentliche Panel-Adresse eintragen, Vorlage wählen (Microsoft Entra ID, Google, Keycloak …), beim Anbieter die angezeigte Redirect-URI `https://<panel>/oauth/callback` registrieren, Client-ID und -Secret eintragen, „Verbindung testen“.
+2. In der Policy der Site (Reiter *Anmeldung*) den Login einschalten, Anmeldemethoden wählen, erlaubte Gruppen eintragen, 2FA an/aus.
+3. Die Site muss die `sentinel`-Direktive haben. Login: `/.sentinel/auth/login`, Abmelden: `/.sentinel/auth/logout`, Kontoseite: `/.sentinel/auth/me` (mit `Accept: application/json` als JSON), Passwort vergessen: `/.sentinel/auth/reset`.
+4. Für Skripte: *Site-Login › Zugriffstokens* – Token einem Konto zuordnen und als `Authorization: Bearer sst_…` senden.
+5. Optional: *Site-Login › Self-Service* – „Passwort vergessen“ per E-Mail für Zugangskonten einschalten (SMTP unter *Einstellungen › Benachrichtigungen*).
 
-Passwörter werden nicht gespeichert; das Panel prüft sie bei jeder Anmeldung direkt am AD (Bind als Benutzer) und liest die Gruppen mit dem Dienstkonto. Gespeichert werden nur TOTP-Schlüssel und Anmeldedaten. Die Sitzung ist ein signiertes Cookie, das der Agent lokal prüft – das Panel wird nur beim Anmelden gebraucht. Ein 2FA-Reset, Sperren oder „Abmelden“ wirkt innerhalb von Sekunden auf allen Caddy-Instanzen.
+Umstieg von Traefik + Authelia: Sentinel setzt dieselben Header (`Remote-User`, `Remote-Groups`, `Remote-Name`, `Remote-Email`), Anwendungen mit Header-Anmeldung laufen also unverändert weiter. Was Authelia per Konfigurationsdatei erledigt (Zugriffsregeln pro Domain/Pfad, Gruppen, 2FA-Pflicht, Netz-Ausnahmen), steht hier in den Policies und Pfad-Regeln. WebAuthn/Passkeys und Duo-Push gibt es (noch) nicht – zweiter Faktor ist TOTP oder die MFA eines OAuth-Anbieters.
+
+AD-Passwörter werden nicht gespeichert; das Panel prüft sie bei jeder Anmeldung direkt am AD (Bind als Benutzer) und liest die Gruppen mit dem Dienstkonto. Zugangskonten liegen als bcrypt-Hash vor, Tokens als SHA-256. Die Sitzung ist ein signiertes Cookie, das der Agent lokal prüft – das Panel wird nur beim Anmelden gebraucht (bei OAuth zusätzlich vom Browser: das Panel muss für Benutzer erreichbar sein). Ein 2FA-Reset, Sperren, Ablauf oder „Abmelden“ wirkt innerhalb von Sekunden auf allen Caddy-Instanzen. Neue Funktionen (Tokens, OAuth, Bots, Zeitpläne, Wartungsfenster) brauchen auf jeder Caddy-Instanz den aktuellen Sentinel-Agent.
 
 ## Erste Schritte
 
@@ -247,14 +275,17 @@ Passwörter werden nicht gespeichert; das Panel prüft sie bei jeder Anmeldung d
 5. **Einstellungen › Benachrichtigungen**: Webhook oder E-Mail für Sperren und Alarme.
 6. **Verfügbarkeit**: „Sites übernehmen“ legt Monitore für alle Hosts an.
 7. **Einstellungen › Konto & Sicherheit**: Zwei-Faktor-Anmeldung einrichten.
-8. **Site-Login**: Active Directory verbinden und interne Sites per Policy schützen.
+8. **Site-Login**: Active Directory, Zugangskonten oder einen OAuth-Anbieter einrichten und interne Sites per Policy schützen.
+9. **Policies › Bots**: KI-Crawler bremsen oder sperren, falsche Suchmaschinen-Bots entlarven.
 
 ## Hinweise
 
 - Die WAF prüft Requests (URI, Header, Body). Antworten werden nicht inspiziert, damit Streaming und große Downloads unverändert bleiben.
 - Stichprobe < 100 % reduziert gespeicherte Einzel-Requests; Fehler, WAF-Treffer und Eingriffe werden immer übertragen, Diagramme und Zähler bleiben exakt. Die Burst-Erkennung des IDS sieht bei einer Stichprobe nur einen Teil des Traffics.
+- **Datenmenge und Geschwindigkeit**: Caddy wartet nie auf das Panel – der Agent puffert bis zu 20.000 Einträge und verwirft bei Überlast (gezählt), statt Anfragen zu bremsen. Das Panel speichert rund 15.000–20.000 Einträge pro Sekunde. Übersicht und Diagramme rechnen mit Minuten-Summen, Top-Listen und Fehleranalyse mit Stunden-Summen, die das Panel nach jeder vollen Stunde im Hintergrund bildet (nach einem Update werden ältere Stunden nachgeholt); nur die angebrochenen Stunden am Rand kommen aus den Rohdaten. Gemessen mit 5 Mio. gespeicherten Anfragen (≈ 20 Anfragen/s über 72 h, 2 CPU-Kerne): Request-Explorer ≈ 1 ms, Analyseseite mit 10 Top-Listen ≈ 1 s, Fehleranalyse ≈ 0,5 s – vorher 3–33 s. Speicherbedarf ≈ 370 MB pro Million Anfragen. Pfade, IPs, User-Agents und Referer behalten pro Stunde, Host und Instanz die 500 häufigsten Werte (bei sehr vielen verschiedenen Werten sind die hinteren Plätze der Top-Listen deshalb Näherungen); die Zahl verschiedener IPs/Pfade in der Fehleranalyse ist über mehrere Stunden geschätzt (±6 %). Filter wie Status, Aktion oder Volltext durchsuchen die Rohdaten. Für sehr viel Traffic: Aufbewahrung der Einzel-Requests kürzen oder unter *Einstellungen* eine Stichprobe setzen.
 - Alle Agent-Daten laufen über `POST /api/agent/ingest`, `GET /api/agent/state` und (Site-Login) `POST /api/agent/auth` mit Bearer-Token. Mehrere Caddy-Instanzen können dasselbe Panel nutzen.
 - UI anpassen ohne neu zu bauen: `SENTINEL_WEB_DIR=/pfad/zu/panel/web/static` setzt die Dateien von der Platte ein.
-- Gespeicherte Geheimnisse (SMTP-, LDAP-Dienstkonto-Passwort) gibt die API nicht mehr aus; leere Felder behalten den gespeicherten Wert.
+- Gespeicherte Geheimnisse (SMTP-, LDAP-Dienstkonto-Passwort, OAuth-Client-Secrets, Webhook-Tokens) gibt die API nicht mehr aus; leere Felder behalten den gespeicherten Wert.
+- Panel-API per Token: `curl -H "Authorization: Bearer spt_…" https://<panel>/api/status` (Tokens unter *Einstellungen › API-Tokens*).
 - Das Panel zeigt in der Seitenleiste neue Releases an (GitHub, alle 6 Stunden; `SENTINEL_UPDATE_CHECK=0` schaltet das ab).
 - Getestet in dieser Umgebung mit Caddy 2.10.0, Coraza 3.3.3 und CRS 4.25 (Go 1.24); `build.sh` baut standardmäßig gegen die neuesten Versionen.

@@ -192,7 +192,7 @@ input[type="checkbox"] { accent-color: var(--primary); }
 .seg button.active.bad { background: var(--bad-soft); color: var(--bad); }
 .seg button.active.warn { background: var(--warn-soft); color: var(--warn); }
 
-.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); overflow-x: auto; flex-wrap: wrap; }
 .tab { font: inherit; font-size: 13px; background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; cursor: pointer; color: var(--muted); white-space: nowrap; }
 .tab:hover { color: var(--ink); }
 .tab.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
@@ -624,3 +624,54 @@ pre.block { background: var(--surface-2); border: 1px solid var(--line-2); borde
 .inst-tile { display: flex; flex-direction: column; gap: 2px; padding: 10px 14px; min-width: 170px; border: 1px solid var(--line); border-left: 5px solid var(--ic, var(--primary)); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); text-decoration: none; font-size: 13px; }
 .inst-tile:hover { background: var(--surface-2); }
 @media (max-width: 600px) { .warn-list li { grid-template-columns: 1fr; } }
+
+/* ---------------------------------------------------------------- search palette */
+.search-btn { display: inline-flex; align-items: center; gap: 8px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--muted); font: inherit; font-size: 13px; cursor: pointer; min-width: 170px; }
+.search-btn:hover { border-color: var(--primary); color: var(--ink); }
+.search-btn kbd { margin-left: auto; font: 11px ui-monospace, monospace; padding: 1px 5px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+.search-wrap { position: fixed; inset: 0; background: rgba(10, 14, 22, .45); z-index: 200; display: flex; justify-content: center; align-items: flex-start; padding: 10vh 16px 16px; }
+.search-box { width: 100%; max-width: 640px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 18px 50px rgba(0, 0, 0, .25); overflow: hidden; display: flex; flex-direction: column; max-height: 70vh; }
+.search-input { border: 0 !important; border-bottom: 1px solid var(--line) !important; border-radius: 0 !important; padding: 14px 16px !important; font-size: 16px !important; outline: none !important; background: transparent; }
+.search-list { list-style: none; margin: 0; padding: 6px; overflow: auto; }
+.search-list li { display: grid; grid-template-columns: 82px minmax(0, auto) minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+.search-list li.sel { background: var(--primary-soft, var(--surface-3)); }
+.search-list li.none { display: block; color: var(--muted); cursor: default; }
+.search-list .kind { border: 0; padding: 0; background: none; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.search-list .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.search-list .s { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.search-hint { font-size: 11.5px; color: var(--muted); padding: 6px 14px; border-top: 1px solid var(--line-2); }
+@media (max-width: 900px) { .search-btn .lbl, .search-btn kbd { display: none; } .search-btn { min-width: 0; } }
+
+/* ---------------------------------------------------------------- saved views */
+.views-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+.view-chip { display: inline-flex; align-items: center; gap: 2px; border: 1px solid var(--line); border-radius: 14px; padding: 1px 4px 1px 10px; background: var(--surface-2); }
+.view-chip a { text-decoration: none; color: var(--ink); }
+.view-chip .x { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 11px; padding: 2px 4px; }
+.view-chip .x:hover { color: var(--bad); }
+
+/* ---------------------------------------------------------------- until picker, notes */
+.until { display: flex; flex-direction: column; gap: 6px; }
+.until .btn.on { border-color: var(--primary); color: var(--primary); }
+.stamp { display: block; margin-top: 4px; font-size: 11.5px; }
+.rule-note { margin-top: 6px; font-size: 13px; color: var(--ink-2); }
+.small-link { font-size: 12px; margin-left: 4px; }
+.bad-text { color: var(--bad); }
+.warn-text { color: var(--warn); }
+.or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12.5px; }
+.or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.login-box a.btn { justify-content: center; text-align: center; }
+
+/* ---------------------------------------------------------------- wizard, transfer */
+.kind-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.wiz-kind { text-align: left; display: flex; flex-direction: column; gap: 4px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
+.wiz-kind:hover, .wiz-kind.on { border-color: var(--primary); }
+.wiz-kind small { color: var(--muted); }
+.wizard-foot { border-top: 1px solid var(--line-2); padding-top: 10px; }
+.checks { display: flex; flex-direction: column; gap: 4px; max-height: 280px; overflow: auto; }
+.check { display: flex; gap: 8px; align-items: baseline; font-size: 13.5px; cursor: pointer; }
+.transfer-target { border: 1px solid var(--line-2); border-radius: 6px; padding: 8px 10px; }
+ul.diff { margin: 2px 0 6px; padding-left: 18px; font-size: 12px; }
+table.compact td { padding: 3px 6px; font-size: 12.5px; }
+td.trunc { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 1500px) { .search-btn { min-width: 0; } .search-btn .lbl { display: none; } }
+.search-list li .kind { font-size: 10.5px; }

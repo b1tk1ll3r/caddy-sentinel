@@ -70,7 +70,13 @@ func newIDS(e *Engine) *IDS {
 func (d *IDS) reconfigure() {
 	s := d.e.Settings()
 	var ps []netip.Prefix
-	for _, n := range append(append([]string{}, s.IDS.NeverBan...), s.Trusted...) {
+	extra := []string{}
+	if temp, err := d.e.Store.TempEntries("global"); err == nil {
+		for _, t := range temp {
+			extra = append(extra, t.Value) // trusted and never_ban
+		}
+	}
+	for _, n := range append(append(append([]string{}, s.IDS.NeverBan...), s.Trusted...), extra...) {
 		n = strings.TrimSpace(n)
 		if n == "" {
 			continue
@@ -240,8 +246,13 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 			add("feed_block", 1)
 		case protocol.ActionChallenge:
 			add("challenge", 1)
-		case protocol.ActionAuthFail, protocol.ActionAPIKey:
+		case protocol.ActionAuthFail, protocol.ActionAPIKey, protocol.ActionToken:
 			add("auth_fail", 1)
+		case protocol.ActionBotFake:
+			add("bot_fake", 1)
+		case protocol.ActionBot, protocol.ActionBotLimit:
+			add("bot", 1)
+		case protocol.ActionMaintenance:
 		case protocol.ActionPathBlock:
 			add("path_block", 1)
 		case protocol.ActionRedirect:
@@ -390,6 +401,10 @@ func SignalLabel(s string) string {
 		return "Threat-Feed"
 	case "challenge":
 		return "Bot-Challenge"
+	case "bot_fake":
+		return "Falscher Suchmaschinen-Bot"
+	case "bot":
+		return "Crawler gesperrt/gebremst"
 	}
 	return s
 }

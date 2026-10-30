@@ -41,18 +41,32 @@ mkdir -p "$STAGE" "$BIN"
 
 echo "==> Version $VERSION, linux/$ARCH ($(go version))"
 
+# Netzwerkschritte (Module laden, Prüfsummen von sum.golang.org) bei
+# vorübergehenden Fehlern wiederholen – z. B. "stream error … INTERNAL_ERROR".
+retry() {
+  local n=1 max=4
+  until "$@"; do
+    [ $n -ge $max ] && { echo "Fehlgeschlagen nach $max Versuchen: $*" >&2; return 1; }
+    echo "Versuch $n fehlgeschlagen – neuer Versuch in $((n * 15)) s: $*" >&2
+    sleep $((n * 15)); n=$((n + 1))
+  done
+}
+host_go() { GOOS= GOARCH= GOARM= go "$@"; }
+
 if [ -n "${CADDY_VERSION:-}" ] || [ "${UPGRADE_WAF:-0}" = 1 ]; then
   pkgs=()
   [ -n "${CADDY_VERSION:-}" ] && pkgs+=("github.com/caddyserver/caddy/v2@${CADDY_VERSION}")
   [ "${UPGRADE_WAF:-0}" = 1 ] && pkgs+=(github.com/corazawaf/coraza/v3@latest github.com/corazawaf/coraza-coreruleset/v4@latest)
-  for d in sentinel caddy; do (cd "$d" && GOOS= GOARCH= GOARM= go get "${pkgs[@]}" && GOOS= GOARCH= GOARM= go mod tidy); done
-  (cd panel && GOOS= GOARCH= GOARM= go mod tidy)
+  for d in sentinel caddy; do (cd "$d" && retry host_go get "${pkgs[@]}" && retry host_go mod tidy); done
+  (cd panel && retry host_go mod tidy)
 fi
 
 # frisch geklont ohne go.sum: Abhängigkeiten auflösen
 for d in sentinel caddy panel; do
-  [ -f "$d/go.sum" ] || (cd "$d" && GOOS= GOARCH= GOARM= go mod tidy)
+  [ -f "$d/go.sum" ] || (cd "$d" && retry host_go mod tidy)
 done
+# alle Module vorab laden (mit Wiederholung), damit Tests und Builds offline laufen
+for d in sentinel caddy panel; do (cd "$d" && retry host_go mod download); done
 
 if [ "${SKIP_TESTS:-0}" != 1 ] && [ "$GOARCH" = "$(GOOS= GOARCH= go env GOARCH)" ]; then
   echo "==> Tests"

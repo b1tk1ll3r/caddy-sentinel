@@ -8,7 +8,10 @@ import (
 	"net/netip"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
+	_ "time/tzdata" // schedules must work on hosts without zoneinfo
 )
 
 // PathRule adjusts what a policy does for matching requests.
@@ -58,6 +61,126 @@ type PathRule struct {
 	// Test: blocking parts of the rule (block, only-networks, API key) only
 	// record what they would do.
 	Test bool `json:"test,omitempty"`
+
+	// Until: the rule ends at this unix time (0 = no end). The panel
+	// switches expired rules off; the agent ignores them right away.
+	Until int64 `json:"until,omitempty"`
+	// Schedule limits the rule to (or excludes it from) weekly time windows.
+	Schedule Schedule `json:"schedule,omitempty"`
+
+	// Note explains why the rule exists; Author/Updated are set by the panel.
+	Note    string `json:"note,omitempty"`
+	Author  string `json:"author,omitempty"`
+	Updated int64  `json:"updated,omitempty"`
+}
+
+// Schedule is a weekly time window. Mode "" = always, "inside" = only within
+// the window, "outside" = only outside of it.
+type Schedule struct {
+	Mode string `json:"mode,omitempty"`
+	// Days: ISO weekdays 1 (Monday) … 7 (Sunday); empty = every day.
+	Days []int `json:"days,omitempty"`
+	// From/To "HH:MM" local time; To <= From spans midnight.
+	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
+	// TZ: IANA time zone, e.g. "Europe/Berlin" (default: Europe/Berlin).
+	TZ string `json:"tz,omitempty"`
+}
+
+// DefaultTZ is used for schedules without time zone.
+const DefaultTZ = "Europe/Berlin"
+
+// CompiledSchedule evaluates a Schedule quickly.
+type CompiledSchedule struct {
+	mode     string
+	days     [8]bool
+	anyDay   bool
+	from, to int // minutes after midnight
+	loc      *time.Location
+}
+
+// CompileSchedule validates s.
+func CompileSchedule(s Schedule) (*CompiledSchedule, error) {
+	if s.Mode == "" {
+		return nil, nil
+	}
+	if s.Mode != "inside" && s.Mode != "outside" {
+		return nil, fmt.Errorf("unbekannter Zeitplan-Modus %q", s.Mode)
+	}
+	c := &CompiledSchedule{mode: s.Mode, anyDay: len(s.Days) == 0}
+	for _, d := range s.Days {
+		if d < 1 || d > 7 {
+			return nil, fmt.Errorf("ungültiger Wochentag %d", d)
+		}
+		c.days[d] = true
+	}
+	var err error
+	if c.from, err = parseClock(s.From, 0); err != nil {
+		return nil, err
+	}
+	if c.to, err = parseClock(s.To, 24*60); err != nil {
+		return nil, err
+	}
+	tz := s.TZ
+	if tz == "" {
+		tz = DefaultTZ
+	}
+	if c.loc, err = time.LoadLocation(tz); err != nil {
+		return nil, fmt.Errorf("unbekannte Zeitzone %q", tz)
+	}
+	return c, nil
+}
+
+func parseClock(v string, def int) (int, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return def, nil
+	}
+	h, m, ok := strings.Cut(v, ":")
+	hh, err1 := strconv.Atoi(h)
+	mm, err2 := strconv.Atoi(m)
+	if !ok || err1 != nil || err2 != nil || hh < 0 || hh > 24 || mm < 0 || mm > 59 || (hh == 24 && mm != 0) {
+		return 0, fmt.Errorf("ungültige Uhrzeit %q (HH:MM)", v)
+	}
+	return hh*60 + mm, nil
+}
+
+// InWindow reports whether t lies inside the weekly window.
+func (c *CompiledSchedule) InWindow(t time.Time) bool {
+	lt := t.In(c.loc)
+	wd := int(lt.Weekday())
+	if wd == 0 {
+		wd = 7
+	}
+	min := lt.Hour()*60 + lt.Minute()
+	dayOK := func(d int) bool { return c.anyDay || c.days[d] }
+	if c.from < c.to {
+		return dayOK(wd) && min >= c.from && min < c.to
+	}
+	// spans midnight: evening part belongs to the start day
+	if min >= c.from {
+		return dayOK(wd)
+	}
+	if min < c.to {
+		prev := wd - 1
+		if prev == 0 {
+			prev = 7
+		}
+		return dayOK(prev)
+	}
+	return false
+}
+
+// Active reports whether a rule with this schedule applies at t.
+func (c *CompiledSchedule) Active(t time.Time) bool {
+	if c == nil {
+		return true
+	}
+	in := c.InWindow(t)
+	if c.mode == "outside" {
+		return !in
+	}
+	return in
 }
 
 // APIKey is stored as SHA-256 hash; Prefix helps recognising the key.
@@ -82,6 +205,7 @@ type CompiledRule struct {
 	nets     []netip.Prefix
 	only     []netip.Prefix
 	keys     [][]byte
+	sched    *CompiledSchedule
 }
 
 // CompilePathRule validates and compiles r.
@@ -116,6 +240,9 @@ func CompilePathRule(r *PathRule) (*CompiledRule, error) {
 			return nil, fmt.Errorf("Regel %q: ungültiger API-Schlüssel %q", r.Name, k.Name)
 		}
 		c.keys = append(c.keys, b)
+	}
+	if c.sched, err = CompileSchedule(r.Schedule); err != nil {
+		return nil, fmt.Errorf("Regel %q: %v", r.Name, err)
 	}
 	switch r.Action {
 	case "", "allow", "block":
@@ -215,7 +342,15 @@ func globToRegex(g string) string {
 	return sb.String()
 }
 
-// Match reports whether the rule applies to the request.
+// ActiveAt reports whether the rule is in force at t (expiry and schedule).
+func (c *CompiledRule) ActiveAt(t time.Time) bool {
+	if !c.R.Enabled || (c.R.Until > 0 && t.Unix() >= c.R.Until) {
+		return false
+	}
+	return c.sched.Active(t)
+}
+
+// Match reports whether the rule applies to the request (ignoring time).
 func (c *CompiledRule) Match(urlPath, method string, ip netip.Addr) bool {
 	if !c.R.Enabled {
 		return false
@@ -273,10 +408,15 @@ func (c *CompiledRule) CheckAPIKey(headerValue string) bool {
 	return ok == 1
 }
 
-// MatchRules returns the first matching rule.
+// MatchRules returns the first matching rule that is in force now.
 func MatchRules(rules []*CompiledRule, urlPath, method string, ip netip.Addr) *CompiledRule {
+	return MatchRulesAt(rules, urlPath, method, ip, time.Now())
+}
+
+// MatchRulesAt returns the first matching rule in force at t.
+func MatchRulesAt(rules []*CompiledRule, urlPath, method string, ip netip.Addr, t time.Time) *CompiledRule {
 	for _, r := range rules {
-		if r.Match(urlPath, method, ip) {
+		if r.Match(urlPath, method, ip) && r.ActiveAt(t) {
 			return r
 		}
 	}

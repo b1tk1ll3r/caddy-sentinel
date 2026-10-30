@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -168,6 +169,7 @@ type core struct {
 	state  atomic.Pointer[runtimeState]
 	remote atomic.Pointer[remoteCfg]
 	rl     *rateLimiter
+	bots   *botVerifier
 
 	localBans sync.Map // ip string -> until unix seconds (rate_ban before panel confirms)
 
@@ -205,6 +207,7 @@ func newCore(panel, token, cacheFile string, failClosed bool, geo protocol.GeoIP
 		client:      &http.Client{Timeout: 40 * time.Second},
 		started:     time.Now(),
 		rl:          newRateLimiter(),
+		bots:        newBotVerifier(),
 		queue:       make(chan protocol.Request, 20000),
 		counters:    map[counterKey]*protocol.Counter{},
 		cancel:      cancel,
@@ -485,6 +488,7 @@ func (c *core) status() protocol.AgentStatus {
 		Version:      Version,
 		CaddyVersion: caddyVersion(),
 		StartedAt:    c.started.Unix(),
+		Addrs:        hostAddrs(),
 	}
 	if rc := c.remote.Load(); rc != nil {
 		st.Remote = rc.mode
@@ -584,4 +588,32 @@ func (c *core) tokenRejected() {
 	c.tokenMu.Lock()
 	c.token = ""
 	c.tokenMu.Unlock()
+}
+
+var addrCache struct {
+	sync.Mutex
+	at   time.Time
+	list []string
+}
+
+// hostAddrs lists the global unicast addresses of this host (cached).
+func hostAddrs() []string {
+	addrCache.Lock()
+	defer addrCache.Unlock()
+	if time.Since(addrCache.at) < 5*time.Minute && addrCache.at.Unix() > 0 {
+		return addrCache.list
+	}
+	var out []string
+	if as, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range as {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.IsGlobalUnicast() {
+				out = append(out, ipn.IP.String())
+			}
+		}
+	}
+	if len(out) > 16 {
+		out = out[:16]
+	}
+	addrCache.at, addrCache.list = time.Now(), out
+	return out
 }

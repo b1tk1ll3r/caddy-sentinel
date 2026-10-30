@@ -3,6 +3,7 @@
 // diagnosis with fixes. Also finds a request by the reference shown on
 // Sentinel's error page.
 import { el, mount, get, qs, fmtInt, fmtAgo, fmtDateTime, rangeState, panel, select, empty, ACTIONS, statusBadge, errToast, instChip, instState, actionLabel } from '../ui.js';
+import { viewsBar } from '../views.js';
 import { requestTable, requestDrawer, drawer, kpi, seg, eventDrawer } from '../widgets.js';
 import { timeChart, legend } from '../charts.js';
 import { diagnosisBox } from '../diagnosis.js';
@@ -51,7 +52,7 @@ export async function render(root, _p, scope, q) {
       refResult)),
     el('div.row', null,
       select([['', 'Alle Hosts'], ...hosts.map(h => [h, h])], host, (v) => { host = v; sync(); load(); }, { 'aria-label': 'Host' }),
-      whoSeg),
+      whoSeg, el('span.grow'), viewsBar('failures', scope)),
     kpis,
     panel('Verlauf und Änderungen', el('div.stack', null, chart, legend(series, () => chart.update({})),
       el('small.muted', null, '◆ markiert Änderungen an Konfiguration, Policies und Regeln – so ist sichtbar, ob ein Anstieg mit einer Änderung zusammenfällt. Klick auf eine Markierung zeigt Details.'),

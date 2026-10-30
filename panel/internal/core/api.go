@@ -137,6 +137,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"caddyfile":          info.Main,
 		"caddyfile_editable": info.Editable(),
 		"instances":          s.e.Instances(),
+		"client_ip":          viewerIP(r),
 		"caddyfile_ok":       ferr == nil,
 		"caddyfile_writable": mainWritable,
 		"agents":             s.e.Agents(),
@@ -320,6 +321,7 @@ func (s *Server) handleBanCreate(w http.ResponseWriter, r *http.Request) {
 		IP      string `json:"ip"`
 		Seconds int    `json:"seconds"`
 		Reason  string `json:"reason"`
+		Note    string `json:"note"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -335,6 +337,30 @@ func (s *Server) handleBanCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.e.Ban(req.IP, req.Reason+" ("+userFrom(r).Username+")", "manual", req.Seconds, 0); err != nil {
 		writeErr(w, 500, err.Error())
+		return
+	}
+	if n := strings.TrimSpace(req.Note); n != "" {
+		_, _ = s.e.Store.SetBanNote(req.IP, n, userFrom(r).Username)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) handleBanNote(w http.ResponseWriter, r *http.Request) {
+	ip, _ := url.PathUnescape(r.PathValue("ip"))
+	var req struct {
+		Note string `json:"note"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	ok, err := s.e.Store.SetBanNote(ip, strings.TrimSpace(req.Note), userFrom(r).Username)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, 404, "Sperre nicht gefunden")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -413,6 +439,7 @@ func (s *Server) handlePolicySave(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p.ID = ""
 	}
+	stampAuthors(s.e.Policy(p.ID), &p, userFrom(r).Username)
 	if err := s.e.SavePolicy(&p, true); err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -432,6 +459,10 @@ func (s *Server) handlePolicyDefault(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if s.e.Policy(id) == nil {
 		writeErr(w, 404, "Policy nicht gefunden")
+		return
+	}
+	if len(s.e.Policy(id).Instances) > 0 {
+		writeErr(w, 400, "Die Standard-Policy muss auf allen Caddy-Instanzen gelten – zuerst die Beschränkung auf Instanzen aufheben")
 		return
 	}
 	st := s.e.Settings()
@@ -1001,6 +1032,16 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	// never hand out stored secrets
 	secrets := map[string]bool{"smtp_password": st.SMTP.Password != "", "directory_bind_password": st.Directory.BindPassword != ""}
 	st.SMTP.Password, st.Directory.BindPassword = "", ""
+	st.OAuth = append([]OAuthProvider{}, st.OAuth...)
+	for i := range st.OAuth {
+		secrets["oauth_"+st.OAuth[i].ID] = st.OAuth[i].ClientSecret != ""
+		st.OAuth[i].ClientSecret = ""
+	}
+	st.Webhooks = append([]Webhook{}, st.Webhooks...)
+	for i := range st.Webhooks {
+		secrets["webhook_"+st.Webhooks[i].ID] = st.Webhooks[i].Token != ""
+		st.Webhooks[i].Token = ""
+	}
 	if u := userFrom(r); u != nil && u.Role != "admin" {
 		st.MetricsToken = ""
 	}
@@ -1023,13 +1064,37 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		if st.Webhooks[i].ID == "" {
 			st.Webhooks[i].ID = RandomToken(4)
 		}
-		if u, err := url.Parse(st.Webhooks[i].URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-			writeErr(w, 400, "ungültige Webhook-URL: "+st.Webhooks[i].URL)
+		wh := &st.Webhooks[i]
+		if wh.Format == "email" {
+			if len(splitRecipients(wh.URL)) == 0 {
+				writeErr(w, 400, "E-Mail-Benachrichtigung „"+wh.Name+"“: Empfänger fehlen")
+				return
+			}
+			continue
+		}
+		if wh.Format == "telegram" && strings.TrimSpace(wh.URL) == "" {
+			wh.URL = "https://api.telegram.org"
+		}
+		if (wh.Format == "matrix" || wh.Format == "telegram") && (wh.Room == "" || wh.Token == "") {
+			writeErr(w, 400, "Benachrichtigung „"+wh.Name+"“: "+map[string]string{"matrix": "Raum-ID und Access-Token", "telegram": "Chat-ID und Bot-Token"}[wh.Format]+" angeben")
+			return
+		}
+		if u, err := url.Parse(wh.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			writeErr(w, 400, "ungültige Webhook-URL: "+wh.URL)
 			return
 		}
 	}
 	// empty secret fields keep the stored value
 	cur := s.e.Settings()
+	for i := range st.Webhooks {
+		if st.Webhooks[i].Token == "" {
+			for _, c := range cur.Webhooks {
+				if c.ID == st.Webhooks[i].ID {
+					st.Webhooks[i].Token = c.Token
+				}
+			}
+		}
+	}
 	if st.SMTP.Password == "" {
 		st.SMTP.Password = cur.SMTP.Password
 	}
@@ -1040,6 +1105,12 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	oa, err := normalizeOAuth(st.OAuth, cur.OAuth, st.PanelURL)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	st.OAuth = oa
 	st.SSO.Domain = strings.Trim(strings.ToLower(strings.TrimSpace(st.SSO.Domain)), ".")
 	if st.SSO.Enabled && (st.SSO.Domain == "" || !strings.Contains(st.SSO.Domain, ".") || strings.ContainsAny(st.SSO.Domain, " /:*")) {
 		writeErr(w, 400, "Single Sign-on: gültige Domain angeben, z. B. firma.local")
@@ -1055,6 +1126,15 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	}
 	out := s.e.Settings()
 	out.SMTP.Password, out.Directory.BindPassword = "", ""
+	out.OAuth = append([]OAuthProvider{}, out.OAuth...)
+	for i := range out.OAuth {
+		out.OAuth[i].ClientSecret = ""
+	}
+	out.Webhooks = append([]Webhook{}, out.Webhooks...)
+	for i := range out.Webhooks {
+		out.Webhooks[i].Token = ""
+	}
+	s.e.Rebuild("settings")
 	writeJSON(w, 200, out)
 }
 
@@ -1085,6 +1165,16 @@ func (s *Server) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 	if err := readJSON(r, &wh); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if wh.Token == "" {
+		for _, c := range s.e.Settings().Webhooks {
+			if c.ID == wh.ID && wh.ID != "" {
+				wh.Token = c.Token
+			}
+		}
+	}
+	if wh.Format == "telegram" && wh.URL == "" {
+		wh.URL = "https://api.telegram.org"
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
@@ -1154,4 +1244,19 @@ func (s *Server) handleAPIKeyNew(w http.ResponseWriter, r *http.Request) {
 		"key":     key,
 		"api_key": protocol.APIKey{Name: strings.TrimSpace(req.Name), Hash: protocol.HashAPIKey(key), Prefix: key[:9], Created: time.Now().Unix()},
 	})
+}
+
+// viewerIP is the address of the browser (behind a local reverse proxy the
+// first X-Forwarded-For entry) – only used for hints like "add my IP".
+func viewerIP(r *http.Request) string {
+	ip := clientIP(r)
+	if a, err := netip.ParseAddr(ip); err == nil && (a.IsLoopback() || a.IsPrivate()) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			first := strings.TrimSpace(strings.Split(xff, ",")[0])
+			if _, err := netip.ParseAddr(first); err == nil {
+				return first
+			}
+		}
+	}
+	return ip
 }

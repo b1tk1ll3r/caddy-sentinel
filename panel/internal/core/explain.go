@@ -80,6 +80,7 @@ var pipeOrder = []struct{ key, label string }{
 	{"ip", "IP-Regeln"},
 	{"geo", "Geo & Feeds"},
 	{"filters", "Filter"},
+	{"bots", "Bots"},
 	{"rate", "Ratelimits"},
 	{"challenge", "Bot-Challenge"},
 	{"auth", "Anmeldung"},
@@ -104,11 +105,13 @@ func stageOf(r *store.RequestRow) string {
 		return "geo"
 	case protocol.ActionMethod, protocol.ActionUserAgent, protocol.ActionHoneypot, protocol.ActionBodyLimit:
 		return "filters"
+	case protocol.ActionBot, protocol.ActionBotLimit, protocol.ActionBotFake:
+		return "bots"
 	case protocol.ActionRateLimit, protocol.ActionRateBan:
 		return "rate"
 	case protocol.ActionChallenge:
 		return "challenge"
-	case protocol.ActionAuth, protocol.ActionAuthFail, protocol.ActionAuthDenied:
+	case protocol.ActionAuth, protocol.ActionAuthFail, protocol.ActionAuthDenied, protocol.ActionToken:
 		return "auth"
 	case protocol.ActionWAFBlock:
 		return "waf"
@@ -259,9 +262,51 @@ func (e *Engine) explain(ctx context.Context, r *store.RequestRow, replay bool) 
 
 	case protocol.ActionMaintenance:
 		d.Headline = "Wartungsmodus ist aktiv"
-		d.Explain = "Die Policy " + quote(polName) + " steht im Wartungsmodus. Alle Besucher erhalten 503 – außer Pfade, deren Pfad-Regel „Wartung überspringen“ gesetzt hat."
+		d.Explain = "Die Policy " + quote(polName) + " steht im Wartungsmodus. Alle Besucher erhalten 503 – außer Netze, die trotz Wartung zugreifen dürfen, und Pfade, deren Pfad-Regel „Wartung überspringen“ gesetzt hat."
 		policyFact()
-		fix("Wartungsmodus beenden", "Policy › Allgemein › Wartungsmodus", polLink("general"))
+		if pol != nil {
+			if pol.MaintenanceUntil > 0 {
+				fact("Geplantes Ende", time.Unix(pol.MaintenanceUntil, 0).Format("02.01.2006 15:04"))
+			}
+			if len(pol.MaintenanceAllow) > 0 {
+				mono("Trotzdem erlaubt", strings.Join(pol.MaintenanceAllow, ", "))
+			}
+		}
+		fix("Wartungsmodus beenden oder Netz freigeben", "Policy › Allgemein › Wartungsmodus", polLink("general"))
+
+	case protocol.ActionBot:
+		d.Who = "client"
+		d.Headline = "Crawler gesperrt: " + r.Detail
+		d.Explain = "Die Bot-Einstellungen der Policy " + quote(polName) + " sperren diese Art von Crawler (" + r.Why + "). Normale Besucher sind nicht betroffen."
+		policyFact()
+		fact("Crawler", r.Detail)
+		mono("User-Agent", r.UA)
+		fix("Bot-Einstellungen ändern", "Policy › Bots: z. B. „bremsen“ statt „sperren“.", polLink("bots"))
+
+	case protocol.ActionBotLimit:
+		d.Who = "client"
+		d.Headline = "Crawler gebremst: " + r.Detail
+		d.Explain = "Der Crawler hat mehr Anfragen geschickt, als die Bot-Einstellungen der Policy " + quote(polName) + " pro Minute erlauben. Er erhält 429 und soll es später erneut versuchen."
+		policyFact()
+		fact("Grenze", r.Why)
+		fix("Grenze anpassen", "Policy › Bots › Anfragen pro Minute", polLink("bots"))
+
+	case protocol.ActionBotFake:
+		d.Who = "client"
+		d.Headline = "Gefälschter Suchmaschinen-Bot"
+		d.Explain = "Der Client nennt sich " + r.Detail + ", kommt aber nicht aus dem Netz der Suchmaschine: die Prüfung per Reverse-DNS ist fehlgeschlagen. Solche Anfragen stammen fast immer von Scrapern oder Scannern, die sich tarnen."
+		policyFact()
+		fact("Prüfung", r.Why)
+		mono("User-Agent", r.UA)
+		fix("Prüfung ausschalten", "Nur falls die eigene Infrastruktur sich als Suchmaschine ausgibt: Policy › Bots.", polLink("bots"))
+
+	case protocol.ActionToken:
+		d.Who = "client"
+		d.Headline = "Zugriffstoken ungültig"
+		d.Explain = "Der Client hat ein Sentinel-Zugriffstoken geschickt (Authorization: Bearer sst_…), das unbekannt, widerrufen oder abgelaufen ist – oder dessen Konto gesperrt bzw. abgelaufen ist."
+		policyFact()
+		fact("Grund", r.Why)
+		fix("Zugriffstokens verwalten", "", "#/access?tab=tokens")
 
 	case protocol.ActionGeo:
 		d.Headline = "Land oder Netz ist gesperrt"
@@ -363,10 +408,10 @@ func (e *Engine) explain(ctx context.Context, r *store.RequestRow, replay bool) 
 		d.Verdict = "login"
 		d.Who = "client"
 		d.Headline = "Anmeldung erforderlich"
-		d.Explain = "Der Bereich ist durch den Site-Login (AD/LDAP + 2FA) geschützt. Browser werden zur Anmeldeseite umgeleitet, Skripte und API-Clients erhalten 401."
+		d.Explain = "Der Bereich ist durch den Site-Login geschützt (" + e.loginMethods(protocol.EffectiveAuth(policyAuth(pol), rule)) + "). Browser werden zur Anmeldeseite umgeleitet, Skripte und API-Clients erhalten 401 – sie können sich mit einem Zugriffstoken (Authorization: Bearer sst_…) ausweisen."
 		if r.Status == http.StatusServiceUnavailable {
 			d.Headline = "Anmeldung derzeit nicht möglich"
-			d.Explain = "Der Anmeldedienst (Panel bzw. Verzeichnisdienst) war nicht erreichbar."
+			d.Explain = "Der Anmeldedienst (Panel, Verzeichnis oder OAuth-Anbieter) war nicht erreichbar."
 			d.Who = "sentinel"
 			fix("Verzeichnis-Verbindung prüfen", "", "#/access?tab=directory")
 		}
@@ -1061,4 +1106,11 @@ func (e *Engine) explainTest(ctx context.Context, r *store.RequestRow, replay bo
 		d.Now.Text = "Der Testmodus ist inzwischen beendet: " + d.Now.Text
 	}
 	return d
+}
+
+func policyAuth(p *PolicyDoc) protocol.AuthPolicy {
+	if p == nil {
+		return protocol.AuthPolicy{}
+	}
+	return p.Auth
 }

@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/protocol"
 )
@@ -24,6 +25,18 @@ func (s *Store) InsertRequests(reqs []protocol.Request) error {
 			return err
 		}
 		defer st.Close()
+		// requests for an hour that is already condensed (agent was offline
+		// and sends late): re-open that hour
+		late := map[int64]bool{}
+		cutoff := time.Now().Add(-aggGrace).UnixMilli()/hourMs*hourMs - hourMs
+		for _, r := range reqs {
+			if h := r.T / hourMs * hourMs; h <= cutoff {
+				late[h] = true
+			}
+		}
+		if len(late) > 0 {
+			s.markLate(tx, late)
+		}
 		for _, r := range reqs {
 			var hits any
 			if len(r.Hits) > 0 {
@@ -472,13 +485,50 @@ func (f RequestFilter) where() (string, []any) {
 	return strings.Join(w, " AND "), args
 }
 
+// requestsWhere builds the explorer condition. Rows are listed newest
+// first by id; with only a time window SQLite would read the whole window
+// through the ts index and sort it. Translating the window into an id range
+// (two index lookups) lets it walk the primary key backwards and stop after
+// LIMIT rows. The ts condition stays for exactness ("+ts" keeps SQLite
+// from choosing the ts index again).
+func (f RequestFilter) requestsWhere(s *Store) (string, []any) {
+	if f.From <= 0 && f.To <= 0 {
+		return f.where()
+	}
+	g := f
+	g.From, g.To = 0, 0
+	where, args := g.where()
+	var lo, hi int64
+	if f.From > 0 {
+		if err := s.DB.QueryRow(`SELECT id FROM requests WHERE ts>=? ORDER BY ts LIMIT 1`, f.From).Scan(&lo); err != nil {
+			return "0", nil // nothing in the window
+		}
+		// late batches can carry older timestamps than their id suggests
+		lo -= 50000
+		where += " AND id>=? AND +ts>=?"
+		args = append(args, lo, f.From)
+	}
+	if f.To > 0 {
+		if f.To < time.Now().Add(-time.Minute).UnixMilli() {
+			if err := s.DB.QueryRow(`SELECT id FROM requests WHERE ts>? ORDER BY ts LIMIT 1`, f.To).Scan(&hi); err == nil {
+				hi += 50000
+				where += " AND id<=?"
+				args = append(args, hi)
+			}
+		}
+		where += " AND +ts<=?"
+		args = append(args, f.To)
+	}
+	return where, args
+}
+
 type RequestRow struct {
 	ID int64 `json:"id"`
 	protocol.Request
 }
 
 func (s *Store) Requests(f RequestFilter) ([]RequestRow, error) {
-	where, args := f.where()
+	where, args := f.requestsWhere(s)
 	if f.Limit <= 0 || f.Limit > 1000 {
 		f.Limit = 200
 	}
@@ -536,21 +586,28 @@ var topDims = map[string]string{
 
 // Top returns the top values of a dimension within the filter.
 func (s *Store) Top(dim string, f RequestFilter, limit int) ([]TopEntry, error) {
-	col, ok := topDims[dim]
-	if !ok {
+	if _, ok := topDims[dim]; !ok {
 		return nil, fmt.Errorf("unknown dimension %q", dim)
-	}
-	where, args := f.where()
-	if dim == "rule" {
-		where += " AND action='waf_block'"
 	}
 	if limit <= 0 || limit > 200 {
 		limit = 25
 	}
+	if out, used, err := s.topAgg(dim, f, limit); used {
+		return out, err
+	}
+	return s.topRaw(dim, f, limit)
+}
+
+func (s *Store) topRaw(dim string, f RequestFilter, limit int) ([]TopEntry, error) {
+	col := topDims[dim]
+	where, args := f.where()
+	if dim == "rule" {
+		where += " AND action='waf_block'"
+	}
 	args = append(args, limit)
 	rows, err := s.DB.Query(`SELECT COALESCE(`+col+`,'') AS k, COUNT(*), SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END),
-		SUM(CASE WHEN "+blockingSQL+" THEN 1 ELSE 0 END), COALESCE(SUM(bytes),0), COALESCE(AVG(dur),0), MAX(ts)
-		FROM requests WHERE `+where+` GROUP BY k ORDER BY COUNT(*) DESC LIMIT ?`, args...)
+		SUM(CASE WHEN `+blockingSQL+` THEN 1 ELSE 0 END), COALESCE(SUM(bytes),0), COALESCE(AVG(dur),0), MAX(ts)
+		FROM requests WHERE `+where+` GROUP BY k ORDER BY COUNT(*) DESC, k LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +734,7 @@ type IPSummary struct {
 func (s *Store) IPSummary(ip string) (*IPSummary, error) {
 	sum := &IPSummary{Actions: map[string]int64{}}
 	err := s.DB.QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN "+blockingSQL+" THEN 1 ELSE 0 END),0), COALESCE(MIN(ts),0), COALESCE(MAX(ts),0)
+		COALESCE(SUM(CASE WHEN `+blockingSQL+` THEN 1 ELSE 0 END),0), COALESCE(MIN(ts),0), COALESCE(MAX(ts),0)
 		FROM requests WHERE ip=?`, ip).Scan(&sum.Requests, &sum.Errors, &sum.Blocked, &sum.FirstSeen, &sum.LastSeen)
 	if err != nil {
 		return nil, err
@@ -754,6 +811,13 @@ func (s *Store) Failures(from, to int64, inst, host string, limit int) ([]Failur
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
+	if out, used, err := s.failuresAgg(from, to, inst, host, limit); used {
+		return out, err
+	}
+	return s.failuresRaw(from, to, inst, host, limit)
+}
+
+func (s *Store) failuresRaw(from, to int64, inst, host string, limit int) ([]FailureGroup, error) {
 	w := "ts>=? AND ts<=? AND (status>=400 OR " + blockingSQL + ")"
 	args := []any{from, to}
 	if inst != "" {

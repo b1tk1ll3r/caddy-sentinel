@@ -67,15 +67,28 @@ type DirUser struct {
 	Logins      int      `json:"logins"`
 	Disabled    bool     `json:"disabled"`
 	Revoked     int64    `json:"revoked"` // sessions issued before are invalid
+	// Source: "ldap" (directory), "local" (password in Sentinel) or
+	// "oidc:<provider>" (OAuth2/OIDC).
+	Source    string `json:"source"`
+	PWHash    string `json:"-"`
+	Expires   int64  `json:"expires"` // unix, 0 = no expiry
+	Note      string `json:"note"`
+	CreatedBy string `json:"created_by"`
+	// MustChange: the password has to be changed at the next sign-in.
+	MustChange bool  `json:"must_change"`
+	PWChanged  int64 `json:"pw_changed"`
+	// Recovery holds SHA-256 hashes of unused recovery codes.
+	Recovery     []string `json:"-"`
+	RecoveryLeft int      `json:"recovery_left"`
 }
 
-const dirCols = `username,display,email,dn,groups,totp_secret,totp_enabled,totp_last,created,last_login,last_ip,last_host,logins,disabled,revoked`
+const dirCols = `username,display,email,dn,groups,totp_secret,totp_enabled,totp_last,created,last_login,last_ip,last_host,logins,disabled,revoked,source,pw_hash,expires,note,created_by,must_change,pw_changed,recovery`
 
 func scanDirUser(row interface{ Scan(...any) error }) (*DirUser, error) {
 	u := &DirUser{}
-	var groups string
-	var en, dis int
-	err := row.Scan(&u.Username, &u.Display, &u.Email, &u.DN, &groups, &u.TOTPSecret, &en, &u.TOTPLast, &u.Created, &u.LastLogin, &u.LastIP, &u.LastHost, &u.Logins, &dis, &u.Revoked)
+	var groups, rec string
+	var en, dis, mc int
+	err := row.Scan(&u.Username, &u.Display, &u.Email, &u.DN, &groups, &u.TOTPSecret, &en, &u.TOTPLast, &u.Created, &u.LastLogin, &u.LastIP, &u.LastHost, &u.Logins, &dis, &u.Revoked, &u.Source, &u.PWHash, &u.Expires, &u.Note, &u.CreatedBy, &mc, &u.PWChanged, &rec)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -86,7 +99,9 @@ func scanDirUser(row interface{ Scan(...any) error }) (*DirUser, error) {
 	if u.Groups == nil {
 		u.Groups = []string{}
 	}
-	u.TOTPEnabled, u.Disabled = en == 1, dis == 1
+	u.TOTPEnabled, u.Disabled, u.MustChange = en == 1, dis == 1, mc == 1
+	_ = json.Unmarshal([]byte(rec), &u.Recovery)
+	u.RecoveryLeft = len(u.Recovery)
 	return u, nil
 }
 
@@ -114,7 +129,10 @@ func (s *Store) DirUsers() ([]DirUser, error) {
 // UpsertDirUser stores the directory attributes after a successful bind.
 func (s *Store) UpsertDirUser(u *DirUser) error {
 	g, _ := json.Marshal(u.Groups)
-	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,dn,groups,created) VALUES(?,?,?,?,?,?)
+	if cur, err := s.DirUser(u.Username); err == nil && cur.Source != SourceLDAP {
+		return errors.New("der Name gehört zu einem Konto aus einer anderen Quelle (" + cur.Source + ")")
+	}
+	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,dn,groups,created,source) VALUES(?,?,?,?,?,?,'ldap')
 		ON CONFLICT(username) DO UPDATE SET display=excluded.display, email=excluded.email, dn=excluded.dn, groups=excluded.groups`,
 		strings.ToLower(u.Username), u.Display, u.Email, u.DN, string(g), time.Now().Unix())
 	return err
@@ -317,6 +335,31 @@ func (s *Store) UpsertLDAPPanelUser(username, display, role string) (*User, erro
 	}
 	if u.Source != "ldap" {
 		return nil, errors.New("lokales Konto mit gleichem Namen vorhanden")
+	}
+	if _, err := s.Exec(`UPDATE users SET role=?, display=? WHERE id=?`, role, display, u.ID); err != nil {
+		return nil, err
+	}
+	u.Role, u.Display = role, display
+	return u, nil
+}
+
+// UpsertExternalPanelUser creates or updates the shadow panel account of an
+// OAuth/OIDC user (source "oidc:<provider>", no local password).
+func (s *Store) UpsertExternalPanelUser(source, username, display, role string) (*User, error) {
+	username = strings.ToLower(username)
+	u, err := s.UserByName(username)
+	if err == ErrNotFound {
+		if _, err := s.Exec(`INSERT INTO users(username,pw_hash,created,role,source,display) VALUES(?,?,?,?,?,?)`,
+			username, "!oidc", time.Now().Unix(), role, source, display); err != nil {
+			return nil, err
+		}
+		return s.UserByName(username)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if u.Source != source {
+		return nil, errors.New("ein Panel-Konto mit diesem Namen existiert bereits (" + u.Source + ")")
 	}
 	if _, err := s.Exec(`UPDATE users SET role=?, display=? WHERE id=?`, role, display, u.ID); err != nil {
 		return nil, err

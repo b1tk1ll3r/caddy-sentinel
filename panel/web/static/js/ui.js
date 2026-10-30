@@ -106,8 +106,9 @@ export function modal(title, body, { actions = [], wide = false, onClose } = {})
     actions.length ? el('footer', null, actions.map(a => el('button.btn' + (a.kind ? '.' + a.kind : ''), {
       onclick: async (e) => {
         if (!a.onClick) return close();
-        e.currentTarget.disabled = true;
-        try { if ((await a.onClick()) !== false) close(); } catch (err) { errToast(err); } finally { if (e.currentTarget) e.currentTarget.disabled = false; }
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        try { if ((await a.onClick()) !== false) close(); } catch (err) { errToast(err); } finally { btn.disabled = false; }
       },
     }, a.label))) : null);
   const wrap = el('div.modal-wrap', { onmousedown: (e) => { if (e.target === wrap) close(); } }, box);
@@ -225,6 +226,10 @@ export const ACTIONS = {
   path_block: 'Pfad-Sperre',
   redirect: 'Weitergeleitet',
   api_key: 'API-Schlüssel fehlt',
+  bot_block: 'Crawler gesperrt',
+  bot_limit: 'Crawler gebremst',
+  bot_fake: 'Falscher Suchmaschinen-Bot',
+  auth_token: 'Token ungültig',
 };
 
 // actions after which the request was still served; "test:…" are decisions
@@ -321,7 +326,49 @@ export function copy(text) {
 }
 
 export function ipLink(ip) {
-  return el('a.mono.iplink', { href: '#/ip/' + encodeURIComponent(ip) }, ip);
+  return el('a.mono.iplink', { href: '#/ip/' + encodeURIComponent(ip), 'data-ip': ip, title: 'Klick: Steckbrief · Strg+Klick: ganze Seite' }, ip);
+}
+
+// ---------------------------------------------------------------- dates
+
+const pad = (n) => String(n).padStart(2, '0');
+/** unix seconds -> value for <input type=datetime-local> */
+export function toLocalInput(unix) {
+  if (!unix) return '';
+  const d = new Date(unix * 1000);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+export function fromLocalInput(v) {
+  if (!v) return 0;
+  const t = new Date(v).getTime();
+  return Number.isFinite(t) ? Math.round(t / 1000) : 0;
+}
+const udf = new Intl.DateTimeFormat('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+export function fmtUnix(unix) { return unix ? udf.format(new Date(unix * 1000)) : '–'; }
+
+/**
+ * End-date picker: quick choices plus free date/time. value = unix seconds
+ * (0 = no end). opts.required hides "unbefristet".
+ */
+export function untilInput(value, onChange, opts = {}) {
+  const input = el('input', { type: 'datetime-local', value: toLocalInput(value), min: toLocalInput(Math.floor(Date.now() / 1000)), onchange: (e) => { onChange(fromLocalInput(e.target.value)); } });
+  const set = (unix) => { input.value = toLocalInput(unix); onChange(unix); };
+  const now = () => Math.floor(Date.now() / 1000);
+  const friday = () => { const d = new Date(); d.setDate(d.getDate() + ((5 - d.getDay() + 7) % 7 || 7)); d.setHours(18, 0, 0, 0); return Math.floor(d / 1000); };
+  const quick = [['1 Std.', () => now() + 3600], ['Heute 18 Uhr', () => { const d = new Date(); d.setHours(18, 0, 0, 0); return d < new Date() ? now() + 3600 : Math.floor(d / 1000); }], ['1 Tag', () => now() + 86400], ['Freitag 18 Uhr', friday], ['1 Woche', () => now() + 7 * 86400], ['30 Tage', () => now() + 30 * 86400]];
+  return el('div.until', null,
+    el('div.row', { style: { gap: '4px', flexWrap: 'wrap' } },
+      opts.required ? null : el('button.btn.sm' + (!value ? '.on' : ''), { type: 'button', onclick: () => set(0) }, 'unbefristet'),
+      quick.map(([l, f]) => el('button.btn.sm', { type: 'button', onclick: () => set(f()) }, l))),
+    input);
+}
+
+/** "geändert von admin am 01.02. 12:00 · Notiz" */
+export function stampLine(o) {
+  const parts = [];
+  if (o?.author) parts.push(o.author);
+  if (o?.updated || o?.created) parts.push(fmtUnix(o.updated || o.created));
+  return parts.length ? el('small.muted.stamp', null, '✎ ' + parts.join(' · ')) : null;
 }
 
 // simple card wrapper

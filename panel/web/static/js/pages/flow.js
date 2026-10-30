@@ -7,10 +7,10 @@ import { setActions } from '../app.js';
 // path rules) → Caddy routes → endpoints. Plus a simulator that highlights
 // the path a concrete request takes.
 
-const STAGE_ICON = { bans: '⛨', rules: '⑂', maintenance: '⚒', ip: '⌂', geo: '◍', filters: '⚑', rate: '⏱', challenge: '⧗', auth: '🔑', waf: '⛊', headers: '≡', policy: '⏻' };
+const STAGE_ICON = { bans: '⛨', rules: '⑂', maintenance: '⚒', ip: '⌂', geo: '◍', filters: '⚑', bots: '🤖', rate: '⏱', challenge: '⧗', auth: '🔑', waf: '⛊', headers: '≡', policy: '⏻' };
 const RESULT_ICON = { pass: '✓', skip: '–', block: '✕', challenge: '⧗', login: '🔑', redirect: '↪', info: 'i', warn: '!' };
 const MATRIX = [
-  ['tls', 'TLS'], ['rules', 'Regeln'], ['maintenance', 'Wartung'], ['ip', 'IP'], ['geo', 'Geo/Feeds'], ['filters', 'Filter'],
+  ['tls', 'TLS'], ['rules', 'Regeln'], ['maintenance', 'Wartung'], ['ip', 'IP'], ['geo', 'Geo/Feeds'], ['filters', 'Filter'], ['bots', 'Bots'],
   ['rate', 'Limits'], ['challenge', 'Challenge'], ['auth', 'Anmeldung'], ['waf', 'WAF'],
 ];
 const EP_ICON = { proxy: '⇄', php: '⟨⟩', files: '🗀', respond: '↩', redirect: '↪', acme: '🔏', error: '⚠', other: '◇' };
@@ -22,7 +22,7 @@ export async function render(root, _p, scope, q) {
   const wantPolicy = q.get('policy') || '';
   let vertical = (() => { try { return localStorage.getItem('sentinel.flow.vertical') === '1' || window.innerWidth < 900; } catch { return window.innerWidth < 900; } })();
   let trace = null;
-  const sim = { method: 'GET', path: '/', ip: '203.0.113.10', client: 'browser', user: '', groups: '', factors: 2, api_key: '', challenge_solved: false, check_waf: false, host: '' };
+  const sim = { method: 'GET', path: '/', ip: '203.0.113.10', client: 'browser', user: '', groups: '', factors: 2, api_key: '', token: '', at: '', challenge_solved: false, check_waf: false, host: '' };
   // prefilled from a logged request ("Im Simulator nachstellen")
   let autoRun = false;
   for (const k of ['method', 'path', 'ip', 'host', 'client', 'user']) if (q.get(k)) { sim[k] = q.get(k); autoRun = true; }
@@ -234,7 +234,9 @@ export async function render(root, _p, scope, q) {
         site.hosts.length > 1 ? el('label.field', null, el('span', null, 'Host'), select(site.hosts.map(h => h.replace('*', 'www')), sim.host, (v) => { sim.host = v; run(); })) : null,
         el('label.field', null, el('span', null, 'Client-IP'), inp('ip', { class: 'mono', list: 'flow-ips' }),
           el('datalist#flow-ips', null, [['203.0.113.10', 'Internet'], ['192.168.1.20', 'LAN'], ['10.0.0.5', 'VPN'], ['127.0.0.1', 'lokal']].map(([v, l]) => el('option', { value: v }, l)))),
-        el('div.field', null, el('span', null, 'Client'), seg([['browser', 'Browser'], ['api', 'Skript / API']], sim.client, (v) => { sim.client = v; run(); })),
+        el('label.field', null, el('span', null, 'Client'), select([['browser', 'Browser'], ['api', 'Skript / API'], ['gptbot', 'KI-Crawler (GPTBot)'], ['ahrefs', 'SEO-Crawler (AhrefsBot)'], ['googlebot', 'Googlebot']], sim.client, (v) => { sim.client = v; run(); })),
+        el('label.field', null, el('span', null, 'Zeitpunkt'), el('input', { type: 'datetime-local', value: sim.at, onchange: (e) => { sim.at = e.target.value; run(); } }), el('small', null, 'leer = jetzt (für Zeitpläne, Ablauf, Wartung)')),
+        el('label.field', null, el('span', null, 'Zugriffstoken'), inp('token', { placeholder: 'sst_… (optional)', class: 'mono' })),
         el('label.field', null, el('span', null, 'Angemeldet als'), inp('user', { placeholder: 'niemand' })),
         el('label.field', null, el('span', null, 'Gruppen'), inp('groups', { placeholder: 'Wiki-Users, IT-Admins' })),
         el('div.field', null, el('span', null, 'Mit 2FA'), toggle(sim.factors >= 2, (v) => { sim.factors = v ? 2 : 1; run(); }, 'Code eingegeben')),
@@ -249,7 +251,8 @@ export async function render(root, _p, scope, q) {
     try {
       trace = await post('/flow/trace', {
         site: site.id, host: sim.host, method: sim.method, path: sim.path, ip: sim.ip,
-        ua: sim.client === 'api' ? 'curl/8.5.0' : '', accept: sim.client === 'api' ? 'application/json' : '',
+        ua: { api: 'curl/8.5.0', gptbot: 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)', ahrefs: 'Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)', googlebot: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' }[sim.client] || '',
+        accept: sim.client === 'api' ? 'application/json' : '', token: sim.token.trim(), at: sim.at ? Math.round(new Date(sim.at).getTime() / 1000) : 0,
         user: sim.user.trim(), groups: sim.groups.split(',').map(s => s.trim()).filter(Boolean), factors: sim.factors,
         api_key: sim.api_key.trim(), challenge_solved: sim.challenge_solved, check_waf: sim.check_waf,
       });

@@ -50,6 +50,8 @@ type Engine struct {
 	version   int64
 	stateJSON []byte
 	stateErrs map[string][]string
+	stateInst map[string][]byte // per-instance state (policies limited to instances)
+	scoped    bool
 	changed   chan struct{}
 
 	agentToken string
@@ -138,6 +140,7 @@ func (e *Engine) Run(ctx context.Context) {
 	go e.IDS.run(ctx)
 	go e.alerts.run(ctx)
 	go e.maintenanceLoop(ctx)
+	go e.aggLoop(ctx)
 	go e.feeds.run(ctx)
 	go e.mon.run(ctx)
 	go e.certLoop(ctx)
@@ -168,9 +171,53 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 				_ = e.Store.AddEvents(evs)
 				e.Rebuild("bans expired")
 			}
+			e.expireTick()
 		case <-prune.C:
 			e.prune()
 		}
+	}
+}
+
+// aggLoop condenses finished hours into the analytics aggregates (newest
+// first; after an update or a long downtime the backlog is worked off in
+// the background while the raw data answers the queries).
+func (e *Engine) aggLoop(ctx context.Context) {
+	t := time.NewTimer(20 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		next := time.Minute
+		hrs := e.Settings().Retention.RequestsHours
+		if hrs <= 0 {
+			hrs = 72
+		}
+		pending, err := e.Store.PendingHours(hrs)
+		if err != nil {
+			e.log.Warn("aggregates", "err", err)
+		}
+		start := time.Now()
+		for i, h := range pending {
+			if ctx.Err() != nil {
+				return
+			}
+			n, err := e.Store.RollupHour(ctx, h)
+			if err != nil {
+				e.log.Warn("aggregates: hour", "hour", time.UnixMilli(h).Format(time.RFC3339), "err", err)
+				break
+			}
+			if n > 0 {
+				e.log.Debug("aggregates: hour condensed", "hour", time.UnixMilli(h).Format(time.RFC3339), "rows", n, "ms", time.Since(start).Milliseconds())
+			}
+			if time.Since(start) > 20*time.Second && i < len(pending)-1 {
+				next = 2 * time.Second // backlog: continue soon, let other writers in
+				break
+			}
+		}
+		t.Reset(next)
 	}
 }
 
@@ -534,6 +581,9 @@ func (e *Engine) SavePolicy(p *PolicyDoc, rebuild bool) error {
 	if err := e.normalizeAuth(&p.Auth); err != nil {
 		return err
 	}
+	if err := e.normalizePolicyExtras(p); err != nil {
+		return err
+	}
 	if err := e.normalizePathRules(p); err != nil {
 		return err
 	}
@@ -692,11 +742,46 @@ func (e *Engine) BuildState() (*protocol.State, map[string][]string) {
 	if rv, err := e.Store.DirRevocations(); err == nil && len(rv) > 0 {
 		st.AuthRevoked = rv
 	}
+	st.AuthTokens = e.siteTokensForState()
+	st.AuthProviders = e.providersForState()
+	st.AuthSources = e.authSources()
+	if e.resetAvailable() {
+		for _, src := range st.AuthSources {
+			if src == "local" {
+				st.AuthFeatures = append(st.AuthFeatures, "reset")
+			}
+		}
+	}
+	if len(st.AuthProviders) > 0 {
+		st.PanelURL = strings.TrimRight(s.PanelURL, "/")
+	}
+	// temporary entries (with end date) join the regular lists
+	temp, _ := e.Store.TempEntries("")
+	polTemp := map[string][]store.TempEntry{}
+	for _, t := range temp {
+		switch {
+		case t.Scope == "global" && t.List == "trusted":
+			st.Trusted = append(st.Trusted, t.Value)
+		case t.Scope != "global":
+			polTemp[t.Scope] = append(polTemp[t.Scope], t)
+		}
+	}
 	errs := map[string][]string{}
 	for _, p := range e.Policies() {
 		pp := p.Policy
 		if pp.Auth.SSO && s.SSO.Enabled && s.SSO.Domain != "" {
 			pp.Auth.CookieDomain = s.SSO.Domain
+		}
+		if ts := polTemp[p.ID]; len(ts) > 0 {
+			pp.IP.Allow = append([]string{}, pp.IP.Allow...)
+			pp.IP.Deny = append([]string{}, pp.IP.Deny...)
+			for _, t := range ts {
+				if t.List == "allow" {
+					pp.IP.Allow = append(pp.IP.Allow, t.Value)
+				} else if t.List == "deny" {
+					pp.IP.Deny = append(pp.IP.Deny, t.Value)
+				}
+			}
 		}
 		w, es := e.PolicyWAF(p)
 		pp.WAF = w
@@ -732,6 +817,11 @@ func (e *Engine) Rebuild(reason string) {
 	b, _ := json.Marshal(st)
 	e.stateJSON = b
 	e.stateErrs = errs
+	e.stateInst = map[string][]byte{}
+	e.scoped = false
+	for _, p := range e.Policies() {
+		e.scoped = e.scoped || len(p.Instances) > 0
+	}
 	close(e.changed)
 	e.changed = make(chan struct{})
 	e.stateMu.Unlock()
@@ -743,6 +833,57 @@ func (e *Engine) State() ([]byte, int64, <-chan struct{}) {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
 	return e.stateJSON, e.version, e.changed
+}
+
+// StateFor returns the state for one Caddy instance: policies limited to
+// other instances are left out (cached per state version).
+func (e *Engine) StateFor(inst string) ([]byte, int64, <-chan struct{}) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	if !e.scoped {
+		return e.stateJSON, e.version, e.changed
+	}
+	if b, ok := e.stateInst[inst]; ok {
+		return b, e.version, e.changed
+	}
+	var st protocol.State
+	if json.Unmarshal(e.stateJSON, &st) != nil {
+		return e.stateJSON, e.version, e.changed
+	}
+	filterStateForInstance(&st, e.Policies(), inst)
+	b, _ := json.Marshal(&st)
+	e.stateInst[inst] = b
+	return b, e.version, e.changed
+}
+
+// On reports whether policy p is active on instance inst.
+func (p *PolicyDoc) On(inst string) bool {
+	if len(p.Instances) == 0 || inst == "" || inst == "all" {
+		return true
+	}
+	for _, i := range p.Instances {
+		if i == inst {
+			return true
+		}
+	}
+	return false
+}
+
+func filterStateForInstance(st *protocol.State, pols []*PolicyDoc, inst string) {
+	for _, p := range pols {
+		if p.On(inst) {
+			continue
+		}
+		delete(st.Policies, p.ID)
+		for h, id := range st.Hosts {
+			if id == p.ID {
+				delete(st.Hosts, h)
+			}
+		}
+		if st.DefaultPolicy == p.ID {
+			st.DefaultPolicy = ""
+		}
+	}
 }
 
 func (e *Engine) StateErrors() map[string][]string {

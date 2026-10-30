@@ -37,6 +37,11 @@ type TraceRequest struct {
 	Body     string   `json:"body"`
 
 	Inst string `json:"inst"`
+	// At: point in time to evaluate (schedules, expiry, maintenance window);
+	// 0 = now.
+	At int64 `json:"at,omitempty"`
+	// Token: a site access token presented as "Authorization: Bearer".
+	Token string `json:"token,omitempty"`
 
 	assumeKey bool       // replay of a logged request: the key it sent is unknown
 	policy    *PolicyDoc // impact preview: evaluate this draft instead
@@ -144,14 +149,33 @@ func (e *Engine) Trace(ctx context.Context, in TraceRequest) (*TraceResult, erro
 	if in.policy != nil && (pol == nil || in.policy.ID == pid) {
 		pol = in.policy
 	}
+	if pol != nil && !pol.On(in.Inst) {
+		def := e.Policy(e.Settings().DefaultPolicy)
+		name := pol.Name
+		if def != nil && def.ID != pol.ID {
+			step("policy", "Policy", "info", "„"+name+"“ gilt nicht auf dieser Caddy-Instanz – es greift die Standard-Policy „"+def.Name+"“")
+			pol, pid = def, def.ID
+		} else {
+			step("policy", "Policy", "skip", "„"+name+"“ gilt nicht auf dieser Caddy-Instanz")
+			return e.traceEndpoint(res, br, step), nil
+		}
+	}
 	res.Policy = pid
-	settings := e.Settings()
+	at := time.Now()
+	if in.At > 0 {
+		at = time.Unix(in.At, 0)
+	}
+	trusted := e.Settings().Trusted
+	st := e.lastState()
+	if st != nil {
+		trusted = st.Trusted // includes temporary entries
+	}
 
-	if ipInNets(in.IP, settings.Trusted) {
+	if ipInNets(in.IP, trusted) {
 		step("bans", "Sperren & Vertrauen", "pass", "vertrauenswürdige IP – alle Prüfungen übersprungen")
 		return e.traceEndpoint(res, br, step), nil
 	}
-	if st := e.lastState(); st != nil {
+	if st != nil {
 		for _, b := range st.Bans {
 			if ipInNets(in.IP, []string{b.IP}) && (b.Until == 0 || b.Until > time.Now().Unix()) {
 				step("bans", "Sperren & Vertrauen", "block", "IP gesperrt: "+b.Reason)
@@ -165,6 +189,11 @@ func (e *Engine) Trace(ctx context.Context, in TraceRequest) (*TraceResult, erro
 		return e.traceEndpoint(res, br, step), nil
 	}
 	p := pol.Policy
+	if st != nil && in.policy == nil {
+		if sp := st.Policies[pid]; sp != nil {
+			p.IP = sp.IP // with temporary allow/deny entries
+		}
+	}
 	if !p.Enabled {
 		step("policy", "Policy", "skip", "Policy ist ausgeschaltet – nur Messung")
 		return e.traceEndpoint(res, br, step), nil
@@ -180,11 +209,22 @@ func (e *Engine) Trace(ctx context.Context, in TraceRequest) (*TraceResult, erro
 	var pr *protocol.PathRule
 	var cr *protocol.CompiledRule
 	if !strings.HasPrefix(urlPath, "/.sentinel/") {
-		cr = protocol.MatchRules(rules, urlPath, in.Method, ip)
+		cr = protocol.MatchRulesAt(rules, urlPath, in.Method, ip, at)
 	}
 	apiOK := false
 	if cr == nil {
-		step("rules", "Pfad-Regeln", "skip", "keine Regel passt")
+		why := "keine Regel passt"
+		for _, r := range rules {
+			if r.Match(urlPath, in.Method, ip) && !r.ActiveAt(at) {
+				if r.R.Until > 0 && at.Unix() >= r.R.Until {
+					why = "„" + r.R.Name + "“ würde passen, ist aber abgelaufen"
+				} else {
+					why = "„" + r.R.Name + "“ würde passen, gilt zu diesem Zeitpunkt aber nicht (Zeitplan)"
+				}
+				break
+			}
+		}
+		step("rules", "Pfad-Regeln", "skip", why)
 	} else {
 		pr = cr.R
 		res.Rule, res.RuleName = pr.ID, pr.Name
@@ -241,9 +281,19 @@ func (e *Engine) Trace(ctx context.Context, in TraceRequest) (*TraceResult, erro
 	}
 	allow := pr != nil && pr.Action == "allow"
 
-	if p.Maintenance && !allow && (pr == nil || !pr.SkipMaintenance) {
-		step("maintenance", "Wartung", "block", "Wartungsmodus aktiv")
-		return stop(503, "block", "Wartungsseite (503)"), nil
+	if p.MaintenanceActive(at.Unix()) && !allow && (pr == nil || !pr.SkipMaintenance) {
+		if ipInNets(in.IP, p.MaintenanceAllow) {
+			step("maintenance", "Wartung", "pass", "Wartungsmodus aktiv – dieses Netz darf trotzdem zugreifen")
+		} else {
+			d := "Wartungsmodus aktiv"
+			if p.MaintenanceUntil > 0 {
+				d += " bis " + time.Unix(p.MaintenanceUntil, 0).Format("02.01. 15:04")
+			}
+			step("maintenance", "Wartung", "block", d)
+			return stop(503, "block", "Wartungsseite (503)"), nil
+		}
+	} else if p.Maintenance && p.MaintenanceFrom > at.Unix() {
+		step("maintenance", "Wartung", "info", "Wartung geplant ab "+time.Unix(p.MaintenanceFrom, 0).Format("02.01. 15:04"))
 	}
 	switch {
 	case ipInNets(in.IP, p.IP.Deny) && p.Test.IP:
@@ -341,6 +391,29 @@ func (e *Engine) Trace(ctx context.Context, in TraceRequest) (*TraceResult, erro
 		step("filters", "Filter", "skip", "durch Regel übersprungen")
 	}
 
+	if b := protocol.ClassifyBot(in.UA); b != nil && !allow {
+		bp := p.Bots
+		act := map[string]string{"ai": bp.AI, "seo": bp.SEO}[b.Class]
+		label := map[string]string{"ai": "KI-Crawler", "seo": "SEO-Crawler", "search": "Suchmaschine"}[b.Class]
+		switch {
+		case b.Class == "search" && bp.VerifySearch && len(b.Domains) > 0:
+			step("bots", "Bots & Crawler", "info", b.Name+": echte Herkunft wird per Reverse-DNS geprüft ("+strings.Join(b.Domains, ", ")+") – Fälschungen werden blockiert")
+		case act == "block" && p.Test.Filters:
+			step("bots", "Bots & Crawler", "warn", "Testmodus: "+label+" "+b.Name+" würde blockiert")
+		case act == "block":
+			step("bots", "Bots & Crawler", "block", label+" "+b.Name+" ist gesperrt")
+			return stop(403, "block", label+" gesperrt"), nil
+		case act == "limit":
+			n := bp.LimitPerMinute
+			if n <= 0 {
+				n = 10
+			}
+			step("bots", "Bots & Crawler", "info", fmt.Sprintf("%s %s: höchstens %d Anfragen pro Minute", label, b.Name, n))
+		default:
+			step("bots", "Bots & Crawler", "pass", label+" "+b.Name+" erlaubt")
+		}
+	}
+
 	if allow || (pr != nil && pr.SkipRateLimits) {
 		step("rate", "Ratelimits", "skip", "durch Regel übersprungen")
 	} else {
@@ -391,7 +464,29 @@ func (e *Engine) Trace(ctx context.Context, in TraceRequest) (*TraceResult, erro
 	}
 
 	eff := protocol.EffectiveAuth(p.Auth, pr)
+	var tok *protocol.AuthToken
+	if in.Token != "" && eff.Enabled && !apiOK {
+		for _, t := range e.siteTokensForState() {
+			if protocol.HashAPIKey(in.Token) == t.Hash {
+				tt := t
+				tok = &tt
+			}
+		}
+	}
 	switch {
+	case tok != nil:
+		switch {
+		case len(tok.Policies) > 0 && !containsFold(tok.Policies, p.ID):
+			step("auth", "Anmeldung", "block", "Zugriffstoken „"+tok.Name+"“ gilt nicht für diese Policy")
+			return stop(403, "block", "Token nicht freigegeben"), nil
+		case !protocol.AuthAllowed(eff, tok.User, tok.Groups):
+			step("auth", "Anmeldung", "block", "Zugriffstoken „"+tok.Name+"“: Konto "+tok.User+" hat keinen Zugriff (Gruppen)")
+			return stop(403, "block", "kein Zugriff für "+tok.User), nil
+		}
+		step("auth", "Anmeldung", "pass", "Zugriffstoken „"+tok.Name+"“ von "+tok.User+" (ersetzt Login und 2FA)")
+	case in.Token != "" && eff.Enabled && !apiOK && strings.HasPrefix(in.Token, protocol.TokenPrefix):
+		step("auth", "Anmeldung", "block", "Zugriffstoken unbekannt, gesperrt oder abgelaufen")
+		return stop(401, "block", "Token ungültig"), nil
 	case !eff.Enabled || apiOK:
 		why := "keine Anmeldung nötig"
 		if apiOK {
@@ -407,7 +502,7 @@ func (e *Engine) Trace(ctx context.Context, in TraceRequest) (*TraceResult, erro
 		if eff.RequireTOTP && !ipInNets(in.IP, p.Auth.TOTPSkipNetworks) {
 			need = 2
 		}
-		req := "AD-Login"
+		req := e.loginMethods(eff)
 		if need == 2 {
 			req += " + 2FA"
 		}
@@ -599,6 +694,25 @@ func rlMatches(rl protocol.RateLimit, p, method string) bool {
 		}
 	}
 	return rl.Requests > 0 && rl.WindowSeconds > 0
+}
+
+// loginMethods names the sign-in methods a site offers.
+func (e *Engine) loginMethods(a protocol.AuthPolicy) string {
+	var m []string
+	for _, src := range e.authSources() {
+		if protocol.SourceAllowed(a, src) {
+			m = append(m, map[string]string{"directory": "AD", "local": "Zugangskonto"}[src])
+		}
+	}
+	for _, p := range e.Settings().OAuth {
+		if p.Enabled && p.SiteLogin && protocol.SourceAllowed(a, "oidc:"+p.ID) {
+			m = append(m, p.Name)
+		}
+	}
+	if len(m) == 0 {
+		return "Login (keine Methode eingerichtet!)"
+	}
+	return "Login per " + strings.Join(m, "/")
 }
 
 func containsFold(l []string, s string) bool {

@@ -1,4 +1,6 @@
-import { el, mount, get, post, put, del, panel, tabs, field, toggle, select, linesInput, toast, errToast, confirmDialog, prompt, modal, empty, countryLabel, fmtInt, fmtAgo, fmtDateTime, instChip, actionLabel } from '../ui.js';
+import { el, mount, get, post, put, del, panel, tabs, field, toggle, select, linesInput, toast, errToast, confirmDialog, prompt, modal, empty, countryLabel, fmtInt, fmtAgo, fmtDateTime, instChip, actionLabel, instState, untilInput, toLocalInput, fromLocalInput, fmtUnix, fmtUntil, stampLine, can } from '../ui.js';
+import { tempPanelBody, tempDialog } from '../temp.js';
+import { openTransfer } from '../transfer.js';
 
 const fmtIntSafe = (n) => fmtInt(n || 0);
 import { seg } from '../widgets.js';
@@ -32,6 +34,8 @@ export async function render(root, [id], scope, q) {
   const sideList = el('div.policy-list', null, policies.map(p => el('a' + (p.id === id ? '.active' : ''), { href: '#/policies/' + p.id },
     el('b', null, p.name), p.id === list.default ? el('span.badge.primary', { style: { marginLeft: '6px' } }, 'Standard') : null,
     !p.enabled ? el('span.badge', { style: { marginLeft: '6px' } }, 'aus') : null,
+    p.maintenance ? el('span.badge.warn', { style: { marginLeft: '6px' } }, 'Wartung') : null,
+    (p.instances || []).map(i => el('span', { style: { marginLeft: '4px' } }, instChip(i))),
     el('small', null, wafLabel(p.waf.mode), ' · ', p.hosts?.length ? p.hosts.join(', ') : (p.id === list.default ? 'alle übrigen Hosts' : 'keine Hosts')))),
     el('div', { style: { padding: '10px 14px' } }, el('button.btn', { onclick: create }, 'Neue Policy')));
 
@@ -61,6 +65,11 @@ export async function render(root, [id], scope, q) {
   for (const k of ['allowed_groups', 'allowed_users', 'exempt_paths', 'bypass_networks', 'totp_skip_networks']) p.auth[k] ??= [];
   p.path_rules ??= [];
   p.test ??= { ip: false, geo: false, filters: false };
+  p.instances ??= [];
+  p.maintenance_allow ??= [];
+  p.bots ??= {};
+  p.auth.sources ??= [];
+  for (const r of p.path_rules) r.schedule ??= {};
   let dirty = false;
   const saveBtn = el('button.btn.primary', { disabled: true, onclick: save }, 'Speichern');
   const markDirty = () => { dirty = true; saveBtn.disabled = false; };
@@ -128,8 +137,9 @@ export async function render(root, [id], scope, q) {
   const tabBody = el('div.stack');
   const drawTab = () => {
     sessionStorage.setItem('policy.tab', tab);
-    mount(tabHost, tabs([['general', 'Allgemein'], ['access', 'Zugriff'], ['rate', `Ratelimits (${p.rate_limits.length})`], ['geo', 'Geo & Feeds'], ['challenge', 'Bot-Challenge'], ['login', p.auth.enabled ? 'Anmeldung ●' : 'Anmeldung'], ['rules', `Pfad-Regeln (${p.path_rules.length})`], ['waf', 'WAF'], ['headers', 'Header'], ['ids', 'IDS']], tab, (t) => { tab = t; q.delete('tab'); drawTab(); }), tabBody);
-    ({ general, access, rate, geo, challenge, login, rules, waf, headers, ids })[tab]();
+    const botsOn = (p.bots.ai && p.bots.ai !== 'allow') || (p.bots.seo && p.bots.seo !== 'allow') || p.bots.verify_search;
+    mount(tabHost, tabs([['general', p.maintenance ? 'Allgemein ●' : 'Allgemein'], ['access', 'Zugriff'], ['rate', `Ratelimits (${p.rate_limits.length})`], ['geo', 'Geo & Feeds'], ['bots', botsOn ? 'Bots ●' : 'Bots'], ['challenge', 'Bot-Challenge'], ['login', p.auth.enabled ? 'Anmeldung ●' : 'Anmeldung'], ['rules', `Pfad-Regeln (${p.path_rules.length})`], ['waf', 'WAF'], ['headers', 'Header'], ['ids', 'IDS']], tab, (t) => { tab = t; q.delete('tab'); drawTab(); }), tabBody);
+    ({ general, access, rate, geo, bots, challenge, login, rules, waf, headers, ids })[tab]();
   };
   const tabHost = el('div.stack');
 
@@ -178,16 +188,45 @@ export async function render(root, [id], scope, q) {
       el('div.field.wide', null, el('span', null, 'Hosts'), linesInput(p.hosts, (v) => { p.hosts = v; markDirty(); }, { rows: 3, placeholder: 'example.com\n*.example.com' }),
         el('small', null, p.id === list.default ? 'Standard-Policy: gilt zusätzlich für alle Hosts, die keiner anderen Policy zugeordnet sind.' : 'Requests an diese Hosts nutzen diese Policy (sofern die Direktive keine Policy fest vorgibt). Wildcards wie *.example.com sind erlaubt.')),
       el('div.field.wide', null, el('span', null, 'Notizen'), el('textarea', { rows: 2, value: p.notes || '', oninput: (e) => { p.notes = e.target.value; markDirty(); } })),
-    )), panel('Wartungsmodus', el('div.fields', null,
-      el('div.field', null, el('span', null, 'Wartung'), toggle(p.maintenance, (v) => { p.maintenance = v; markDirty(); }, 'Alle Requests mit 503 beantworten')),
-      field('Meldung', el('input', { value: p.maintenance_message || '', placeholder: 'Wartungsarbeiten – bitte später erneut versuchen.', oninput: (e) => { p.maintenance_message = e.target.value; markDirty(); } }), 'Vertrauenswürdige IPs aus den Einstellungen kommen trotzdem durch.'),
-    )), panel('Antwort bei Sperren', el('div.fields', null,
+      instState.multi() ? instanceScope() : null,
+    )), maintenancePanel(), panel('Antwort bei Sperren', el('div.fields', null,
       field('Status-Code', el('input', { type: 'number', min: 0, max: 599, value: p.block_status || 0, oninput: (e) => { p.block_status = +e.target.value; markDirty(); } }), '0 = 403. WAF-Blocks nutzen den Status der Regel.'),
       field('Text', el('input', { value: p.block_message || '', placeholder: 'Forbidden', oninput: (e) => { p.block_message = e.target.value; markDirty(); } })),
     )));
   }
 
+  function instanceScope() {
+    const all = !p.instances.length;
+    const isDef = p.id === list.default;
+    return el('div.field.wide', null, el('span', null, 'Gilt auf'),
+      el('div.chips', null,
+        el('span.chip' + (all ? '.on' : ''), { role: 'checkbox', 'aria-checked': all ? 'true' : 'false', tabindex: 0, onclick: () => { p.instances = []; markDirty(); general(); } }, 'allen Caddy-Instanzen'),
+        isDef ? null : instState.list.map(i => {
+          const on = p.instances.includes(i.id);
+          return el('span.chip' + (on ? '.on' : ''), { role: 'checkbox', 'aria-checked': on ? 'true' : 'false', tabindex: 0, onclick: () => { p.instances = on ? p.instances.filter(x => x !== i.id) : [...p.instances, i.id]; markDirty(); general(); } }, on ? '✓ ' : '', i.name);
+        })),
+      el('small', null, isDef ? 'Die Standard-Policy gilt immer überall.' : all ? 'Die Policy wird an alle Caddy-Server verteilt.' : 'Nur diese Server erhalten die Policy. Auf den anderen greift für ihre Hosts die Standard-Policy.'));
+  }
+
+  function maintenancePanel() {
+    const now = Math.floor(Date.now() / 1000);
+    const active = p.maintenance && (!p.maintenance_from || p.maintenance_from <= now) && (!p.maintenance_until || p.maintenance_until > now);
+    const myIP = window.__status?.client_ip;
+    return panel('Wartungsmodus', el('div.stack', null,
+      p.maintenance ? el('div.callout.' + (active ? 'warn' : 'info'), null, active ? 'Wartung ist aktiv' : 'Wartung ist geplant', p.maintenance_from > now ? ' ab ' + fmtUnix(p.maintenance_from) : '', p.maintenance_until ? ' bis ' + fmtUnix(p.maintenance_until) + ' – danach schaltet Sentinel sie selbst aus.' : ' – ohne geplantes Ende.') : null,
+      el('div.fields', null,
+        el('div.field', null, el('span', null, 'Wartung'), toggle(p.maintenance, (v) => { p.maintenance = v; markDirty(); general(); }, 'Besucher sehen eine Wartungsseite (503)')),
+        field('Meldung', el('input', { value: p.maintenance_message || '', placeholder: 'Wartungsarbeiten – bitte später erneut versuchen.', oninput: (e) => { p.maintenance_message = e.target.value; markDirty(); } }), 'Mit geplantem Ende nennt die Seite die Uhrzeit, ab der es weitergeht.'),
+        field('Beginn', el('input', { type: 'datetime-local', value: toLocalInput(p.maintenance_from), onchange: (e) => { p.maintenance_from = fromLocalInput(e.target.value); markDirty(); } }), 'leer = sofort'),
+        el('label.field', null, el('span', null, 'Ende'), untilInput(p.maintenance_until || 0, (v) => { p.maintenance_until = v; markDirty(); })),
+        el('div.field.wide', null, el('span', null, 'Trotzdem erreichbar für'), linesInput(p.maintenance_allow, (v) => { p.maintenance_allow = v; markDirty(); }, { rows: 2, placeholder: '192.168.10.0/24' }),
+          el('small', null, 'Netze, die während der Wartung normal zugreifen – z. B. die IT zum Testen. Vertrauenswürdige IPs und Pfad-Regeln mit „auch bei Wartung“ kommen ebenfalls durch. ',
+            myIP ? el('a', { href: '#', onclick: (e) => { e.preventDefault(); if (!p.maintenance_allow.includes(myIP)) p.maintenance_allow.push(myIP); markDirty(); general(); } }, 'Meine IP (' + myIP + ') eintragen') : null)))));
+  }
+
   function access() {
+    const polById = Object.fromEntries(policies.map(x => [x.id, x.name]));
+    const temp = tempPanelBody(p.id, polById);
     mount(tabBody,
       panel('IP-Regeln', el('div.fields', null,
         testToggle('ip', 'IP-Freigabe- und Sperrliste'),
@@ -205,7 +244,27 @@ export async function render(root, [id], scope, q) {
         })), el('small', null, p.allowed_methods.length ? 'Andere Methoden erhalten 405.' : 'Keine Auswahl = alle Methoden erlaubt.')),
         field('Gesperrte User-Agents', linesInput(p.blocked_user_agents, (v) => { p.blocked_user_agents = v; markDirty(); }, { placeholder: 'python-requests\nGPTBot' }), 'Teilstring, Groß-/Kleinschreibung egal.'),
         field('Honeypot-Pfade', linesInput(p.honeypot_paths, (v) => { p.honeypot_paths = v; markDirty(); }, { placeholder: '/.env\n/wp-login.php' }), 'Pfad-Präfixe, die echte Besucher nie aufrufen. Antwort 404, das IDS bewertet den Treffer hoch.'),
-        field('Max. Request-Body', el('div.row', null, el('input', { type: 'number', min: 0, value: p.max_body_bytes ? Math.round(p.max_body_bytes / 1048576) : 0, oninput: (e) => { p.max_body_bytes = Math.round(+e.target.value * 1048576); markDirty(); } }), 'MiB'), '0 = unbegrenzt. Größere Uploads erhalten 413.'))));
+        field('Max. Request-Body', el('div.row', null, el('input', { type: 'number', min: 0, value: p.max_body_bytes ? Math.round(p.max_body_bytes / 1048576) : 0, oninput: (e) => { p.max_body_bytes = Math.round(+e.target.value * 1048576); markDirty(); } }), 'MiB'), '0 = unbegrenzt. Größere Uploads erhalten 413.'))),
+      panel('Befristete Einträge', el('div.stack', null,
+        el('p.muted', { style: { margin: 0 } }, 'Freigaben oder Sperren mit Enddatum, z. B. das Netz eines Dienstleisters bis Freitag. Sie gelten sofort (ohne Speichern) und verschwinden von selbst.'),
+        temp,
+        can('policy') ? el('div.row', null, el('button.btn', { onclick: () => tempDialog({ scope: p.id, list: p.ip.mode === 'allowlist' ? 'allow' : 'deny', policies, onDone: () => temp.reload() }, modal) }, 'Befristet eintragen …'),
+          p.ip.mode !== 'allowlist' ? el('small.muted', null, 'Hinweis: Einträge in der Erlaubt-Liste wirken nur im Modus „Nur Freigabeliste“.') : null) : null)));
+  }
+
+  function bots() {
+    const b = p.bots;
+    const act = (k) => seg([['', 'erlauben'], ['limit', 'bremsen', 'warn'], ['block', 'sperren', 'bad']], b[k] || '', (v) => { b[k] = v; markDirty(); bots(); });
+    mount(tabBody, panel('Bots & Crawler', el('div.stack', null,
+      el('p.muted', { style: { margin: 0 } }, 'Sentinel erkennt bekannte Crawler am User-Agent. Echte Besucher sind nicht betroffen. „Bremsen“ erlaubt einem Crawler pro IP nur eine bestimmte Zahl Anfragen pro Minute, danach 429 – seriöse Crawler halten sich daran.'),
+      p.test.filters ? el('div.callout.warn', null, 'Testmodus für Filter ist aktiv: Bot-Sperren werden nur protokolliert.') : null,
+      el('div.fields', null,
+        el('div.field.wide', null, el('span', null, 'KI-Crawler'), act('ai'), el('small', null, 'GPTBot, ChatGPT-User, ClaudeBot, PerplexityBot, CCBot (Common Crawl), Bytespider, Amazonbot, Meta, Applebot-Extended, Diffbot, cohere … – sammeln Inhalte für KI-Modelle und KI-Suche.')),
+        el('div.field.wide', null, el('span', null, 'SEO-Crawler'), act('seo'), el('small', null, 'AhrefsBot, SemrushBot, MJ12bot, DotBot, BLEXBot, DataForSeoBot … – erzeugen viel Last, nützen meist nur Dritten.')),
+        field('Anfragen pro Minute beim Bremsen', el('input', { type: 'number', min: 1, max: 10000, value: b.limit_per_minute || 10, oninput: (e) => { b.limit_per_minute = +e.target.value; markDirty(); } }), 'je Crawler und IP'),
+        el('div.field.wide', null, el('span', null, 'Suchmaschinen prüfen'), toggle(!!b.verify_search, (v) => { b.verify_search = v; markDirty(); }, 'falsche Googlebots, Bingbots … sperren'),
+          el('small', null, 'Echte Suchmaschinen bleiben erlaubt. Wer sich als Googlebot, Bingbot, Applebot, YandexBot, Baiduspider oder PetalBot ausgibt, wird per Reverse-DNS und Gegenprobe geprüft (Ergebnis 24 h gecacht). Fälschungen erhalten 403 und erhöhen den Bedrohungs-Score. Ist DNS gestört, lässt Sentinel die Anfrage durch.'))),
+      el('div.callout', null, 'Tipp: Ergänzend kann eine robots.txt die KI-Crawler höflich ausladen – Sentinel setzt die Entscheidung aber auch bei Crawlern durch, die robots.txt ignorieren.'))));
   }
 
   function rate() {
@@ -223,6 +282,7 @@ export async function render(root, [id], scope, q) {
         el('button.icon-btn', { title: 'Entfernen', onclick: () => { p.rate_limits.splice(i, 1); markDirty(); draw(); } }, '✕')),
       el('div.field', null, el('span', null, 'Testmodus'), toggle(!!r.test, (v) => { r.test = v; markDirty(); }, 'nur protokollieren')),
       el('div', { style: { gridColumn: '1 / -1' } }, field('Pfad-Regex (optional)', el('input.mono', { value: r.path_regex || '', placeholder: '^/api/v[0-9]+/login$', oninput: (e) => { r.path_regex = e.target.value; markDirty(); } }))),
+      el('div', { style: { gridColumn: '1 / -1' } }, field('Notiz', el('input', { value: r.note || '', placeholder: 'Warum gibt es das Limit? (z. B. Ticket, Vorfall)', oninput: (e) => { r.note = e.target.value; markDirty(); } })), stampLine(r)),
     )) : el('p.muted', null, 'Keine Ratelimits.'));
     draw();
     mount(tabBody, panel('Ratelimits', el('div.stack', null,
@@ -282,19 +342,34 @@ export async function render(root, [id], scope, q) {
   function login() {
     const a = p.auth;
     const dir = settings.settings.directory || {};
+    const provs = (settings.settings.oauth || []).filter(x => x.enabled && x.site_login);
     const hostHint = p.hosts?.length ? p.hosts[0] : 'deine-site';
+    const srcs = [['directory', 'Domänenkonten (AD/LDAP)', dir.enabled ? '' : 'nicht eingerichtet'], ['local', 'Zugangskonten (lokal in Sentinel)', ''], ...provs.map(x => ['oidc:' + x.id, x.name + ' (OAuth/OIDC)', ''])];
+    const srcBox = el('div.chips', null, srcs.map(([k, l, warn]) => {
+      const on = !a.sources.length || a.sources.includes(k);
+      return el('span.chip' + (on ? '.on' : ''), {
+        role: 'checkbox', 'aria-checked': on ? 'true' : 'false', tabindex: 0, title: warn,
+        onclick: () => {
+          let cur = a.sources.length ? [...a.sources] : srcs.map(x => x[0]);
+          cur = on ? cur.filter(x => x !== k) : [...cur, k];
+          if (!cur.length) { toast('Mindestens eine Anmeldemethode muss bleiben', 'bad'); return; }
+          a.sources = cur.length === srcs.length ? [] : cur;
+          markDirty(); login();
+        },
+      }, on ? '✓ ' : '', l, warn ? el('small', null, ' – ' + warn) : null);
+    }));
     mount(tabBody,
-      !dir.enabled ? el('div.callout.warn', null, 'Zuerst das Active Directory bzw. den LDAP-Server unter ', el('a', { href: '#/access?tab=directory' }, 'Site-Login › Verzeichnis'), ' einrichten.') : null,
-      panel('Anmeldung mit Active Directory', el('div.stack', null,
-        el('p.muted', null, 'Besucher müssen sich mit ihrem Domänenkonto anmelden, bevor Caddy die Site ausliefert – optional mit zweitem Faktor (TOTP). Den Authenticator richten Benutzer beim ersten Login selbst ein. Sentinel prüft Passwort und Gruppen live gegen das Verzeichnis; danach gilt ein signiertes Sitzungs-Cookie.'),
+      panel('Anmeldung vor der Site', el('div.stack', null,
+        el('p.muted', null, 'Besucher müssen sich anmelden, bevor Caddy die Site ausliefert – mit Domänenkonto (AD), lokalem Zugangskonto oder über einen OAuth-Anbieter wie Microsoft Entra ID oder Google, optional mit zweitem Faktor (TOTP). Skripte und Dienste weisen sich mit einem Zugriffstoken aus (Authorization: Bearer sst_…). Danach gilt ein signiertes Sitzungs-Cookie.'),
+        el('div.field', null, el('span', null, 'Anmeldemethoden'), srcBox, el('small', null, 'Alle markierten werden auf der Anmeldeseite angeboten. ', el('a', { href: '#/access' }, 'Konten, Tokens und Anbieter verwalten'))),
         el('div.fields', null,
           el('div.field', null, el('span', null, 'Anmeldung'), toggle(a.enabled, (v) => { a.enabled = v; markDirty(); drawTab(); }, a.enabled ? 'Login erforderlich' : 'aus')),
-          el('div.field', null, el('span', null, 'Zweiter Faktor'), toggle(a.require_totp, (v) => { a.require_totp = v; markDirty(); }, 'TOTP verlangen (Authenticator-App)')),
+          el('div.field', null, el('span', null, 'Zweiter Faktor'), toggle(a.require_totp, (v) => { a.require_totp = v; markDirty(); }, 'TOTP verlangen (Authenticator-App)'), el('small', null, 'Anbieter mit „MFA beim Anbieter“ zählen als zwei Faktoren; Zugriffstokens ersetzen Login und Code.')),
           field('Sitzungsdauer (Stunden)', el('input', { type: 'number', min: 1, max: 2160, value: a.session_hours || 12, oninput: (e) => { a.session_hours = +e.target.value; markDirty(); } }), 'Danach ist eine neue Anmeldung nötig.'),
           field('Titel der Login-Seite', el('input', { value: a.title || '', placeholder: hostHint, oninput: (e) => { a.title = e.target.value; markDirty(); } })),
           el('div.field.wide', null, el('span', null, 'Erlaubte Gruppen'), linesInput(a.allowed_groups, (v) => { a.allowed_groups = v; markDirty(); }, { rows: 3, placeholder: 'Wiki-Benutzer\nCN=IT-Admins,OU=Gruppen,DC=firma,DC=local' }),
-            el('small', null, 'Name (CN) oder kompletter DN, eine pro Zeile. Verschachtelte Gruppen zählen mit (Einstellung im Verzeichnis). Leer = jedes Konto aus dem Verzeichnis.')),
-          el('div.field.wide', null, el('span', null, 'Zusätzlich erlaubte Benutzer'), linesInput(a.allowed_users, (v) => { a.allowed_users = v; markDirty(); }, { rows: 2, placeholder: 'max.mustermann' }), el('small', null, 'sAMAccountName, unabhängig von den Gruppen.'))))),
+            el('small', null, 'AD-Gruppe (CN oder DN), Gruppe eines Zugangskontos oder Gruppe/Rolle vom OAuth-Anbieter – eine pro Zeile. Leer = jedes Konto der erlaubten Anmeldemethoden.')),
+          el('div.field.wide', null, el('span', null, 'Zusätzlich erlaubte Benutzer'), linesInput(a.allowed_users, (v) => { a.allowed_users = v; markDirty(); }, { rows: 2, placeholder: 'max.mustermann' }), el('small', null, 'Benutzername, unabhängig von den Gruppen.'))))),
       panel('Ausnahmen', el('div.fields', null,
         field('Pfade ohne Anmeldung', linesInput(a.exempt_paths, (v) => { a.exempt_paths = v; markDirty(); }, { placeholder: '/public/\n/api/webhook' }), 'Pfad-Präfixe, z. B. für Webhooks oder öffentliche Dateien.'),
         field('Netze ohne Anmeldung', linesInput(a.bypass_networks, (v) => { a.bypass_networks = v; markDirty(); }, { placeholder: '10.10.0.0/16' }), 'Clients aus diesen Netzen brauchen gar keinen Login (Vorsicht).'),
@@ -330,12 +405,15 @@ export async function render(root, [id], scope, q) {
           toggle(r.enabled, (v) => { r.enabled = v; markDirty(); drawList(); }),
           el('b', null, `${i + 1}. ${r.name}`),
           r.test ? el('span.badge.test', { title: 'Sperren dieser Regel werden nur protokolliert' }, 'Testmodus') : null,
+          r.until ? el('span.badge.' + (r.until * 1000 < Date.now() ? 'bad' : 'warn'), { title: 'Endet ' + fmtUnix(r.until) }, r.until * 1000 < Date.now() ? 'abgelaufen' : 'bis ' + fmtUnix(r.until)) : null,
+          r.schedule?.mode ? el('span.badge.info', { title: 'Zeitplan' }, scheduleLabel(r.schedule)) : null,
           el('span.grow'),
           el('button.icon-btn', { title: 'nach oben', disabled: i === 0, onclick: () => { [p.path_rules[i - 1], p.path_rules[i]] = [p.path_rules[i], p.path_rules[i - 1]]; markDirty(); drawList(); } }, '↑'),
           el('button.icon-btn', { title: 'nach unten', disabled: i === p.path_rules.length - 1, onclick: () => { [p.path_rules[i + 1], p.path_rules[i]] = [p.path_rules[i], p.path_rules[i + 1]]; markDirty(); drawList(); } }, '↓'),
           el('button.btn.sm', { onclick: () => editRule(r) }, 'Bearbeiten'),
           el('button.btn.sm.danger', { onclick: async () => { if (!await confirmDialog('Regel löschen', `„${r.name}“ löschen?`, 'Löschen')) return; p.path_rules.splice(i, 1); markDirty(); drawList(); } }, 'Löschen')),
-        el('div.rule-body', null, el('div.chips', null, chips.when.map(c => el('span.chip', null, c))), el('div.chips', { style: { marginTop: '6px' } }, chips.then.map(([c, k]) => el('span.chip' + (k ? '.' + k : ''), null, c)))));
+        el('div.rule-body', null, el('div.chips', null, chips.when.map(c => el('span.chip', null, c))), el('div.chips', { style: { marginTop: '6px' } }, chips.then.map(([c, k]) => el('span.chip' + (k ? '.' + k : ''), null, c))),
+          r.note ? el('div.rule-note', null, '📝 ', r.note) : null, stampLine(r)));
     }
 
     function editRule(orig, isNew) {
@@ -368,7 +446,10 @@ export async function render(root, [id], scope, q) {
         el('div.fields', null,
           field('Name', el('input', { value: r.name, oninput: (e) => { r.name = e.target.value; } })),
           el('div.field', null, el('span', null, 'Aktiv'), toggle(r.enabled, (v) => { r.enabled = v; }, 'Regel anwenden')),
-          el('div.field', null, el('span', null, 'Testmodus'), toggle(!!r.test, (v) => { r.test = v; }, 'Sperren nur protokollieren'), el('small', null, 'Sperre, „Nur aus Netzen“ und API-Schlüssel greifen noch nicht – sichtbar in Analysen und Fehleranalyse als „Test: …“.'))),
+          el('div.field', null, el('span', null, 'Testmodus'), toggle(!!r.test, (v) => { r.test = v; }, 'Sperren nur protokollieren'), el('small', null, 'Sperre, „Nur aus Netzen“ und API-Schlüssel greifen noch nicht – sichtbar in Analysen und Fehleranalyse als „Test: …“.')),
+          el('div.field.wide', null, el('span', null, 'Notiz'), el('input', { value: r.note || '', placeholder: 'Warum gibt es die Regel? (Ticket, Ansprechpartner …)', oninput: (e) => { r.note = e.target.value; } }))),
+        el('h4', null, 'Wann gilt die Regel?'),
+        scheduleEditor(r),
         el('h4', null, 'Wenn …'),
         el('div.fields', null,
           el('div.field.wide', null, el('span', null, 'Pfade'), linesInput(r.paths, (v) => { r.paths = v; }, { rows: 3, placeholder: '/admin/\n=/login\n/files/*.pdf\n~^/api/v[0-9]+/' }),
@@ -446,11 +527,14 @@ export async function render(root, [id], scope, q) {
       panel('Ausnahmen (Fehlalarme)', el('div.stack', null,
         el('p.muted', { style: { margin: 0 } }, 'Schalten einzelne CRS-Regeln nur für einen Pfad – oder nur für einen Parameter – ab. Der Fehlalarm-Assistent schlägt passende Ausnahmen anhand echter Blockaden vor.'),
         (w.exclusions || []).length ? el('div.table-wrap', null, el('table', null,
-          el('thead', null, el('tr', null, el('th', null, 'Regeln'), el('th', null, 'Pfade ab'), el('th', null, 'Nur für'), el('th', null, 'Notiz'), el('th'))),
+          el('thead', null, el('tr', null, el('th', null, 'Regeln'), el('th', null, 'Pfade ab'), el('th', null, 'Nur für'), el('th', null, 'Gilt'), el('th', null, 'Notiz'), el('th'))),
           el('tbody', null, w.exclusions.map((x, i) => el('tr', null,
             el('td.mono', null, x.rules.join(', ')), el('td.mono', null, x.path_prefix || 'alle'), el('td.mono', null, x.target || 'alles'),
+            el('td.nowrap', null, x.until ? el('span', { title: fmtUnix(x.until) }, fmtUntil(x.until)) : 'dauerhaft'),
             el('td.muted', null, [x.note, x.author, x.created ? new Date(x.created * 1000).toLocaleDateString('de-DE') : ''].filter(Boolean).join(' · ')),
-            el('td.right', null, el('button.btn.sm.danger', { onclick: () => { w.exclusions.splice(i, 1); markDirty(); waf(); } }, 'Entfernen'))))))) : el('span.muted', null, 'Keine Ausnahmen.'),
+            el('td.right.nowrap', null,
+              el('button.btn.sm', { onclick: () => { let u = x.until || 0; modal('Ausnahme befristen', el('label.field', null, el('span', null, 'Endet'), untilInput(u, (v) => { u = v; })), { actions: [{ label: 'Abbrechen' }, { label: 'Übernehmen', kind: 'primary', onClick: () => { x.until = u; markDirty(); waf(); } }] }); } }, 'Befristen'), ' ',
+              el('button.btn.sm.danger', { onclick: () => { w.exclusions.splice(i, 1); markDirty(); waf(); } }, 'Entfernen'))))))) : el('span.muted', null, 'Keine Ausnahmen.'),
         el('div.row', null, el('button.btn', { onclick: () => openWafAssistant({ policy: p.id }) }, 'Fehlalarm-Assistent öffnen')))),
       panel('Regelsätze', rsChips),
       panel('Eigene Regeln dieser Policy', ruleBuilder(p.rules, meta, markDirty)),
@@ -491,6 +575,7 @@ export async function render(root, [id], scope, q) {
     el('button.btn', { onclick: () => impact(true).catch(errToast), title: 'Gespeicherten Verkehr der letzten 24 h gegen den aktuellen Bearbeitungsstand nachspielen' }, 'Auswirkung prüfen'),
     el('a.btn', { href: '#/waf?policy=' + p.id }, 'Testen'),
     el('button.btn', { onclick: preview }, 'SecLang-Vorschau'),
+    policies.length > 1 ? el('button.btn', { onclick: () => { if (dirty) toast('Übertragen wird der gespeicherte Stand', 'info'); openTransfer(pol, policies); }, title: 'Bereiche dieser Policy in andere Policies übernehmen' }, 'Übertragen …') : null,
     p.id !== list.default ? el('button.btn', { onclick: makeDefault }, 'Als Standard') : null,
     p.id !== list.default ? el('button.btn.danger', { onclick: remove }, 'Löschen') : null,
     saveBtn);
@@ -521,7 +606,35 @@ export async function render(root, [id], scope, q) {
 }
 
 function blankRule() {
-  return { id: '', name: 'Neue Regel', enabled: true, paths: [], methods: [], networks: [], action: '', redirect_url: '', redirect_status: 302, only_networks: [], auth: '', auth_groups: [], auth_users: [], totp: '', api_keys: [], api_key_header: '', waf: '', challenge: '', skip_rate_limits: false, skip_maintenance: false, response_headers: {} };
+  return { id: '', name: 'Neue Regel', enabled: true, paths: [], methods: [], networks: [], action: '', redirect_url: '', redirect_status: 302, only_networks: [], auth: '', auth_groups: [], auth_users: [], totp: '', api_keys: [], api_key_header: '', waf: '', challenge: '', skip_rate_limits: false, skip_maintenance: false, response_headers: {}, until: 0, schedule: {}, note: '' };
+}
+
+const DAYS = [[1, 'Mo'], [2, 'Di'], [3, 'Mi'], [4, 'Do'], [5, 'Fr'], [6, 'Sa'], [7, 'So']];
+function scheduleLabel(s) {
+  if (!s?.mode) return '';
+  const days = (s.days || []).length ? (s.days.join(',') === '1,2,3,4,5' ? 'Mo–Fr' : s.days.map(d => DAYS[d - 1][1]).join(', ')) : 'täglich';
+  return (s.mode === 'inside' ? 'nur ' : 'außer ') + days + ' ' + (s.from || '00:00') + '–' + (s.to || '24:00');
+}
+
+function scheduleEditor(r) {
+  r.schedule ??= {};
+  const s = r.schedule;
+  const box = el('div.stack', { style: { gap: '8px' } });
+  const draw = () => mount(box,
+    el('div.fields', null,
+      el('label.field', null, el('span', null, 'Endet'), untilInput(r.until || 0, (v) => { r.until = v; }), el('small', null, 'Danach schaltet Sentinel die Regel aus (sie bleibt sichtbar).')),
+      el('div.field', null, el('span', null, 'Zeitplan'), seg([['', 'immer'], ['inside', 'nur im Zeitfenster'], ['outside', 'nur außerhalb']], s.mode || '', (v) => { s.mode = v; if (v && !s.from) { s.from = '07:00'; s.to = '19:00'; s.days = [1, 2, 3, 4, 5]; } draw(); }))),
+    s.mode ? el('div.fields', null,
+      el('div.field.wide', null, el('span', null, 'Tage'), el('div.chips', null, DAYS.map(([d, l]) => {
+        const on = (s.days || []).includes(d);
+        return el('span.chip' + (on ? '.on' : ''), { role: 'checkbox', 'aria-checked': on ? 'true' : 'false', tabindex: 0, onclick: () => { s.days = on ? s.days.filter(x => x !== d) : [...(s.days || []), d].sort(); draw(); } }, l);
+      })), el('small', null, 'Keine Auswahl = jeden Tag')),
+      field('Von', el('input', { type: 'time', value: s.from || '', onchange: (e) => { s.from = e.target.value; draw(); } })),
+      field('Bis', el('input', { type: 'time', value: s.to || '', onchange: (e) => { s.to = e.target.value; draw(); } }), 'Bis vor Von = über Mitternacht'),
+      field('Zeitzone', el('input', { value: s.tz || '', placeholder: 'Europe/Berlin', oninput: (e) => { s.tz = e.target.value.trim(); } })),
+      el('div.callout', { style: { gridColumn: '1 / -1' } }, 'Die Regel gilt ', el('b', null, scheduleLabel(s)), '. Beispiel: Pfad /admin sperren „nur außerhalb Mo–Fr 07:00–19:00“ = Admin-Bereich nur zur Bürozeit erreichbar.')) : null);
+  draw();
+  return box;
 }
 
 const LAN = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', 'fc00::/7'];
@@ -558,6 +671,7 @@ function ruleSummary(r) {
   if (r.challenge) then.push(['Challenge ' + ({ off: 'nie', always: 'immer' })[r.challenge]]);
   if (r.skip_rate_limits) then.push(['ohne Ratelimits']);
   if (r.skip_maintenance) then.push(['auch bei Wartung']);
+  if (r.schedule?.mode) when.push(scheduleLabel(r.schedule));
   for (const k of Object.keys(r.response_headers || {})) then.push(['Header ' + k]);
   if (!then.length) then.push(['keine Änderung']);
   return { when, then };
@@ -566,7 +680,7 @@ function ruleSummary(r) {
 function wafLabel(m) { return { off: 'WAF aus', detect: 'WAF erkennt', block: 'WAF blockiert' }[m] || m; }
 
 function signalLabel(s) {
-  return { geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed-Block', challenge: 'Challenge ausgeliefert', waf_block: 'WAF-Block', waf_detect: 'WAF-Treffer (je 5 Score)', honeypot: 'Honeypot', not_found: '404', auth_fail: '401/403 / Login fehlgeschlagen', path_block: 'Pfad-Sperre (Regel)', bad_request: '400', scanner_ua: 'Scanner-Tool', rate_limit: 'Ratelimit', user_agent: 'Gesperrter UA', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß' }[s] || s;
+  return { geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed-Block', challenge: 'Challenge ausgeliefert', waf_block: 'WAF-Block', waf_detect: 'WAF-Treffer (je 5 Score)', honeypot: 'Honeypot', not_found: '404', auth_fail: '401/403 / Login fehlgeschlagen', path_block: 'Pfad-Sperre (Regel)', bad_request: '400', scanner_ua: 'Scanner-Tool', rate_limit: 'Ratelimit', user_agent: 'Gesperrter UA', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß', bot_fake: 'Gefälschter Suchmaschinen-Bot', bot: 'Crawler gesperrt/gebremst' }[s] || s;
 }
 
 function excludeFlow(root, policies, ruleId, def) {

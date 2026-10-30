@@ -51,7 +51,44 @@ type State struct {
 	// AuthRevoked invalidates site-login sessions issued before the given
 	// unix time, keyed by lower-case user name.
 	AuthRevoked map[string]int64 `json:"auth_revoked,omitempty"`
+
+	// AuthTokens are bearer tokens for protected sites (stored as SHA-256).
+	// The agent checks them locally – no round trip to the panel.
+	AuthTokens []AuthToken `json:"auth_tokens,omitempty"`
+
+	// AuthProviders are the OAuth2/OIDC providers offered on login pages;
+	// the panel at PanelURL runs the flow and hands back a one-time code.
+	AuthProviders []AuthProvider `json:"auth_providers,omitempty"`
+	PanelURL      string         `json:"panel_url,omitempty"`
+	// AuthSources lists the password sources available at all
+	// ("directory", "local").
+	AuthSources []string `json:"auth_sources,omitempty"`
+	// AuthFeatures switches optional login page features on ("reset" =
+	// password reset by e-mail for access accounts).
+	AuthFeatures []string `json:"auth_features,omitempty"`
 }
+
+// AuthToken lets scripts and services reach a protected site with
+// "Authorization: Bearer <token>" in the name of an account.
+type AuthToken struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Hash     string   `json:"hash"` // hex SHA-256 of the token
+	User     string   `json:"user"`
+	Display  string   `json:"display,omitempty"`
+	Groups   []string `json:"groups,omitempty"`
+	Policies []string `json:"policies,omitempty"` // empty = every policy the account may use
+	Expires  int64    `json:"expires,omitempty"`  // unix, 0 = no expiry
+}
+
+// AuthProvider is an OAuth2/OIDC login button.
+type AuthProvider struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// TokenPrefix marks site access tokens.
+const TokenPrefix = "sst_"
 
 type FeedRef struct {
 	ID    string `json:"id"`
@@ -87,6 +124,16 @@ type Policy struct {
 
 	Maintenance        bool   `json:"maintenance"`
 	MaintenanceMessage string `json:"maintenance_message"`
+	// MaintenanceFrom/Until: planned window (unix, 0 = open). Outside the
+	// window a switched-on maintenance is not in force; after Until the
+	// panel switches it off.
+	MaintenanceFrom  int64 `json:"maintenance_from,omitempty"`
+	MaintenanceUntil int64 `json:"maintenance_until,omitempty"`
+	// MaintenanceAllow: networks that still reach the site (e.g. the IT).
+	MaintenanceAllow []string `json:"maintenance_allow,omitempty"`
+
+	// Bots controls AI and SEO crawlers and fake search engine bots.
+	Bots BotPolicy `json:"bots,omitempty"`
 
 	IP IPRules `json:"ip"`
 
@@ -133,6 +180,31 @@ type Policy struct {
 	// Test puts checks into test mode: they only record what they would
 	// block ("test:<action>") and let the request through.
 	Test TestMode `json:"test"`
+}
+
+// BotPolicy: Action "" / "allow" | "block" | "limit" per crawler class.
+type BotPolicy struct {
+	AI  string `json:"ai,omitempty"`  // GPTBot, ClaudeBot, CCBot, PerplexityBot …
+	SEO string `json:"seo,omitempty"` // AhrefsBot, SemrushBot, MJ12bot …
+	// LimitPerMinute for "limit" (per crawler and IP, default 10).
+	LimitPerMinute int `json:"limit_per_minute,omitempty"`
+	// VerifySearch blocks requests that claim to be Googlebot, Bingbot …
+	// but do not come from the search engine (reverse DNS check).
+	VerifySearch bool `json:"verify_search,omitempty"`
+}
+
+// MaintenanceActive reports whether the maintenance mode is in force at unix time now.
+func (p *Policy) MaintenanceActive(now int64) bool {
+	if !p.Maintenance {
+		return false
+	}
+	if p.MaintenanceFrom > 0 && now < p.MaintenanceFrom {
+		return false
+	}
+	if p.MaintenanceUntil > 0 && now >= p.MaintenanceUntil {
+		return false
+	}
+	return true
 }
 
 type TestMode struct {
@@ -203,6 +275,9 @@ type AuthPolicy struct {
 	PassHeaders bool `json:"pass_headers"`
 	// Title shown on the login page (default: host name).
 	Title string `json:"title"`
+	// Sources limits how users may sign in: "directory", "local",
+	// "oidc:<provider id>". Empty = every configured source.
+	Sources []string `json:"sources,omitempty"`
 	// SSO shares the login with all SSO-enabled sites below the SSO domain
 	// (settings). CookieDomain is filled in by the panel.
 	SSO          bool   `json:"sso"`
@@ -211,16 +286,27 @@ type AuthPolicy struct {
 
 // AuthRequest is sent by the agent to /api/agent/auth for a login step.
 type AuthRequest struct {
-	Policy   string `json:"policy"`
-	Rule     string `json:"rule,omitempty"` // path rule that applies to the target URL
-	Host     string `json:"host"`
-	IP       string `json:"ip"`
-	UA       string `json:"ua"`
-	Step     string `json:"step"` // password | totp | enroll
+	Policy string `json:"policy"`
+	Rule   string `json:"rule,omitempty"` // path rule that applies to the target URL
+	Host   string `json:"host"`
+	IP     string `json:"ip"`
+	UA     string `json:"ua"`
+	// Step: password | totp | enroll | pwchange | code (OAuth2);
+	// self-service: account, acct_password, acct_totp, acct_totp_confirm,
+	// acct_recovery, acct_logout_all; reset_request, reset_check, reset.
+	Step     string `json:"step"`
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 	Ticket   string `json:"ticket,omitempty"`
 	Code     string `json:"code,omitempty"`
+	// NewPassword for pwchange, acct_password and reset.
+	NewPassword string `json:"new_password,omitempty"`
+	// Account and Issued identify the session the agent verified for the
+	// self-service steps (acct_*).
+	Account string `json:"account,omitempty"`
+	Issued  int64  `json:"issued,omitempty"`
+	// Origin (scheme://host[:port]) for links in e-mails (reset_request).
+	Origin string `json:"origin,omitempty"`
 }
 
 // AuthResponse answers an AuthRequest.
@@ -238,6 +324,34 @@ type AuthResponse struct {
 	SessionSeconds int       `json:"session_seconds,omitempty"`
 	// Factors used: 1 = password, 2 = password + TOTP.
 	Factors int `json:"factors,omitempty"`
+	// Self-service: account overview, recovery codes (shown once).
+	Account *AccountInfo `json:"account,omitempty"`
+	Codes   []string     `json:"codes,omitempty"`
+	// NeedCode: the step needs a TOTP or recovery code (reset_check).
+	NeedCode bool `json:"need_code,omitempty"`
+}
+
+// AccountInfo is what the self-service page shows about the signed-in account.
+type AccountInfo struct {
+	Source       string       `json:"source"` // ldap | local | oidc:<id>
+	SourceLabel  string       `json:"source_label"`
+	Email        string       `json:"email,omitempty"`
+	TOTP         bool         `json:"totp"`
+	RecoveryLeft int          `json:"recovery_left"`
+	CanPassword  bool         `json:"can_password"` // password kept in Sentinel
+	PWChanged    int64        `json:"pw_changed,omitempty"`
+	Expires      int64        `json:"expires,omitempty"`
+	Recent       []LoginEntry `json:"recent,omitempty"`
+}
+
+// LoginEntry is one line of the account's recent sign-in activity.
+type LoginEntry struct {
+	TS     int64  `json:"ts"` // unix ms
+	Host   string `json:"host"`
+	IP     string `json:"ip"`
+	Result string `json:"result"`
+	Detail string `json:"detail,omitempty"`
+	Device string `json:"device,omitempty"`
 }
 
 type AuthUser struct {
@@ -245,6 +359,20 @@ type AuthUser struct {
 	Display string   `json:"d,omitempty"`
 	Email   string   `json:"e,omitempty"`
 	Groups  []string `json:"g,omitempty"` // group CNs
+}
+
+// SourceAllowed reports whether policy a accepts logins from source
+// ("directory", "local", "oidc:<id>").
+func SourceAllowed(a AuthPolicy, source string) bool {
+	if len(a.Sources) == 0 {
+		return true
+	}
+	for _, s := range a.Sources {
+		if s == source || (s == "oidc:*" && strings.HasPrefix(source, "oidc:")) {
+			return true
+		}
+	}
+	return false
 }
 
 // AuthAllowed reports whether a user may access a site with policy a.
@@ -309,6 +437,10 @@ type RateLimit struct {
 	BanSeconds int    `json:"ban_seconds"`
 	// Test: only record what the limit would do.
 	Test bool `json:"test,omitempty"`
+	// Note explains the limit; Author/Updated are set by the panel.
+	Note    string `json:"note,omitempty"`
+	Author  string `json:"author,omitempty"`
+	Updated int64  `json:"updated,omitempty"`
 }
 
 type WAF struct {
@@ -352,6 +484,7 @@ type WAFExclusion struct {
 	Note       string `json:"note,omitempty"`
 	Created    int64  `json:"created,omitempty"`
 	Author     string `json:"author,omitempty"`
+	Until      int64  `json:"until,omitempty"` // unix, 0 = permanent
 }
 
 type SecurityHeaders struct {
@@ -408,6 +541,8 @@ type AgentStatus struct {
 	// Caddyfile). Caddyfile is the managed file in "full" mode.
 	Remote    string `json:"remote,omitempty"`
 	Caddyfile string `json:"caddyfile,omitempty"`
+	// Addrs: IP addresses of the host's network interfaces (for DNS checks).
+	Addrs []string `json:"addrs,omitempty"`
 }
 
 // Command is sent by the panel to an agent (remote management). The agent
@@ -504,6 +639,10 @@ const (
 	ActionPathBlock   = "path_block"    // blocked by a path rule
 	ActionRedirect    = "redirect"      // redirected by a path rule
 	ActionAPIKey      = "api_key"       // missing or wrong API key
+	ActionBot         = "bot_block"     // AI/SEO crawler blocked by the bot settings
+	ActionBotLimit    = "bot_limit"     // crawler slowed down (429)
+	ActionBotFake     = "bot_fake"      // claims to be a search engine but is not
+	ActionToken       = "auth_token"    // invalid or expired site access token
 )
 
 // IsBlocking reports whether an action means the request was not served.
