@@ -72,7 +72,12 @@ func Directives(w protocol.WAF) string {
 	b.WriteString(`SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "id:200000,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=XML"` + "\n")
 	b.WriteString(`SecRule REQUEST_HEADERS:Content-Type "^application/json" "id:200001,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=JSON"` + "\n")
 	b.WriteString(`SecRule REQUEST_HEADERS:Content-Type "^application/[a-z0-9.-]+[+]json" "id:200006,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=JSON"` + "\n")
-	b.WriteString(`SecRule REQBODY_ERROR "!@eq 0" "id:200002,phase:2,t:none,log,deny,status:400,msg:'Failed to parse request body.',logdata:'%{reqbody_error_msg}',severity:2"` + "\n")
+	// A body above SecRequestBodyLimit is inspected only partially
+	// (ProcessPartial); a cut-off JSON/XML document cannot parse, which is
+	// not the client's fault. Only reject unparsable bodies that were read
+	// completely (INBOUND_DATA_ERROR is 1 once the limit was hit).
+	b.WriteString(`SecRule REQBODY_ERROR "!@eq 0" "id:200002,phase:2,t:none,log,deny,status:400,msg:'Failed to parse request body.',logdata:'%{reqbody_error_msg}',severity:2,chain"` + "\n")
+	b.WriteString(`	SecRule INBOUND_DATA_ERROR "!@eq 1" "t:none"` + "\n")
 
 	custom := ""
 	if ex := ExclusionDirectives(w.Exclusions); ex != "" {

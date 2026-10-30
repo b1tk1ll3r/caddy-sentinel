@@ -46,3 +46,32 @@ func TestBodyPassesThrough(t *testing.T) {
 		}
 	}
 }
+
+// The guard used by rule 200002: a chained INBOUND_DATA_ERROR "!@eq 1"
+// matches for complete bodies and not for bodies cut at the limit.
+func TestInboundDataErrorGuard(t *testing.T) {
+	waf, err := Build(protocol.WAF{Mode: "block", InspectBody: true, BodyLimit: 200 << 10, Directives: `SecRule REQUEST_METHOD "@streq POST" "id:9100,phase:2,deny,status:418,chain"
+	SecRule INBOUND_DATA_ERROR "!@eq 1" "t:none"`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		size  int
+		block bool
+	}{{10, true}, {300 << 10, false}} {
+		body := "d=" + strings.Repeat("x", c.size)
+		r := httptest.NewRequest("POST", "/x", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		res, err := Inspect(waf, r, "203.0.113.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Interrupted != c.block {
+			t.Errorf("size %d: interrupted=%v, want %v", c.size, res.Interrupted, c.block)
+		}
+		got, _ := io.ReadAll(r.Body)
+		if string(got) != body {
+			t.Errorf("size %d: body changed (%d bytes)", c.size, len(got))
+		}
+	}
+}
