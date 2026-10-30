@@ -4,6 +4,7 @@
 package wafconf
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -162,6 +163,14 @@ type Result struct {
 // Inspect runs the request phases (connection, URI, headers, body) for r.
 // clientIP is the real client address. If the body was consumed for
 // inspection, r.Body is replaced by an equivalent reader.
+// rebuiltBody re-serves the inspected bytes and closes the original body.
+type rebuiltBody struct {
+	io.Reader
+	orig io.ReadCloser
+}
+
+func (b *rebuiltBody) Close() error { return b.orig.Close() }
+
 func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err error) {
 	tx := waf.NewTransaction()
 	defer func() {
@@ -185,6 +194,11 @@ func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err 
 	if len(r.TransferEncoding) > 0 {
 		tx.AddRequestHeader("Transfer-Encoding", r.TransferEncoding[0])
 	}
+	// net/http moves Content-Length out of r.Header; without it the CRS
+	// flags every POST (920180 "POST without Content-Length").
+	if r.ContentLength >= 0 && r.Header.Get("Content-Length") == "" && (r.ContentLength > 0 || r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
+		tx.AddRequestHeader("Content-Length", strconv.FormatInt(r.ContentLength, 10))
+	}
 	it := tx.ProcessRequestHeaders()
 	if it == nil {
 		if tx.IsRequestBodyAccessible() && r.Body != nil && r.Body != http.NoBody {
@@ -193,8 +207,15 @@ func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err 
 			if rbErr != nil {
 				err = rbErr
 			}
+			// The inspected part now lives in Coraza's body buffer, which is
+			// released by tx.Close() when Inspect returns. Copy it out, then
+			// hand the backend that copy followed by the unread rest.
 			if rbr, e := tx.RequestBodyReader(); e == nil {
-				r.Body = io.NopCloser(io.MultiReader(rbr, r.Body))
+				buf, rerr := io.ReadAll(rbr)
+				if rerr != nil && err == nil {
+					err = rerr
+				}
+				r.Body = &rebuiltBody{Reader: io.MultiReader(bytes.NewReader(buf), r.Body), orig: r.Body}
 			}
 		}
 		if it == nil {

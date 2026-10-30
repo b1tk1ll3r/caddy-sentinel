@@ -81,6 +81,45 @@ confirm() {
 	case "$a" in [nN]*) return 1 ;; *) return 0 ;; esac
 }
 
+# Caddy lädt den Sentinel-Agent nur, wenn die Caddyfile "sentinel" enthält
+# (Direktive in einem Site-Block oder globale Option). Eine vorhandene
+# Caddyfile – z. B. aus dem Distributionspaket – hat das nicht.
+ensure_sentinel_caddyfile() { # panel-url (leer = Standard)
+	local cf=/etc/caddy/Caddyfile
+	[ -f "$cf" ] || return 0
+	if grep -rqsE '^[[:space:]]*sentinel([[:space:]]|\{|$)' /etc/caddy --include='Caddyfile*' --include='*.caddy' --include='*.caddyfile' --include='*.conf'; then
+		return 0
+	fi
+	warn "$cf enthält keine Direktive \"sentinel\" – ohne sie verbindet sich Caddy nicht mit dem Panel."
+	confirm "Sentinel als globale Option in $cf eintragen?" || { warn "Nicht eingetragen – bitte \"sentinel\" selbst ergänzen (siehe docs/INSTALL.md)."; return 0; }
+	cp -a "$cf" "$cf.vor-sentinel"
+	awk '
+		!done && /^[[:space:]]*($|#)/ { buf = buf $0 "\n"; next }
+		!done && /^[[:space:]]*\{[[:space:]]*$/ { printf "%s%s\n\tsentinel\n", buf, $0; done = 1; next }
+		!done { printf "{\n\tsentinel\n}\n\n%s%s\n", buf, $0; done = 1; next }
+		{ print }
+		END { if (!done) printf "{\n\tsentinel\n}\n%s", buf }
+	' "$cf.vor-sentinel" >"$cf"
+	if "$BIN_DIR/caddy" adapt --config "$cf" >/dev/null 2>&1; then
+		say "Globale Option \"sentinel\" eingetragen (Sicherung: $cf.vor-sentinel)."
+		say "Schutz pro Site: in jedem Site-Block, der geschützt werden soll, \"sentinel\" ergänzen."
+	else
+		mv -f "$cf.vor-sentinel" "$cf"
+		warn "Eintragen fehlgeschlagen (Caddyfile ließ sich danach nicht lesen) – unverändert gelassen. Bitte \"sentinel\" selbst ergänzen."
+	fi
+}
+
+# Adresse, unter der Caddy das Panel lokal erreicht (aus SENTINEL_LISTEN)
+panel_probe() { # listen
+	local l=${1:-127.0.0.1:7600}
+	case "$l" in
+	0.0.0.0:*) l=127.0.0.1:${l#0.0.0.0:} ;;
+	"[::]:"*) l="[::1]:${l#\[::\]:}" ;;
+	:*) l=127.0.0.1$l ;;
+	esac
+	echo "$l"
+}
+
 [ "$(id -u)" = 0 ] || die "Bitte als root bzw. mit sudo ausführen."
 ask() { # frage default -> REPLY
 	local a
@@ -295,6 +334,7 @@ if [ "$AGENT" = 1 ]; then
 		sed -i 's/ caddy-sentinel.service//' /etc/systemd/system/caddy.service
 	fi
 	systemctl daemon-reload
+	ensure_sentinel_caddyfile
 	if [ "$START" = 1 ]; then
 		systemctl enable caddy.service >/dev/null 2>&1 || true
 		systemctl restart caddy.service || { journalctl -u caddy -n 30 --no-pager || true; die "Caddy startet nicht."; }
@@ -325,6 +365,10 @@ fi
 if [ "$PANEL_ONLY" = 0 ]; then
 	install -d /etc/systemd/system/caddy.service.d
 	install -m 0644 "$DEPLOY/caddy-override.conf" /etc/systemd/system/caddy.service.d/sentinel.conf
+	# Caddy muss das Panel unter der tatsächlich eingestellten Adresse erreichen
+	plisten=$(sed -n 's/^SENTINEL_LISTEN=//p' /etc/default/caddy-sentinel | tail -n1)
+	sed -i "s|^Environment=SENTINEL_PANEL=.*|Environment=SENTINEL_PANEL=http://$(panel_probe "$plisten")|" /etc/systemd/system/caddy.service.d/sentinel.conf
+	ensure_sentinel_caddyfile
 	if [ ! -f /lib/systemd/system/caddy.service ] && [ ! -f /usr/lib/systemd/system/caddy.service ] && [ ! -f /etc/systemd/system/caddy.service ]; then
 		install -m 0644 "$DEPLOY/caddy.service" /etc/systemd/system/caddy.service
 	fi
@@ -341,7 +385,7 @@ say "Starte Panel"
 systemctl enable --now caddy-sentinel.service
 listen=$(sed -n 's/^SENTINEL_LISTEN=//p' /etc/default/caddy-sentinel | tail -n1)
 listen=${listen:-127.0.0.1:7600}
-probe=${listen/0.0.0.0/127.0.0.1}
+probe=$(panel_probe "$listen")
 ok=0
 for _ in $(seq 1 40); do
 	if [ -f "$DATA_DIR/agent.token" ] && (curl -fsS -o /dev/null "http://$probe/api/auth/state" 2>/dev/null || wget -q -O /dev/null "http://$probe/api/auth/state" 2>/dev/null); then ok=1; break; fi

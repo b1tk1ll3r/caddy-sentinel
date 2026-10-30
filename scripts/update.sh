@@ -288,9 +288,13 @@ if [ -f "$SRC/deploy/caddy-sentinel.service" ] && ! cmp -s "$SRC/deploy/caddy-se
 	install -m 0644 "$SRC/deploy/caddy-sentinel.service" /etc/systemd/system/caddy-sentinel.service
 	say "Unit caddy-sentinel.service aktualisiert"
 fi
-if [ "$HAS_CADDY" = 1 ] && [ -f "$SRC/deploy/caddy-override.conf" ] && ! cmp -s "$SRC/deploy/caddy-override.conf" /etc/systemd/system/caddy.service.d/sentinel.conf; then
-	install -m 0644 "$SRC/deploy/caddy-override.conf" /etc/systemd/system/caddy.service.d/sentinel.conf
-	say "Caddy-Override aktualisiert"
+if [ "$HAS_CADDY" = 1 ] && [ -f "$SRC/deploy/caddy-override.conf" ]; then
+	# Vorlage mit der eingestellten Panel-Adresse vergleichen, nicht mit dem Standard
+	sed "s|^Environment=SENTINEL_PANEL=.*|Environment=SENTINEL_PANEL=$(panel_url)|" "$SRC/deploy/caddy-override.conf" >"$TMP/caddy-override.conf"
+	if ! cmp -s "$TMP/caddy-override.conf" /etc/systemd/system/caddy.service.d/sentinel.conf; then
+		install -m 0644 "$TMP/caddy-override.conf" /etc/systemd/system/caddy.service.d/sentinel.conf
+		say "Caddy-Override aktualisiert"
+	fi
 fi
 for s in update uninstall; do
 	[ -f "$SRC/$s.sh" ] && install -m 0755 "$SRC/$s.sh" "/usr/local/sbin/caddy-sentinel-$s"
