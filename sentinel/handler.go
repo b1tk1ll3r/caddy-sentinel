@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -66,7 +67,8 @@ type reqInfo struct {
 	start  time.Time
 	policy *cpolicy
 	secRel bool
-	html   bool // browser navigation: answer blocks with an HTML page
+	html   bool        // browser navigation: answer blocks with an HTML page
+	wafTx  *wafconf.Tx // open WAF transaction for response inspection
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -85,6 +87,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if cp := canonicalPath(r.URL.Path); cp != r.URL.Path {
 		r.URL.Path, r.URL.RawPath = cp, ""
 	}
+	// identity headers only ever come from Sentinel's own login – for every
+	// host, policy and source, also in their "Remote_User" spelling
+	stripAuthHeaders(r)
 
 	info := &reqInfo{start: start, html: wantsHTML(r) && r.Method != http.MethodHead}
 	info.rec = protocol.Request{
@@ -94,7 +99,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		Path:    truncate(r.URL.Path, 512),
 		IP:      addr.String(),
 		UA:      truncate(r.UserAgent(), 256),
-		Referer: truncate(r.Referer(), 256),
+		Referer: truncate(refererFor(r.Referer()), 256),
 		Proto:   r.Proto,
 	}
 	switch la := r.Context().Value(http.LocalAddrContextKey).(type) {
@@ -106,15 +111,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	st := c.state.Load()
 	if st == nil {
-		// unknown policies: never let clients inject identity headers
-		stripAuthHeaders(r)
 		if c.failClosed {
 			return h.finish(w, info, http.StatusServiceUnavailable, "", "sentinel has no state yet", 0)
 		}
 		return h.passThrough(w, r, next, info)
 	}
 	if st.raw.Telemetry.ReportQuery {
-		info.rec.Query = truncate(r.URL.RawQuery, 512)
+		info.rec.Query = truncate(protocol.RedactQuery(r.URL.Path, r.URL.RawQuery), 512)
+		if ref := r.Referer(); ref != "" {
+			if u, err := url.Parse(ref); err == nil && u.RawQuery != "" {
+				u.RawQuery = protocol.RedactQuery(u.Path, u.RawQuery)
+				info.rec.Referer = truncate(u.String(), 256)
+			}
+		}
 	}
 
 	if g := c.geo.Load(); g != nil && addr.IsValid() {
@@ -130,15 +139,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	info.policy = pol
 	if pol != nil {
 		info.rec.Policy = pol.p.ID
-		// identity headers only ever come from Sentinel's own login, also
-		// for trusted sources and disabled policies
-		if pol.anyAuth {
-			stripAuthHeaders(r)
-		}
 	}
 
-	// trusted sources bypass everything
+	// trusted sources bypass everything – except Sentinel's own pages:
+	// people in trusted networks still sign in to applications (OIDC) and
+	// open their account page
 	if _, ok := st.trusted.lookup(addr); ok {
+		if pol != nil && pol.p.Enabled && !badPath(r.URL.Path) {
+			if isOIDCRequest(st, host, r.URL.Path) {
+				return h.serveOIDC(w, r, info, st, pol, addr)
+			}
+			if pol.anyAuth && strings.HasPrefix(r.URL.Path, authPrefix) {
+				return h.serveAuth(w, r, info, st, pol, addr)
+			}
+		}
 		return h.passThrough(w, r, next, info)
 	}
 
@@ -147,14 +161,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if b, ok := st.banned(addr, now); ok {
 		return h.block(w, info, pol, protocol.ActionBanned, b.Reason, http.StatusForbidden)
 	}
-	if v, ok := c.localBans.Load(addr.String()); ok && v.(int64) >= now {
+	if v, ok := c.localBans.Load(localBanKey(st, addr)); ok && v.(int64) >= now {
 		return h.block(w, info, pol, protocol.ActionBanned, "rate limit ban", http.StatusForbidden)
 	}
 
 	if pol == nil || !pol.p.Enabled {
 		return h.passThrough(w, r, next, info)
 	}
-	if pol.broken && !strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
+	if badPath(r.URL.Path) {
+		// segments that Java servers ("..;"), Windows ("\\") or C code (NUL)
+		// resolve differently than the rules below see them
+		info.rec.Why = "Pfad mit „..;“, „\\“ oder NUL"
+		return h.block(w, info, pol, protocol.ActionPathBlock, "bad request path", http.StatusBadRequest)
+	}
+	if pol.broken && !isACME(r.URL.Path) {
 		// a restricting rule could not be compiled and there is no earlier
 		// version of it: fail closed instead of leaving the area open
 		info.rec.Why = "Regel der Policy fehlerhaft: " + pol.brokenWhy
@@ -169,8 +189,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// path rules (exceptions, areas with/without login, API keys …)
 	var rule *protocol.CompiledRule
 	var pr *protocol.PathRule
-	if len(pol.rules) > 0 && !strings.HasPrefix(r.URL.Path, "/.sentinel/") {
-		rule = protocol.MatchRules(pol.rules, r.URL.Path, r.Method, addr)
+	// Sentinel's own pages (login, challenge) are checked against the rule
+	// of their target in serveAuth; everything else under /.sentinel/ goes
+	// through the rules like any other path.
+	own := pol.anyAuth && strings.HasPrefix(r.URL.Path, authPrefix)
+	if len(pol.rules) > 0 && !own {
+		rule = protocol.MatchRequest(pol.rules, r.URL.Path, r.Method, addr)
 	}
 	// testMark records what a check in test mode would have done; the first
 	// such decision is kept, the request continues.
@@ -220,6 +244,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				testMark(protocol.ActionAPIKey, pr.Name, "Header "+rule.KeyHeader())
 			} else {
 				apiKeyOK = true
+				// the key is Sentinel's credential, not the backend's
+				r.Header.Del(rule.KeyHeader())
 			}
 		}
 	}
@@ -323,11 +349,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 		}
 	}
+	pathVariants := protocol.MatchVariants(r.URL.Path)
+	hasPrefix := func(p string) bool {
+		for _, v := range pathVariants {
+			if strings.HasPrefix(v, p) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, hp := range pol.honeypots {
 		if allow {
 			break
 		}
-		if strings.HasPrefix(r.URL.Path, hp) {
+		if hasPrefix(hp) {
 			if !p.Test.Filters {
 				info.rec.Detail = hp
 				return h.finish(w, info, http.StatusNotFound, protocol.ActionHoneypot, "Not Found", 0)
@@ -431,7 +466,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		why := fmt.Sprintf("mehr als %d Anfragen in %s (gezählt pro %s)", l.rl.Requests, l.window, rlKeyLabel(l.rl.Key))
 		if l.rl.Test {
 			act := protocol.ActionRateLimit
-			if l.rl.Action == "ban" && l.rl.Key != "global" {
+			_, never := st.neverBan.lookup(addr)
+			if l.rl.Action == "ban" && l.rl.Key != "global" && !never {
 				act = protocol.ActionRateBan
 			}
 			testMark(act, l.rl.Name, why)
@@ -440,16 +476,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		info.rec.Detail = l.rl.Name
 		info.rec.Why = why
 		w.Header().Set("Retry-After", strconv.Itoa(retry))
-		if l.rl.Action == "ban" && l.rl.Key != "global" {
+		_, never := st.neverBan.lookup(addr)
+		if l.rl.Action == "ban" && l.rl.Key != "global" && !never {
 			secs := l.rl.BanSeconds
 			if secs <= 0 {
 				secs = 600
 			}
-			c.localBans.Store(addr.String(), now+int64(secs))
+			c.localBans.Store(localBanKey(st, addr), now+int64(secs))
 			info.rec.Detail = fmt.Sprintf("%s|%d", l.rl.Name, secs)
 			return h.finish(w, info, http.StatusTooManyRequests, protocol.ActionRateBan, "too many requests", 0)
 		}
 		return h.finish(w, info, http.StatusTooManyRequests, protocol.ActionRateLimit, "too many requests", 0)
+	}
+
+	// OpenID Provider on the issuer host: after bans, rules, filters and
+	// rate limits, before the bot challenge (applications call the token
+	// endpoint server to server) and the login gate (own authentication)
+	if isOIDCRequest(st, host, r.URL.Path) {
+		return h.serveOIDC(w, r, info, st, pol, addr)
 	}
 
 	// bot challenge
@@ -460,8 +504,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if allow || (pr != nil && pr.Challenge == "off") {
 		needChallenge, chMode = false, "off"
 	}
-	if st.secret != nil && (needChallenge || chMode == "always" || (chMode == "suspicious" && st.challenged(addr, now))) && !pathExempt(pol.exempt, r.URL.Path) {
-		if !validPass(r, st.secret, addr.String(), start) {
+	if st.secret != nil && (needChallenge || chMode == "always" || (chMode == "suspicious" && st.challenged(addr, now))) && !pathExempt(pol.exempt, r.URL.Path) && !isACME(r.URL.Path) {
+		if !validPass(r, st.secret, addr.String(), challengeScope(pol, host), start) {
 			switch {
 			case needChallenge && info.rec.Detail != "":
 				info.rec.Why = "Geo/Feed-Treffer: " + info.rec.Detail
@@ -474,11 +518,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				info.rec.Detail = "kein Browser-Request"
 				return h.block(w, info, pol, protocol.ActionChallenge, "challenge required", http.StatusForbidden)
 			}
-			diff := p.Challenge.Difficulty
-			if diff <= 0 || diff > 26 {
-				diff = 16
-			}
-			n := renderChallenge(w, newToken(st.secret, addr.String(), diff, start), diff, r.URL.RequestURI())
+			diff := challengeDifficulty(pol)
+			n := renderChallenge(w, newToken(st.secret, addr.String(), challengeScope(pol, host), diff, start), diff, r.URL.RequestURI())
 			info.rec.Status, info.rec.Action, info.rec.Bytes = http.StatusForbidden, protocol.ActionChallenge, int64(n)
 			info.rec.Dur = float64(time.Since(start).Microseconds()) / 1000
 			c.report(info.rec, true)
@@ -507,7 +548,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		wafMode = "off"
 	}
 	if pol.waf != nil && (wafMode == "detect" || wafMode == "block") {
-		res, err := wafconf.Inspect(pol.waf, r, addr.String())
+		res, tx, err := wafconf.InspectKeep(pol.waf, r, addr.String(), p.WAF.InspectResponse)
+		info.wafTx = tx
 		if err != nil {
 			h.log.Debug("sentinel: waf inspection error", zap.Error(err))
 		}
@@ -523,6 +565,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			if status < 400 {
 				status = http.StatusForbidden
 			}
+			if status == http.StatusRequestEntityTooLarge {
+				// "Zu große Bodys: ablehnen"
+				info.rec.Why = fmt.Sprintf("Body größer als die Prüfgrenze (%d Bytes)", wafconf.Normalize(p.WAF).BodyLimit)
+				return h.finish(w, info, status, protocol.ActionBodyLimit, "request body too large", 0)
+			}
 			return h.block(w, info, pol, protocol.ActionWAFBlock, "request blocked by WAF", status)
 		}
 		if len(res.Hits) > 0 && (info.rec.Action == "" || info.rec.Action == protocol.ActionFeedMatch) {
@@ -531,14 +578,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	if p.SecurityHeaders.Enabled {
-		applySecurityHeaders(w.Header(), p.SecurityHeaders, r.TLS != nil)
+		applySecurityHeaders(w.Header(), p.SecurityHeaders, isSecure(r))
 	}
 	return h.passThrough(w, r, next, info)
 }
 
 func (h *Handler) passThrough(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, info *reqInfo) error {
+	stripSentinelCredentials(r)
+	var tee *responseTee
+	if info.wafTx != nil {
+		defer info.wafTx.Close()
+		tee = &responseTee{ResponseWriter: w, limit: wafconf.Normalize(info.policy.p.WAF).BodyLimit}
+		w = tee
+	}
 	rec := caddyhttp.NewResponseRecorder(w, nil, nil)
 	err := next.ServeHTTP(rec, r)
+	if tee != nil && err == nil {
+		h.inspectResponse(info, tee, rec.Status())
+	}
 	status := rec.Status()
 	if err != nil {
 		var he caddyhttp.HandlerError
@@ -681,20 +738,30 @@ func (l *crl) matches(r *http.Request) bool {
 	if len(l.methods) > 0 && !l.methods[r.Method] {
 		return false
 	}
+	// limits count every form the backend may resolve the path to:
+	// "/Login" and "/;x/login" are "/login" for IIS or Tomcat
+	vs := protocol.MatchVariants(r.URL.Path)
 	if len(l.rl.PathPrefixes) > 0 {
 		ok := false
 		for _, p := range l.rl.PathPrefixes {
-			if strings.HasPrefix(r.URL.Path, p) {
-				ok = true
-				break
+			for _, v := range vs {
+				if strings.HasPrefix(v, p) {
+					ok = true
+				}
 			}
 		}
 		if !ok {
 			return false
 		}
 	}
-	if l.re != nil && !l.re.MatchString(r.URL.Path) {
-		return false
+	if l.re != nil {
+		ok := false
+		for _, v := range vs {
+			ok = ok || l.re.MatchString(v)
+		}
+		if !ok {
+			return false
+		}
 	}
 	return true
 }
@@ -815,7 +882,8 @@ func (h *Handler) verifyChallenge(w http.ResponseWriter, r *http.Request, info *
 		return h.finish(w, info, http.StatusBadRequest, protocol.ActionChallenge, "bad request", 0)
 	}
 	now := time.Now()
-	if err := verifySolution(st.secret, ip, r.PostFormValue("token"), r.PostFormValue("counter"), now); err != nil {
+	scope := challengeScope(pol, info.rec.Host)
+	if err := verifySolution(st.secret, ip, scope, challengeDifficulty(pol), r.PostFormValue("token"), r.PostFormValue("counter"), now); err != nil {
 		info.rec.Detail = err.Error()
 		return h.finish(w, info, http.StatusForbidden, protocol.ActionChallenge, "Challenge fehlgeschlagen – bitte Seite neu laden.", 0)
 	}
@@ -823,13 +891,27 @@ func (h *Handler) verifyChallenge(w http.ResponseWriter, r *http.Request, info *
 	if ttl <= 0 {
 		ttl = 24 * time.Hour
 	}
-	http.SetCookie(w, passCookie(st.secret, ip, ttl, now, r.TLS != nil))
+	http.SetCookie(w, passCookie(st.secret, ip, scope, ttl, now, isSecure(r)))
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, safeReturn(r.PostFormValue("return")), http.StatusSeeOther)
 	info.rec.Status, info.rec.Action = http.StatusSeeOther, protocol.ActionChallengeOK
 	info.rec.Dur = float64(time.Since(info.start).Microseconds()) / 1000
 	h.core.report(info.rec, true)
 	return nil
+}
+
+// challengeScope binds challenge tokens and passes to policy and host.
+func challengeScope(pol *cpolicy, host string) string {
+	return pol.p.ID + "@" + strings.ToLower(host)
+}
+
+// challengeDifficulty is the proof-of-work difficulty of a policy.
+func challengeDifficulty(pol *cpolicy) int {
+	d := pol.p.Challenge.Difficulty
+	if d <= 0 || d > 26 {
+		d = 16
+	}
+	return d
 }
 
 // redirect answers a path rule with action "redirect".
@@ -841,13 +923,21 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request, info *reqInfo
 		status = http.StatusFound
 	}
 	target := strings.NewReplacer(
-		"{path}", r.URL.Path,
+		"{path}", r.URL.EscapedPath(),
 		"{query}", r.URL.RawQuery,
 		"{uri}", r.URL.RequestURI(),
 		"{host}", info.rec.Host,
 	).Replace(pr.RedirectURL)
-	if strings.ContainsAny(target, "\r\n") {
-		target = "/"
+	// browsers drop tabs and newlines in URLs ("/\t/evil" is "//evil"):
+	// no control characters, and a relative target must stay local
+	for i := 0; i < len(target); i++ {
+		if target[i] < 0x20 || target[i] == 0x7f {
+			target = "/"
+			break
+		}
+	}
+	if !strings.Contains(target, "://") {
+		target = safeReturn(target)
 	}
 	w.Header().Set("Location", target)
 	w.Header().Set("Cache-Control", "no-store")
@@ -858,10 +948,94 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request, info *reqInfo
 	return nil
 }
 
-// stripAuthHeaders removes identity headers a client may have sent.
+// stripAuthHeaders removes identity headers a client may have sent – in any
+// spelling: FastCGI/CGI map "Remote_User" and "Remote-User" to the same
+// HTTP_REMOTE_USER variable.
 func stripAuthHeaders(r *http.Request) {
-	for _, hd := range authHeaders {
-		r.Header.Del(hd)
+	for k := range r.Header {
+		n := strings.ToLower(strings.ReplaceAll(k, "_", "-"))
+		if strings.HasPrefix(n, "remote-") && authHeaderSet[n] {
+			delete(r.Header, k)
+		}
+	}
+}
+
+var authHeaderSet = func() map[string]bool {
+	m := map[string]bool{}
+	for _, h := range authHeaders {
+		m[strings.ToLower(h)] = true
+	}
+	return m
+}()
+
+// badPath reports paths whose meaning differs between Sentinel and common
+// backends: backslashes (Windows), NUL and dot segments with path
+// parameters ("/static/..;/admin" is "/admin" for Tomcat and Jetty).
+func badPath(p string) bool {
+	if strings.ContainsAny(p, "\\\x00") {
+		return true
+	}
+	if !strings.Contains(p, ";") {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if i := strings.IndexByte(seg, ';'); i >= 0 && (seg[:i] == "." || seg[:i] == "..") {
+			return true
+		}
+	}
+	return false
+}
+
+// isACME reports an HTTP-01 challenge request: exactly one token segment.
+func isACME(p string) bool {
+	const pre = "/.well-known/acme-challenge/"
+	if !strings.HasPrefix(p, pre) || len(p) == len(pre) {
+		return false
+	}
+	for _, c := range p[len(pre):] {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// refererFor drops the query of a Referer unless queries are reported (it
+// may carry tokens of the previous page); see ServeHTTP for the redacted form.
+func refererFor(ref string) string {
+	if i := strings.IndexAny(ref, "?#"); i >= 0 {
+		return ref[:i]
+	}
+	return ref
+}
+
+// stripSentinelCredentials keeps Sentinel's own credentials away from the
+// upstream: the login and SSO cookies (an application below the SSO domain
+// could otherwise replay them on other sites) and site access tokens –
+// also on paths without login, where the auth gate does not run.
+func stripSentinelCredentials(r *http.Request) {
+	if bearer(r) != "" {
+		r.Header.Del("Authorization")
+	}
+	cs := r.Cookies()
+	if len(cs) == 0 {
+		return
+	}
+	keep := make([]string, 0, len(cs))
+	removed := false
+	for _, c := range cs {
+		if strings.HasPrefix(c.Name, "__sentinel_") {
+			removed = true
+			continue
+		}
+		keep = append(keep, c.Name+"="+c.Value)
+	}
+	if !removed {
+		return
+	}
+	r.Header.Del("Cookie")
+	if len(keep) > 0 {
+		r.Header.Set("Cookie", strings.Join(keep, "; "))
 	}
 }
 
@@ -888,6 +1062,21 @@ func rlClient(a netip.Addr) string {
 	if a.Is6() && !a.Is4In6() {
 		if p, err := a.Prefix(64); err == nil {
 			return p.String()
+		}
+	}
+	return a.String()
+}
+
+// localBanKey is the key of a local rate-limit ban: the address, or for IPv6
+// the network the rate limiter counted (/64 by default), so a client cannot
+// escape the ban by switching addresses within its prefix.
+func localBanKey(st *runtimeState, a netip.Addr) string {
+	if a.Is6() && !a.Is4In6() {
+		bits := st.raw.BanIPv6Prefix
+		if bits > 0 && bits < 128 {
+			if p, err := a.Prefix(bits); err == nil {
+				return p.String()
+			}
 		}
 	}
 	return a.String()

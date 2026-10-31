@@ -117,7 +117,7 @@ export function requestDrawer(r) {
     r.hits?.length ? el('div', null, el('h3', { style: { margin: '6px 0' } }, 'WAF-Treffer'), hitsTable(r.hits)) : null,
     el('div.row', null,
       el('a.btn', { href: `#/waf?method=${encodeURIComponent(r.m)}&url=${encodeURIComponent(url)}&ua=${encodeURIComponent(r.ua || '')}&policy=${encodeURIComponent(r.pol || '')}` }, 'Im WAF-Tester öffnen'),
-      el('button.btn', { onclick: () => copy(`curl -i -X ${r.m} -H 'User-Agent: ${(r.ua || '').replace(/'/g, '')}' 'http://${r.host}${url}'`) }, 'Als curl kopieren')),
+      el('button.btn', { onclick: () => copy(curlCommand(r, url)) }, 'Als curl kopieren')),
   ]);
 }
 
@@ -145,4 +145,23 @@ export function seg(options, value, onChange) {
   }, label)));
   draw(value);
   return wrap;
+}
+
+// POSIX shell quoting: everything inside single quotes, a quote as '\''.
+// Method, host and path come from the (possibly hostile) request – nothing
+// in them may end up as shell syntax when an admin pastes the command.
+const shq = (v) => "'" + String(v ?? '').replace(/'/g, "'\\''") + "'";
+// Control characters act on the terminal while pasting (ESC ends bracketed
+// paste, ^U clears the line, ^O runs it) – quoting does not help against
+// them: in the URL they are percent-encoded, elsewhere removed.
+const CTL = /[\u0000-\u001f\u007f-\u009f]/g;
+const pctCtl = (s) => String(s).replace(CTL, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+export function curlCommand(r, url) {
+  const method = /^[A-Z]{1,16}$/.test(r.m || '') ? r.m : 'GET';
+  const host = String(r.host || '').replace(/[^A-Za-z0-9.:\[\]-]/g, '');
+  const target = 'http://' + host + (String(url).startsWith('/') ? url : '/' + url);
+  const parts = ['curl', '-i', '-X', method];
+  if (r.ua) parts.push('-H', shq('User-Agent: ' + String(r.ua).replace(CTL, '')));
+  parts.push(shq(pctCtl(target)));
+  return parts.join(' ');
 }

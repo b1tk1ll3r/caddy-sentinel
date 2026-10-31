@@ -38,12 +38,57 @@ type ipTrack struct {
 	Signals   map[string]float64 // signal -> accumulated points (decayed together with score)
 	Counts    map[string]int64
 	Hosts     map[string]int64
+	// Insts: the Caddy instances whose reports added points (see banScope)
+	Insts     map[string]bool
 	LastPath  string
 	LastUA    string
 	scannerAt time.Time
 	burstWin  int64
 	burstCnt  int
 	burstHit  int64
+	// recent remembers which passive signals (404, 401/403 from the backend,
+	// WAF detections, rate limit rejections) were already counted for a
+	// path, so a page that polls the same URL is not scored over and over.
+	recent [16]recentSig
+}
+
+type recentSig struct {
+	h  uint64
+	at int64
+}
+
+// seen reports whether key was counted within ttl seconds and records it.
+func (t *ipTrack) seen(key string, now, ttl int64) bool {
+	h := uint64(14695981039346656037) // FNV-1a
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	oldest := 0
+	for i := range t.recent {
+		if t.recent[i].h == h && now-t.recent[i].at < ttl {
+			return true
+		}
+		if t.recent[i].at < t.recent[oldest].at {
+			oldest = i
+		}
+	}
+	t.recent[oldest] = recentSig{h: h, at: now}
+	return false
+}
+
+// Time windows for counting a repeated request only once.
+const (
+	passiveDedupSeconds   = 600
+	rateLimitDedupSeconds = 60
+)
+
+func safeMethod(m string) bool {
+	switch strings.ToUpper(m) {
+	case "GET", "HEAD", "OPTIONS", "":
+		return true
+	}
+	return false
 }
 
 // IPScore is the exported view of a tracked IP.
@@ -125,7 +170,42 @@ type banDecision struct {
 	host   string
 	policy string
 	dry    bool
+	inst   string // "" = all instances
 }
+
+// remoteInst is the instance a ban from inst's own telemetry is limited
+// to: a remote instance (its agent could be compromised and must not ban
+// clients everywhere); the local instance and unknown sources ban for all.
+func remoteInst(inst string) string {
+	if inst == "" || inst == LocalInstance {
+		return ""
+	}
+	return inst
+}
+
+// banScope: points from a single remote instance only ban on that
+// instance; points from the local instance or from several instances ban
+// on all.
+func (t *ipTrack) banScope() string {
+	if len(t.Insts) != 1 {
+		return ""
+	}
+	for i := range t.Insts {
+		return remoteInst(i)
+	}
+	return ""
+}
+
+// maxTrackHosts bounds the host list of one tracked IP; further hosts are
+// counted under otherHosts.
+const (
+	maxTrackHosts = 32
+	otherHosts    = "(weitere Hosts)"
+	// maxAgentBansPerBatch bounds how many bans one telemetry batch can
+	// mirror centrally (a compromised agent cannot ban the whole Internet
+	// at once).
+	maxAgentBansPerBatch = 200
+)
 
 // Observe processes a batch of requests.
 func (d *IDS) Observe(reqs []protocol.Request) {
@@ -136,7 +216,9 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 	}
 	half := float64(cfg.HalfLifeSeconds)
 	now := time.Now()
+	unix := now.Unix()
 	var decisions []banDecision
+	agentBans := 0 // rate_ban reports taken over from this batch
 	newChallenges := false
 
 	d.mu.Lock()
@@ -182,7 +264,7 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 				}
 				delete(d.ip, victim)
 			}
-			t = &ipTrack{FirstSeen: now, Updated: now, Signals: map[string]float64{}, Counts: map[string]int64{}, Hosts: map[string]int64{}}
+			t = &ipTrack{FirstSeen: now, Updated: now, Signals: map[string]float64{}, Counts: map[string]int64{}, Hosts: map[string]int64{}, Insts: map[string]bool{}}
 			d.ip[r.IP] = t
 		}
 		// decay
@@ -201,7 +283,12 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 			t.Updated = now
 		}
 		t.Requests++
-		t.Hosts[r.Host]++
+		// bounded: random Host headers must not grow the track without end
+		if _, ok := t.Hosts[r.Host]; ok || len(t.Hosts) < maxTrackHosts {
+			t.Hosts[r.Host]++
+		} else {
+			t.Hosts[otherHosts]++
+		}
 		t.LastPath = r.Path
 		if r.UA != "" {
 			t.LastUA = r.UA
@@ -214,6 +301,9 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 			}
 			t.Score += w
 			t.Signals[sig] += w
+			if len(t.Insts) < 64 {
+				t.Insts[r.Inst] = true
+			}
 			t.Counts[sig]++
 		}
 
@@ -224,24 +314,42 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 			// Only count detections that would have reached a CRS critical
 			// level (score >= 5). Single low-severity matches (e.g. "Host
 			// header is a numeric IP") are too noisy to punish clients.
-			if r.WAFScore >= 5 {
+			// A false positive on a form (editor saving a page) repeats on
+			// the same path; scanners spread over many paths.
+			if r.WAFScore >= 5 && !t.seen("wd|"+r.Method+"|"+r.Path, unix, passiveDedupSeconds) {
 				add("waf_detect", math.Min(float64(r.WAFScore)/5, 4))
 			}
 		case protocol.ActionHoneypot:
 			add("honeypot", 1)
 		case protocol.ActionRateLimit:
-			add("rate_limit", 1)
+			// once per limit and minute: a short overrun only gets 429s, a
+			// sustained flood still adds up to a ban
+			if !t.seen("rl|"+r.Host+"|"+strings.Split(r.Detail, "|")[0], unix, rateLimitDedupSeconds) {
+				add("rate_limit", 1)
+			}
 		case protocol.ActionRateBan:
 			// agent already banned locally -> mirror the ban centrally
+			// the duration comes from the agent: never permanent (0) and
+			// never longer than the configured maximum
 			secs := 600
 			if p := strings.LastIndexByte(r.Detail, '|'); p >= 0 {
-				if n, err := strconv.Atoi(r.Detail[p+1:]); err == nil {
+				if n, err := strconv.Atoi(r.Detail[p+1:]); err == nil && n > 0 {
 					secs = n
 				}
 			}
+			maxSecs := cfg.MaxBanSeconds
+			if maxSecs <= 0 {
+				maxSecs = 30 * 86400
+			}
+			secs = min(max(secs, 60), maxSecs)
+			if agentBans >= maxAgentBansPerBatch {
+				continue
+			}
+			agentBans++
 			if !d.banning[r.IP] && !d.isNeverBan(r.IP) {
 				d.banning[r.IP] = true
-				decisions = append(decisions, banDecision{ip: r.IP, score: t.Score, reason: "Ratelimit überschritten: " + strings.Split(r.Detail, "|")[0], secs: secs, host: r.Host, policy: r.Policy, dry: cfg.DryRun})
+				decisions = append(decisions, banDecision{ip: r.IP, score: t.Score, reason: "Ratelimit überschritten: " + strings.Split(r.Detail, "|")[0], secs: secs, host: r.Host, policy: r.Policy, dry: cfg.DryRun,
+					inst: remoteInst(r.Inst)})
 			}
 			continue
 		case protocol.ActionUserAgent:
@@ -272,13 +380,23 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 			// unauthenticated requests are normal (session expired); wrong
 			// credentials are counted via ActionAuthFail
 		case "":
+			// Answers of the backend: count each path once per window.
+			// Apps poll the same URL (session check, missing favicon) –
+			// scanners request many different paths. Failed logins
+			// (POST …) are counted every time.
 			switch {
 			case r.Status == 404:
-				add("not_found", 1)
+				if !t.seen("404|"+r.Path, unix, passiveDedupSeconds) {
+					add("not_found", 1)
+				}
 			case r.Status == 401 || r.Status == 403:
-				add("auth_fail", 1)
+				if !safeMethod(r.Method) || !t.seen("401|"+r.Path, unix, passiveDedupSeconds) {
+					add("auth_fail", 1)
+				}
 			case r.Status == 400:
-				add("bad_request", 1)
+				if !t.seen("400|"+r.Path, unix, passiveDedupSeconds) {
+					add("bad_request", 1)
+				}
 			}
 		}
 		// scanner UA (once per 10 minutes per IP)
@@ -319,13 +437,13 @@ func (d *IDS) Observe(reqs []protocol.Request) {
 		}
 		if t.Score >= threshold && !d.banning[r.IP] && !d.isNeverBan(r.IP) {
 			d.banning[r.IP] = true
-			decisions = append(decisions, banDecision{ip: r.IP, score: t.Score, reason: explain(t.Signals), host: r.Host, policy: r.Policy, dry: cfg.DryRun})
+			decisions = append(decisions, banDecision{ip: r.IP, score: t.Score, reason: explain(t.Signals), host: r.Host, policy: r.Policy, dry: cfg.DryRun, inst: t.banScope()})
 		}
 	}
 	d.mu.Unlock()
 
 	for _, dec := range decisions {
-		go d.execute(dec, cfg)
+		goSafe(d.e.log, "ids execute", func() { d.execute(dec, cfg) })
 	}
 	if newChallenges {
 		go d.e.Rebuild("challenge list")
@@ -427,14 +545,17 @@ func (d *IDS) execute(dec banDecision, cfg IDSConfig) {
 		delete(d.banning, dec.ip)
 		d.mu.Unlock()
 	}()
-	// already banned?
+	// IPv6: ban the client's network (a /64 is one subscriber), otherwise
+	// it simply switches to the next address
+	target := banTarget(dec.ip, cfg.IPv6Prefix)
 	bans, _ := d.e.Store.ActiveBans()
 	for _, b := range bans {
-		if b.IP == dec.ip {
+		// already banned where this decision would ban
+		if (b.IP == dec.ip || b.IP == target) && (b.Inst == "" || b.Inst == dec.inst) {
 			return
 		}
 	}
-	prev := d.e.Store.OffenderBans(dec.ip)
+	prev := d.e.Store.OffenderBans(target)
 	secs := dec.secs
 	if secs == 0 {
 		secs = cfg.BanSeconds
@@ -458,7 +579,10 @@ func (d *IDS) execute(dec banDecision, cfg IDSConfig) {
 	if prev > 0 {
 		dec.reason += fmt.Sprintf(" · Wiederholungstäter (%d. Sperre)", prev+1)
 	}
-	if err := d.e.Ban(dec.ip, dec.reason, "ids", secs, dec.score); err != nil {
+	if target != dec.ip {
+		dec.reason += " · Netz " + target + " (IPv6)"
+	}
+	if err := d.e.BanScoped(target, dec.reason, "ids", dec.inst, secs, dec.score); err != nil {
 		d.e.log.Warn("ban failed", "ip", dec.ip, "err", err)
 		return
 	}
@@ -554,4 +678,32 @@ func (d *IDS) Tracked() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(d.ip)
+}
+
+// ipv6Prefix returns the effective prefix length for IPv6 bans (0 = default 64).
+func ipv6Prefix(n int) int {
+	if n <= 0 {
+		return 64
+	}
+	if n > 128 {
+		return 128
+	}
+	return n
+}
+
+// banTarget is what an IDS ban covers: the address, or for IPv6 its network.
+func banTarget(ip string, prefix int) string {
+	a, err := netip.ParseAddr(ip)
+	if err != nil || !a.Is6() || a.Is4In6() {
+		return ip
+	}
+	bits := ipv6Prefix(prefix)
+	if bits >= 128 {
+		return a.String()
+	}
+	p, err := a.Prefix(bits)
+	if err != nil {
+		return ip
+	}
+	return p.String()
 }

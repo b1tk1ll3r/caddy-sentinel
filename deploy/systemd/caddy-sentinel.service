@@ -1,0 +1,61 @@
+# /etc/systemd/system/caddy-sentinel.service
+#
+# Das Panel läuft als eigener Systembenutzer caddy-sentinel (ohne Login),
+# getrennt von Caddy (Benutzer caddy):
+#   /var/lib/caddy-sentinel/        caddy-sentinel:caddy          2750
+#     agent.token                   caddy-sentinel:caddy          0640  Caddy liest es
+#     staging/                      caddy-sentinel:caddy          2750  Prüf-Kopien, Caddy liest sie
+#     data/                         caddy-sentinel:caddy-sentinel 0700  Datenbank mit allen Geheimnissen
+#   /etc/caddy/                     Gruppe caddy, gruppenschreibbar, setgid
+# Caddy kann die Datenbank nicht lesen; das Panel kann Caddys private
+# Schlüssel nicht lesen (Zertifikate kommen über den Sentinel-Agenten).
+[Unit]
+Description=Caddy Sentinel Panel (Editor, Metriken, IDS/IPS, WAF)
+Documentation=https://github.com/b1tk1ll3r/caddy-sentinel
+After=network-online.target
+Wants=network-online.target
+Before=caddy.service
+
+[Service]
+Type=simple
+User=caddy-sentinel
+Group=caddy-sentinel
+# Gruppe caddy: Caddyfile und Imports in /etc/caddy schreiben, Agent-Token
+# und Prüf-Kopien für Caddy lesbar ablegen
+SupplementaryGroups=caddy
+EnvironmentFile=-/etc/default/caddy-sentinel
+ExecStart=/usr/local/bin/caddy-sentinel
+Restart=on-failure
+RestartSec=3
+
+# Härtung
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# kein /var/log/caddy: "Vollständig prüfen" öffnet Caddys Log-Dateien nicht
+ReadWritePaths=/var/lib/caddy-sentinel /etc/caddy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+# AF_NETLINK: eigene Adressen ermitteln (DNS-Prüfung neuer Sites)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+# neue Dateien: Gruppe lesbar (Agent-Token, Prüf-Kopien, Caddyfile), sonst niemand
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

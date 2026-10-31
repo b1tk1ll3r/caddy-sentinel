@@ -158,8 +158,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	if mons, err := s.e.Store.ListMonitors(); err == nil {
 		for _, m := range mons {
-			if has(m.Name, m.URL) {
-				add(searchHit{Kind: "monitor", Title: m.Name, Sub: "Monitor · " + m.URL, Href: "#/uptime"})
+			mu := m.URL
+			if !RoleCan(u.Role, "policy") {
+				mu = RedactURL(mu) // neither shown nor searchable for readers
+			}
+			if has(m.Name, mu) {
+				add(searchHit{Kind: "monitor", Title: m.Name, Sub: "Monitor · " + mu, Href: "#/uptime"})
 			}
 		}
 	}
@@ -231,6 +235,12 @@ func (s *Server) handleViewSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r)
+	// a shared view appears for every user: only roles that may change
+	// policies can publish one (readers keep private views)
+	if v.Shared && !RoleCan(u.Role, "policy") {
+		writeErr(w, 403, "Geteilte Ansichten erfordern "+capRoles("policy"))
+		return
+	}
 	if id := r.PathValue("id"); id != "" {
 		cur, err := s.e.Store.View(id)
 		if err != nil {

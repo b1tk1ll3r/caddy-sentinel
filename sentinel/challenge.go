@@ -45,8 +45,12 @@ func challengeSecret(hexSecret string) []byte {
 	return b
 }
 
-// validPass checks the pass cookie for ip.
-func validPass(r *http.Request, secret []byte, ip string, now time.Time) bool {
+// The token and the pass cookie are bound to the client address and to a
+// scope (policy and host): a solution of the easiest site does not open the
+// hardest one, and a pass of one site is no pass for another.
+
+// validPass checks the pass cookie for ip and scope.
+func validPass(r *http.Request, secret []byte, ip, scope string, now time.Time) bool {
 	c, err := r.Cookie(challengeCookie)
 	if err != nil {
 		return false
@@ -60,7 +64,7 @@ func validPass(r *http.Request, secret []byte, ip string, now time.Time) bool {
 		return false
 	}
 	fields := strings.Split(string(raw), "|")
-	if len(fields) != 3 || fields[0] != "v1" || fields[1] != ip {
+	if len(fields) != 4 || fields[0] != "v2" || fields[1] != ip || fields[3] != scope {
 		return false
 	}
 	exp, err := strconv.ParseInt(fields[2], 10, 64)
@@ -70,18 +74,18 @@ func validPass(r *http.Request, secret []byte, ip string, now time.Time) bool {
 	return subtle.ConstantTimeCompare([]byte(mac), []byte(sign(secret, "pass", string(raw)))) == 1
 }
 
-func passCookie(secret []byte, ip string, ttl time.Duration, now time.Time, secure bool) *http.Cookie {
-	raw := fmt.Sprintf("v1|%s|%d", ip, now.Add(ttl).Unix())
+func passCookie(secret []byte, ip, scope string, ttl time.Duration, now time.Time, secure bool) *http.Cookie {
+	raw := fmt.Sprintf("v2|%s|%d|%s", ip, now.Add(ttl).Unix(), scope)
 	return &http.Cookie{
 		Name: challengeCookie, Value: b64.EncodeToString([]byte(raw)) + "." + sign(secret, "pass", raw),
 		Path: "/", MaxAge: int(ttl.Seconds()), HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode,
 	}
 }
 
-func newToken(secret []byte, ip string, difficulty int, now time.Time) string {
+func newToken(secret []byte, ip, scope string, difficulty int, now time.Time) string {
 	n := make([]byte, 9)
 	_, _ = rand.Read(n)
-	raw := fmt.Sprintf("%s|%d|%d|%s", ip, now.Unix(), difficulty, b64.EncodeToString(n))
+	raw := fmt.Sprintf("%s|%d|%d|%s|%s", ip, now.Unix(), difficulty, b64.EncodeToString(n), scope)
 	return b64.EncodeToString([]byte(raw)) + "." + sign(secret, "tok", raw)
 }
 
@@ -98,7 +102,7 @@ func leadingZeroBits(h []byte) int {
 }
 
 // verifySolution validates token and proof of work.
-func verifySolution(secret []byte, ip, token, counter string, now time.Time) error {
+func verifySolution(secret []byte, ip, scope string, minDifficulty int, token, counter string, now time.Time) error {
 	payload, mac, ok := strings.Cut(token, ".")
 	if !ok {
 		return fmt.Errorf("token malformed")
@@ -111,14 +115,17 @@ func verifySolution(secret []byte, ip, token, counter string, now time.Time) err
 		return fmt.Errorf("token signature invalid")
 	}
 	f := strings.Split(string(raw), "|")
-	if len(f) != 4 || f[0] != ip {
-		return fmt.Errorf("token not issued for this client")
+	if len(f) != 5 || f[0] != ip || f[4] != scope {
+		return fmt.Errorf("token not issued for this client or site")
 	}
 	ts, _ := strconv.ParseInt(f[1], 10, 64)
 	if now.Sub(time.Unix(ts, 0)) > tokenMaxAge {
 		return fmt.Errorf("token expired")
 	}
 	diff, _ := strconv.Atoi(f[2])
+	if diff < minDifficulty {
+		return fmt.Errorf("token easier than the site requires")
+	}
 	if len(counter) > 20 {
 		return fmt.Errorf("counter invalid")
 	}

@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/b1tk1ll3r/caddy-sentinel/panel/internal/store"
@@ -32,14 +34,14 @@ type CertInfo struct {
 // Certificates scans Caddy's storage directory for certificates.
 func (e *Engine) Certificates(ctx context.Context, inst string) ([]CertInfo, error) {
 	cfg := e.Settings().Certs
-	root, err := e.storageRoot(ctx, inst)
+	root, mirrored, err := e.certRoot(ctx, inst, false)
 	if err != nil {
 		return nil, err
 	}
 	base := filepath.Join(root, "certificates")
 	if _, err := os.Stat(base); err != nil {
-		if inst != "" && inst != LocalInstance && os.IsNotExist(err) {
-			return []CertInfo{}, nil // remote Caddy without managed certificates
+		if os.IsNotExist(err) && (mirrored || dirExists(root)) {
+			return []CertInfo{}, nil // Caddy without managed certificates
 		}
 		return nil, fmt.Errorf("%s nicht lesbar: %v", base, err)
 	}
@@ -101,6 +103,131 @@ func (e *Engine) Certificates(ctx context.Context, inst string) ([]CertInfo, err
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].NotAfter < out[j].NotAfter })
 	return out, err
+}
+
+// certRoot returns the directory to read certificates (and, with pki, the
+// internal CA) of an instance from; mirrored is true for a copy fetched
+// through a Sentinel agent.
+//
+// Remote instances are always mirrored (storageRoot). For the local Caddy
+// the panel reads the configured data directory when it may (Docker with
+// the data volume mounted, older installations where panel and Caddy share
+// the user caddy). Otherwise – the systemd installation runs the panel as
+// its own user caddy-sentinel, and Caddy keeps its data directory (0700)
+// and private keys (0600) to itself – the public parts are mirrored through
+// the local agent exactly like for remote instances: the agent operation
+// "data.files" returns certificates, CA certificates and the ACME server
+// databases, never private keys, and refreshMirror drops any *.key file.
+func (e *Engine) certRoot(ctx context.Context, inst string, pki bool) (string, bool, error) {
+	if inst == "" || inst == "all" {
+		inst = LocalInstance
+	}
+	if inst != LocalInstance {
+		root, err := e.storageRoot(ctx, inst, pki)
+		return root, true, err
+	}
+	root := e.Settings().Certs.StoragePath
+	if root != "" && caddyDataReadable(root) {
+		return root, false, nil
+	}
+	dir, err := e.localMirror(ctx, pki)
+	if err != nil {
+		if root == "" {
+			return "", false, fmt.Errorf("kein Caddy-Datenverzeichnis konfiguriert, und der lokale Sentinel-Agent liefert keine Zertifikate: %v", err)
+		}
+		return "", false, fmt.Errorf("Caddys Datenverzeichnis %s ist für das Panel nicht lesbar (gewollt: private Schlüssel darf nur Caddy lesen), und der lokale Sentinel-Agent liefert keine Zertifikate: %v", root, err)
+	}
+	return dir, true, nil
+}
+
+// caddyDataReadable reports whether the panel can read the certificates in
+// Caddy's data directory itself: the directory and the first certificate
+// found below certificates/ and pki/ must be readable. Only *.crt files are
+// opened – never keys.
+func caddyDataReadable(root string) bool {
+	if _, err := os.ReadDir(root); err != nil {
+		return false
+	}
+	ok := true
+	for _, sub := range []string{"certificates", "pki"} {
+		_ = filepath.WalkDir(filepath.Join(root, sub), func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
+					ok = false
+				}
+				return fs.SkipAll
+			}
+			if d.IsDir() || !strings.HasSuffix(p, ".crt") {
+				return nil
+			}
+			if f, err := os.Open(p); err != nil {
+				ok = false
+			} else {
+				f.Close()
+			}
+			return fs.SkipAll
+		})
+	}
+	return ok
+}
+
+func dirExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
+}
+
+// localMirrors holds per engine the mirror state of the local instance
+// (same mechanism as for remote instances, see storageRoot).
+var localMirrors sync.Map // *Engine -> *instRT
+
+func (e *Engine) localMirrorRT() *instRT {
+	if v, ok := localMirrors.Load(e); ok {
+		return v.(*instRT)
+	}
+	rt := &instRT{meta: store.Instance{ID: LocalInstance}, remote: newRemoteTarget(e, LocalInstance)}
+	v, _ := localMirrors.LoadOrStore(e, rt)
+	return v.(*instRT)
+}
+
+// localMirror returns <data>/mirror/local, refreshed through the local
+// agent. A stale copy is used right away and refreshed in the background;
+// if the agent is not connected (Caddy stopped), the last copy is used.
+func (e *Engine) localMirror(ctx context.Context, pki bool) (string, error) {
+	rt := e.localMirrorRT()
+	dir := filepath.Join(e.cfg.DataDir, "mirror", LocalInstance)
+	rt.mirrorMu.Lock()
+	at := rt.mirrorAt
+	if pki {
+		at = rt.mirrorPKIAt
+	}
+	// shorter than for remote instances: the local agent answers at once
+	fresh := !at.IsZero() && time.Since(at) < 30*time.Second
+	_, statErr := os.Stat(dir)
+	have := statErr == nil && !at.IsZero()
+	if !fresh && have && !rt.mirroring {
+		rt.mirroring = true
+		goSafe(e.log, "local mirror refresh", func() {
+			defer func() {
+				rt.mirrorMu.Lock()
+				rt.mirroring = false
+				rt.mirrorMu.Unlock()
+			}()
+			bg, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			_ = e.refreshMirror(bg, rt, dir, pki)
+		})
+	}
+	rt.mirrorMu.Unlock()
+	if fresh || have {
+		return dir, nil
+	}
+	if err := e.refreshMirror(ctx, rt, dir, pki); err != nil {
+		if statErr == nil {
+			return dir, nil // copy from before a restart; better than nothing
+		}
+		return "", err
+	}
+	return dir, nil
 }
 
 func firstNonEmpty(org []string, cn string) string {

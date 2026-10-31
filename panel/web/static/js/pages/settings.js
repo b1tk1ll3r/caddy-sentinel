@@ -47,9 +47,10 @@ export async function render(root, _p, scope, q) {
           field('Burst: Requests', num(c, 'burst_requests', { min: 0 }), '0 = aus. Mehr Requests einer IP im Fenster zählen als Signal.'),
           field('Burst: Fenster (s)', num(c, 'burst_window_seconds', { min: 1 })),
           field('Bot-Challenge ab Score', num(c, 'challenge_threshold', { min: 0 }), 'IPs ab diesem Score müssen auf Policies mit Challenge-Modus „verdächtig“ die Bot-Challenge lösen. 0 = aus.'),
-          field('Challenge-Dauer (Min.)', el('input', { type: 'number', min: 1, value: Math.round((c.challenge_seconds || 3600) / 60), oninput: (e) => { c.challenge_seconds = +e.target.value * 60; markDirty(); } }))))),
+          field('Challenge-Dauer (Min.)', el('input', { type: 'number', min: 1, value: Math.round((c.challenge_seconds || 3600) / 60), oninput: (e) => { c.challenge_seconds = +e.target.value * 60; markDirty(); } })),
+          field('IPv6-Sperren für', select([['64', 'das /64-Netz des Clients'], ['56', 'das /56-Netz'], ['48', 'das /48-Netz'], ['128', 'nur die einzelne Adresse']], String(c.ipv6_prefix || 64), (v) => { c.ipv6_prefix = +v; markDirty(); }), 'Ein /64 gehört meist einem Anschluss. Wer nur die Adresse sperrt, lässt den Client mit der nächsten Adresse weitermachen.')))),
       panel('Gewichtung der Signale', el('div.stack', null,
-        el('p.muted', null, 'Punkte, die eine IP pro Ereignis erhält. Policies können diese Werte überschreiben.'),
+        el('p.muted', null, 'Punkte, die eine IP pro Ereignis erhält. Policies können diese Werte überschreiben. 404, 400, 401/403 des Backends bei GET und WAF-Treffer im Erkennungsmodus zählen je Pfad nur einmal in 10 Minuten, Ratelimit-Treffer einmal pro Minute – so sperrt eine Seite, die dieselbe Adresse abfragt, ihre Besucher nicht. Fehlgeschlagene Anmeldungen (POST) zählen jedes Mal.'),
         el('div.fields', null, Object.keys(SIGNALS).map(k => field(SIGNALS[k], el('input', { type: 'number', min: 0, value: c.weights[k] ?? 0, oninput: (e) => { c.weights[k] = +e.target.value; markDirty(); } })))),
         el('div.row', null, el('button.btn.ghost', { onclick: () => { c.weights = { ...data.defaults.ids.weights }; markDirty(); ids(); } }, 'Standardgewichte wiederherstellen')))),
       panel('Angriffstools (User-Agent-Teilstrings)', linesInput(c.scanner_uas, (v) => { c.scanner_uas = v; markDirty(); }, { rows: 6 })));
@@ -197,14 +198,14 @@ export async function render(root, _p, scope, q) {
           el('dt', null, 'Caddyfile'), el('dd.mono', null, st.caddyfile, ' ', st.caddyfile_writable ? el('span.badge.ok', null, 'beschreibbar') : el('span.badge.warn', null, 'schreibgeschützt')),
           el('dt', null, 'Token-Datei'), el('dd.mono', null, info.token_file)))),
       panel('Zertifikats-Überwachung', el('div.fields', null,
-        el('div.field.wide', null, el('span', null, 'Caddy-Datenverzeichnis'), el('input.mono', { value: s.certs.storage_path || '', placeholder: '/var/lib/caddy/.local/share/caddy', oninput: (e) => { s.certs.storage_path = e.target.value.trim(); markDirty(); } }), el('small', null, 'Enthält den Ordner „certificates“. Das Panel benötigt Leserechte.')),
+        el('div.field.wide', null, el('span', null, 'Caddy-Datenverzeichnis'), el('input.mono', { value: s.certs.storage_path || '', placeholder: '/var/lib/caddy/.local/share/caddy', oninput: (e) => { s.certs.storage_path = e.target.value.trim(); markDirty(); } }), el('small', null, 'Enthält den Ordner „certificates“. Ist er für das Panel nicht lesbar (Standard seit dem eigenen Benutzer caddy-sentinel), kommen die Zertifikate ohne Schlüssel über den lokalen Agenten.')),
         field('Warnen ab (Tage Restlaufzeit)', num(s.certs, 'warn_days', { min: 1 })))),
       panel('Agent-Token', el('div.stack', null,
         el('div.row', null, el('input.mono', { value: info.token, readonly: true, style: { flex: 1, minWidth: '280px' }, type: 'password', onfocus: (e) => { e.target.type = 'text'; }, onblur: (e) => { e.target.type = 'password'; } }),
           el('button.btn', { onclick: () => copy(info.token) }, 'Kopieren'),
           el('button.btn.danger', {
             onclick: async () => {
-              if (!await confirmDialog('Token erneuern', 'Caddy muss danach neu geladen werden (systemctl reload caddy), damit es das neue Token aus der Datei liest. Bis dahin verliert Sentinel die Verbindung.', 'Erneuern')) return;
+              if (!await confirmDialog('Token erneuern', 'Der Agent liest das neue Token beim nächsten abgewiesenen Abruf selbst aus der Datei und verbindet sich nach wenigen Sekunden neu. Agents auf anderen Servern mit eigenem Token sind nicht betroffen.', 'Erneuern')) return;
               try { await post('/settings/agent/rotate'); toast('Neues Token erzeugt', 'ok'); agent(); } catch (e) { errToast(e); }
             },
           }, 'Erneuern')))));
@@ -245,7 +246,7 @@ export async function render(root, _p, scope, q) {
     const box = el('div');
     const reload = () => users();
     mount(body, panel('Benutzer', el('div.stack', null,
-      el('p.muted', null, 'Administratoren dürfen alles. Leser sehen alle Daten, können aber nichts ändern (z. B. für Kolleg:innen oder den Bereitschaftsdienst).'),
+      el('p.muted', null, 'Administratoren dürfen alles. Bearbeiter ändern Caddyfile, Policies, Regelsätze, Feeds und Monitore und setzen Sperren. Support sieht alles und setzt oder hebt Sperren auf. Leser sehen alle Daten, können aber nichts ändern.'),
       el('div.table-wrap', null, el('table', null,
         el('thead', null, el('tr', null, el('th', null, 'Benutzer'), el('th', null, 'Rolle'), el('th', null, '2FA'), el('th', null, 'Letzte Anmeldung'), el('th', null, ''))),
         el('tbody', null, list.map(u => el('tr', null,
@@ -254,7 +255,7 @@ export async function render(root, _p, scope, q) {
           el('td', null, u.source === 'ldap' ? el('a', { href: '#/access?tab=users' }, 'über Site-Login') : u.totp_enabled ? el('span.badge.ok', null, 'aktiv') : el('span.badge', null, 'aus')),
           el('td', null, u.last_login ? fmtAgo(u.last_login * 1000) : '–'),
           el('td.nowrap', null,
-            u.source === 'ldap' ? null : el('button.btn.sm', { onclick: async () => { const pw = await promptPw(u.username); if (!pw) return; try { await put('/users/' + u.id, { password: pw }); toast('Passwort gesetzt', 'ok'); } catch (e) { errToast(e); } } }, 'Passwort setzen'), ' ',
+            (u.source && u.source !== 'local') ? null : el('button.btn.sm', { onclick: async () => { const pw = await promptPw(u.username); if (!pw) return; try { await put('/users/' + u.id, { password: pw }); toast('Passwort gesetzt', 'ok'); } catch (e) { errToast(e); } } }, 'Passwort setzen'), ' ',
             u.totp_enabled ? el('button.btn.sm', { onclick: async () => { if (!await confirmDialog('2FA zurücksetzen', `${u.username} muss die Zwei-Faktor-Anmeldung danach neu einrichten.`, 'Zurücksetzen')) return; await put('/users/' + u.id, { reset_totp: true }); reload(); } }, '2FA zurücksetzen') : null, ' ',
             u.id !== me.id ? el('button.btn.sm.danger', { onclick: async () => { if (!await confirmDialog('Benutzer löschen', `${u.username} löschen?`, 'Löschen')) return; try { await del('/users/' + u.id); reload(); } catch (e) { errToast(e); } } }, 'Löschen') : null)))))),
       el('div.row', null, el('button.btn.primary', { onclick: createUser }, 'Benutzer anlegen')))));
@@ -279,22 +280,46 @@ export async function render(root, _p, scope, q) {
   }
 
   function backup() {
-    let fileIn, withSettings;
+    let fileIn, withSettings, pw1, pw2, plain, pwIn;
+    const download = async () => {
+      const unencrypted = plain.checked;
+      if (!unencrypted) {
+        if (pw1.value.length < 12) return toast('Das Passwort muss mindestens 12 Zeichen haben', 'bad');
+        if (pw1.value !== pw2.value) return toast('Die Passwörter stimmen nicht überein', 'bad');
+      }
+      try {
+        const data = await post('/backup', unencrypted ? { plain: true } : { password: pw1.value });
+        const name = `caddy-sentinel-backup-${new Date().toISOString().slice(0, 10)}${unencrypted ? '.json' : '.sentinel-backup'}`;
+        const a = el('a', { href: URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })), download: name });
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        pw1.value = pw2.value = '';
+        toast(unencrypted ? 'Unverschlüsselte Sicherung erstellt – sicher aufbewahren' : 'Verschlüsselte Sicherung erstellt', 'ok');
+      } catch (e) { errToast(e); }
+    };
     mount(body,
       panel('Sicherung herunterladen', el('div.stack', null,
-        el('p.muted', null, 'Exportiert Einstellungen, Policies, Regelsätze, Threat-Feeds und Monitore als JSON. Benutzer, Statistiken und das Agent-Token sind nicht enthalten. Die Datei enthält ggf. Webhook-Tokens und SMTP-Passwort – sicher aufbewahren.'),
-        el('div', null, el('a.btn.primary', { href: '/api/backup', download: '' }, 'Backup herunterladen')))),
+        el('p.muted', null, 'Exportiert Einstellungen, Policies, Regelsätze, Threat-Feeds, Monitore, befristete Einträge, Zugangskonten und Site-Zugriffstokens. Panel-Benutzer, Statistiken und das Agent-Token sind nicht enthalten. Die Sicherung enthält Geheimnisse (SMTP-, LDAP-Passwort, OAuth-Secrets, Webhook- und Metrics-Token) sowie Passwort-Hashes und 2FA-Schlüssel der Zugangskonten. Sie wird deshalb mit einem Passwort verschlüsselt (AES-256-GCM). Ohne das Passwort lässt sie sich nicht einspielen – es gibt keine Wiederherstellung.'),
+        el('div.fields', null,
+          field('Passwort für die Sicherung', pw1 = el('input', { type: 'password', autocomplete: 'new-password', minlength: 12 }), 'mindestens 12 Zeichen'),
+          field('Passwort wiederholen', pw2 = el('input', { type: 'password', autocomplete: 'new-password' }))),
+        el('label.toggle', null, plain = el('input', { type: 'checkbox', onchange: () => { pw1.disabled = pw2.disabled = plain.checked; } }), el('span.track', null, el('span.thumb')), el('span', null, 'Unverschlüsselt herunterladen (Geheimnisse im Klartext)')),
+        el('div', null, el('button.btn.primary', { onclick: download }, 'Sicherung herunterladen')))),
       panel('Sicherung einspielen', el('div.stack', null,
-        el('p.muted', null, 'Gleichnamige Policies, Regelsätze, Feeds und Monitore werden überschrieben, andere bleiben erhalten. Geeignet auch zum Übertragen der Regeln auf einen zweiten Server.'),
-        fileIn = el('input', { type: 'file', accept: 'application/json,.json' }),
+        el('p.muted', null, 'Policies, Regelsätze, Feeds und Monitore mit derselben ID werden überschrieben, andere bleiben erhalten. Vorhandene Zugangskonten bleiben unverändert. Geeignet auch zum Übertragen der Regeln auf einen zweiten Server.'),
+        fileIn = el('input', { type: 'file', accept: 'application/json,.json,.sentinel-backup' }),
+        field('Passwort (bei verschlüsselter Sicherung)', pwIn = el('input', { type: 'password', autocomplete: 'off' })),
         el('label.toggle', null, withSettings = el('input', { type: 'checkbox' }), el('span.track', null, el('span.thumb')), el('span', null, 'Auch globale Einstellungen übernehmen')),
         el('div', null, el('button.btn', {
           onclick: async () => {
             const f = fileIn.files[0];
             if (!f) return toast('Bitte eine Backup-Datei wählen', 'bad');
             try {
-              const backupData = JSON.parse(await f.text());
-              const r = await post('/backup/restore', { backup: backupData, settings: withSettings.checked });
+              const data = JSON.parse(await f.text());
+              const enc = data.format === 'caddy-sentinel-backup-encrypted';
+              if (enc && !pwIn.value) return toast('Die Sicherung ist verschlüsselt – bitte das Passwort eingeben', 'bad');
+              const r = await post('/backup/restore', enc ? { encrypted: data, password: pwIn.value, settings: withSettings.checked } : { backup: data, settings: withSettings.checked });
+              pwIn.value = '';
               const n = r.imported;
               toast(`Eingespielt: ${n.policies || 0} Policies, ${n.rulesets || 0} Regelsätze, ${n.feeds || 0} Feeds, ${n.monitors || 0} Monitore`, r.errors.length ? 'bad' : 'ok', 8000);
               if (r.errors.length) modal('Teilweise eingespielt', el('ul', null, r.errors.map(e => el('li', null, e))));

@@ -111,8 +111,9 @@ export async function render(root, _p, scope) {
     const pre = el('pre.mono', { style: { whiteSpace: 'pre-wrap' } });
     const cmd = el('pre.mono', { style: { whiteSpace: 'pre-wrap' } });
     const draw = () => {
-      cmd.textContent = `bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh) \\
-  --agent --panel ${panelURL} --token ${token} --remote ${mode}`;
+      // the token goes in as environment variable, not as argument (process list)
+      cmd.textContent = `SENTINEL_AGENT_TOKEN='${token}' bash <(wget -qO- https://github.com/b1tk1ll3r/caddy-sentinel/releases/latest/download/install.sh) \\
+  --agent --panel ${panelURL} --remote ${mode}`;
       pre.textContent = `{
 	sentinel {
 		panel ${panelURL}

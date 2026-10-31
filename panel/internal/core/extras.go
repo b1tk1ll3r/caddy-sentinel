@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/b1tk1ll3r/caddy-sentinel/panel/internal/caddyx"
@@ -87,6 +88,11 @@ func (s *Server) handleFeeds(w http.ResponseWriter, r *http.Request) {
 			usage[fr.Feed] = append(usage[fr.Feed], p.ID)
 		}
 	}
+	if !RoleCan(userFrom(r).Role, "policy") {
+		for i := range fs {
+			fs[i].URL = RedactURL(fs[i].URL) // readers: no API keys
+		}
+	}
 	writeJSON(w, 200, map[string]any{"feeds": fs, "presets": FeedPresets, "usage": usage})
 }
 
@@ -98,6 +104,9 @@ func (s *Server) handleFeedGet(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(f.Content) > 200000 {
 		f.Content = f.Content[:200000] + "\n# … (gekürzt)"
+	}
+	if !RoleCan(userFrom(r).Role, "policy") {
+		f.URL = RedactURL(f.URL)
 	}
 	writeJSON(w, 200, f)
 }
@@ -222,8 +231,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request) {
 		LatSpark []float64 `json:"lat"`
 	}
 	out := []view{}
+	reader := !RoleCan(userFrom(r).Role, "policy")
 	for _, m := range mons {
 		v := view{Monitor: m, State: states[m.ID]}
+		if reader {
+			v.Monitor.URL = RedactURL(m.URL) // readers: no credentials
+		}
 		v.Up24, v.AvgMs, _ = s.e.Store.Uptime(m.ID, now-86400)
 		v.Up7d, _, _ = s.e.Store.Uptime(m.ID, now-7*86400)
 		v.Up30d, _, _ = s.e.Store.Uptime(m.ID, now-30*86400)
@@ -257,8 +270,10 @@ func (s *Server) handleMonitorSave(w http.ResponseWriter, r *http.Request) {
 	if m.Name == "" {
 		m.Name = u.Host
 	}
-	if m.IntervalS < 15 {
+	if m.IntervalS <= 0 {
 		m.IntervalS = 60
+	} else if m.IntervalS < 15 {
+		m.IntervalS = 15
 	}
 	if m.TimeoutS <= 0 || m.TimeoutS > 60 {
 		m.TimeoutS = 10
@@ -370,6 +385,17 @@ type Backup struct {
 	Accounts    []backupAccount   `json:"accounts,omitempty"`
 	SiteTokens  []backupToken     `json:"site_tokens,omitempty"`
 	TempEntries []store.TempEntry `json:"temp_entries,omitempty"`
+	// Passkeys of the access accounts (public keys).
+	Passkeys []backupPasskey `json:"passkeys,omitempty"`
+	// OIDC: the OpenID Provider with its applications (secret hashes).
+	// Signing keys are not part of the backup – new ones are created.
+	OIDC *IdPConfig `json:"oidc,omitempty"`
+}
+
+type backupPasskey struct {
+	store.Passkey
+	Key   []byte `json:"key"`
+	Count int64  `json:"count"`
 }
 
 type backupAccount struct {
@@ -384,7 +410,14 @@ type backupToken struct {
 	Hash string `json:"hash"`
 }
 
+// handleBackup: GET /api/backup – unencrypted, for scripts (admin only).
 func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	b := s.buildBackup()
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="caddy-sentinel-backup-%s.json"`, time.Now().Format("2006-01-02")))
+	writeJSON(w, 200, b)
+}
+
+func (s *Server) buildBackup() Backup {
 	st := s.e.Settings()
 	b := Backup{Format: "caddy-sentinel-backup", Version: 1, Created: time.Now().Unix(), Settings: &st,
 		Policies: s.e.Policies(), Rulesets: s.e.Rulesets()}
@@ -412,18 +445,53 @@ func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	b.TempEntries, _ = s.e.Store.TempEntries("")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="caddy-sentinel-backup-%s.json"`, time.Now().Format("2006-01-02")))
-	writeJSON(w, 200, b)
+	if ic := s.e.idpConfig(); ic.Enabled || len(ic.Clients) > 0 {
+		b.OIDC = ic
+	}
+	if pks, err := s.e.Store.Passkeys(""); err == nil {
+		local := map[string]bool{}
+		for _, a := range b.Accounts {
+			local[strings.ToLower(a.Username)] = true
+		}
+		for _, p := range pks {
+			if local[p.Username] {
+				b.Passkeys = append(b.Passkeys, backupPasskey{Passkey: *p, Key: p.Key, Count: p.Count})
+			}
+		}
+	}
+	return b
 }
 
+// restoreMu serialises restores (each can take a lot of memory and CPU).
+var restoreMu sync.Mutex
+
 func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
+	if !restoreMu.TryLock() {
+		writeErr(w, http.StatusConflict, "Es läuft bereits eine Wiederherstellung – bitte warten")
+		return
+	}
+	defer restoreMu.Unlock()
 	var req struct {
-		Backup   Backup `json:"backup"`
-		Settings bool   `json:"settings"`
+		Backup    Backup     `json:"backup"`
+		Encrypted *encBackup `json:"encrypted"`
+		Password  string     `json:"password"`
+		Settings  bool       `json:"settings"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "Datei ist kein gültiges Backup: "+err.Error())
 		return
+	}
+	if req.Encrypted != nil {
+		plain, err := decryptBackup(req.Encrypted, req.Password)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		req.Backup = Backup{}
+		if err := json.Unmarshal(plain, &req.Backup); err != nil {
+			writeErr(w, 400, "Datei ist kein gültiges Backup: "+err.Error())
+			return
+		}
 	}
 	b := req.Backup
 	if b.Format != "caddy-sentinel-backup" {
@@ -467,10 +535,22 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 			n["monitors"]++
 		}
 	}
+	created := map[string]bool{}
+	defer func() {
+		// passkeys only for accounts this restore created
+		for _, p := range b.Passkeys {
+			if created[strings.ToLower(p.Username)] {
+				pk := p.Passkey
+				pk.Key, pk.Count = p.Key, p.Count
+				_ = s.e.Store.AddPasskey(&pk)
+			}
+		}
+	}()
 	for _, a := range b.Accounts {
 		if _, err := s.e.Store.DirUser(a.Username); err == nil {
 			continue // keep existing accounts
 		}
+		created[strings.ToLower(a.Username)] = true
 		u := a.DirUser
 		if err := s.e.Store.CreateLocalAccount(&u, a.PWHash); err != nil {
 			errs = append(errs, "Konto "+a.Username+": "+err.Error())
@@ -493,13 +573,49 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		if tt.Hash == "" {
 			continue
 		}
+		// like passkeys: only for accounts this restore created – a token
+		// from a file must never grant access to an existing account
+		if !created[strings.ToLower(tt.User)] {
+			n["site_tokens_skipped"]++
+			continue
+		}
 		if err := s.e.Store.CreateSiteToken(&tt); err == nil {
 			n["site_tokens"]++
 		}
 	}
+	if b.OIDC != nil {
+		idpSaveMu.Lock()
+		cfg := s.e.idpConfig().copy()
+		added := 0
+		for _, c := range b.OIDC.Clients {
+			if cfg.client(c.ID) == nil {
+				cfg.Clients = append(cfg.Clients, c)
+				added++
+			}
+		}
+		if req.Settings {
+			cfg.Enabled, cfg.Issuer, cfg.AccessMinutes = b.OIDC.Enabled, b.OIDC.Issuer, b.OIDC.AccessMinutes
+		}
+		if err := s.e.saveIdPConfig(cfg); err != nil {
+			errs = append(errs, "OIDC-Server: "+err.Error())
+		} else {
+			n["oidc_clients"] = added
+		}
+		idpSaveMu.Unlock()
+	}
 	for _, t := range b.TempEntries {
 		tt := t
-		if tt.Until > time.Now().Unix() && s.e.Store.PutTempEntry(&tt) == nil {
+		// the same rules as for entries created in the interface; global
+		// lists (trusted, never_ban) only together with the settings
+		tt.Value = strings.TrimSpace(tt.Value)
+		now := time.Now().Unix()
+		okList := tt.Scope == "global" && (tt.List == "trusted" || tt.List == "never_ban") && req.Settings ||
+			tt.Scope != "global" && (tt.List == "allow" || tt.List == "deny") && s.e.Policy(tt.Scope) != nil
+		if !okList || !validIPOrCIDR(tt.Value) || tt.Until <= now || tt.Until > time.Now().AddDate(1, 0, 1).Unix() {
+			n["temp_entries_skipped"]++
+			continue
+		}
+		if s.e.Store.PutTempEntry(&tt) == nil {
 			n["temp_entries"]++
 		}
 	}

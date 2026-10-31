@@ -41,7 +41,7 @@ type actionLink struct {
 }
 
 func (e *Engine) actionKey() []byte {
-	m := hmac.New(sha256.New, []byte(e.challengeSecretBytes()))
+	m := hmac.New(sha256.New, []byte(e.actionSecret))
 	m.Write([]byte("sentinel-action-v1"))
 	return m.Sum(nil)
 }
@@ -77,25 +77,11 @@ func (e *Engine) verifyAction(tok string) (*actionClaim, error) {
 	return &c, nil
 }
 
-var usedActions = struct {
-	sync.Mutex
-	m map[string]int64
-}{m: map[string]int64{}}
-
-func takeAction(nonce string, exp int64) bool {
-	usedActions.Lock()
-	defer usedActions.Unlock()
-	now := time.Now().Unix()
-	for k, v := range usedActions.m {
-		if v < now {
-			delete(usedActions.m, k)
-		}
-	}
-	if _, used := usedActions.m[nonce]; used {
-		return false
-	}
-	usedActions.m[nonce] = exp
-	return true
+// takeAction marks an action link as used. The nonces are stored in the
+// database, so a used link stays used after a restart of the panel.
+func (e *Engine) takeAction(nonce string, exp int64) bool {
+	ok, err := e.Store.UseActionNonce(nonce, exp)
+	return ok && err == nil
 }
 
 var digitsRe = regexp.MustCompile(`[0-9]+`)
@@ -203,7 +189,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		actionPage(w, 200, title, text, button, r.URL.Path)
 		return
 	}
-	if !takeAction(c.Nonce, c.Exp) {
+	if !s.e.takeAction(c.Nonce, c.Exp) {
 		actionPage(w, http.StatusConflict, title, "Dieser Link wurde schon verwendet.", "", "")
 		return
 	}

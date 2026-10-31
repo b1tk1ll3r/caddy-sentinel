@@ -28,10 +28,12 @@ export function tempTable(entries, { onChange, policies = {} } = {}) {
 
 /** Dialog for a new temporary entry. */
 export function tempDialog({ value = '', scope = 'global', list, policies = [], onDone } = {}, modal) {
-  const st = { value, scope, list: list || (scope === 'global' ? 'trusted' : 'allow'), until: Math.floor(Date.now() / 1000) + 3600, note: '' };
+  // only administrators may trust a source globally (all checks skipped)
+  if (list === 'trusted' && !can('admin')) list = 'never_ban';
+  const st = { value, scope, list: list || (scope === 'global' ? (can('admin') ? 'trusted' : 'never_ban') : 'allow'), until: Math.floor(Date.now() / 1000) + 3600, note: '' };
   const listBox = el('div');
   const drawLists = () => {
-    const opts = st.scope === 'global' ? ['trusted', 'never_ban'] : ['allow', 'deny'];
+    const opts = st.scope === 'global' ? (can('admin') ? ['trusted', 'never_ban'] : ['never_ban']) : ['allow', 'deny'];
     if (!opts.includes(st.list)) st.list = opts[0];
     mount(listBox, field('Liste', select(opts.map(k => [k, TEMP_LISTS[k][0] + ' – ' + TEMP_LISTS[k][1]]), st.list, (v) => { st.list = v; })));
   };

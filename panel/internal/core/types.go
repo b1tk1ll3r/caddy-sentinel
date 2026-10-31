@@ -183,6 +183,9 @@ type IDSConfig struct {
 	// challenge on policies with challenge mode "suspicious" (0 = off).
 	ChallengeThreshold float64 `json:"challenge_threshold"`
 	ChallengeSeconds   int     `json:"challenge_seconds"`
+	// IPv6Prefix: bans of IPv6 addresses cover this network (64 = the /64
+	// of the client, like the rate limiter counts; 128 = single address).
+	IPv6Prefix int `json:"ipv6_prefix"`
 }
 
 type AlertConfig struct {
@@ -237,6 +240,7 @@ func DefaultSettings() Settings {
 			NeverBan:           []string{"127.0.0.0/8", "::1"},
 			ChallengeThreshold: 40,
 			ChallengeSeconds:   3600,
+			IPv6Prefix:         64,
 		},
 		Certs: CertConfig{StoragePath: defaultCaddyData(), WarnDays: 14},
 		SMTP:  SMTPConfig{Port: 587, Security: "starttls"},
@@ -255,7 +259,7 @@ func DefaultSettings() Settings {
 			PanelRequireTOTP: true,
 		},
 		Telemetry: protocol.Telemetry{SampleRate: 1, ReportQuery: true},
-		Retention: Retention{RequestsHours: 72, EventsDays: 90, RollupDays: 90},
+		Retention: Retention{RequestsHours: 168, EventsDays: 90, RollupDays: 90},
 		Trusted:   []string{},
 		Alerts: AlertConfig{
 			ErrorRate: 0.2, ErrorMinRequests: 50,

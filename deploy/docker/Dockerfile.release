@@ -24,8 +24,8 @@ ARG TARGETVARIANT
 COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy /usr/bin/caddy
 COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
 RUN setcap cap_net_bind_service=+ep /usr/bin/caddy \
- && mkdir -p /data /config /run/caddy /run/sentinel-token /var/lib/caddy-sentinel /srv /etc/caddy/sites \
- && chown -R caddy:caddy /data /config /run/caddy /run/sentinel-token /etc/caddy /srv
+ && mkdir -p /data /config /run/caddy /run/sentinel-token /run/sentinel-staging /var/lib/caddy-sentinel /srv /etc/caddy/sites /var/log/caddy \
+ && chown -R caddy:caddy /data /config /run/caddy /run/sentinel-token /run/sentinel-staging /etc/caddy /srv /var/log/caddy
 ENV XDG_DATA_HOME=/data \
     XDG_CONFIG_HOME=/config \
     SENTINEL_PANEL=http://panel:7600 \
@@ -47,8 +47,9 @@ COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy-sentinel /usr/bin/caddy-sent
 # Caddy-Binary für "caddy validate"/"caddy fmt" im Editor
 COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/caddy /usr/bin/caddy
 COPY dist/linux_${TARGETARCH}${TARGETVARIANT}/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
-RUN mkdir -p /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy \
- && chown -R caddy:caddy /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data
+# /run/sentinel-staging: Prüf-Kopien (eigenes Volume, Caddy hängt es nur lesend ein)
+RUN mkdir -p /run/sentinel-token /run/sentinel-staging /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy /var/log/caddy \
+ && chown -R caddy:caddy /run/sentinel-token /run/sentinel-staging /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data /var/log/caddy
 ENV SENTINEL_LISTEN=0.0.0.0:7600 \
     SENTINEL_DATA=/var/lib/caddy-sentinel \
     SENTINEL_CADDY_ADMIN=unix//run/caddy/admin.sock \

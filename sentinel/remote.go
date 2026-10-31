@@ -5,10 +5,12 @@ package sentinel
 // connection only – the remote host needs no open port) and executes a fixed
 // set of operations:
 //
-//   read mode (default): read the running config, upstream health, metrics,
-//   adapt (validate) a Caddyfile, read certificates (never private keys).
+//   read mode (default): read the running config (secrets such as DNS
+//   provider tokens are blanked before they leave the server), upstream
+//   health, metrics, certificates (never private keys).
 //   full mode (opt-in, needs `caddyfile`): additionally list/read/write the
-//   Caddyfile and its imports, load a new config and run `caddy validate`.
+//   Caddyfile and its imports, adapt and load a new config and run
+//   `caddy validate`.
 
 import (
 	"bytes"
@@ -18,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,6 +30,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 
 	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/cfgws"
@@ -38,6 +42,9 @@ type remoteCfg struct {
 	caddyfile string
 	admin     string
 	ws        *cfgws.Workspace
+	// storage is Caddy's configured certificate storage (global option
+	// `storage`); nil or file system = the data directory is read directly
+	storage certmagic.Storage
 }
 
 func newRemoteCfg(mode, caddyfile, admin string) (*remoteCfg, error) {
@@ -50,7 +57,12 @@ func newRemoteCfg(mode, caddyfile, admin string) (*remoteCfg, error) {
 		return nil, fmt.Errorf("sentinel: remote must be off, read or full")
 	}
 	if admin == "" {
-		admin = "http://localhost:2019"
+		// Caddy's own default: localhost:2019 or the CADDY_ADMIN variable
+		// (e.g. unix//run/caddy/admin.sock|0660)
+		admin = caddy.DefaultAdminListen
+	}
+	if !strings.Contains(admin, "://") && !strings.HasPrefix(admin, "unix/") {
+		admin = "http://" + admin
 	}
 	rc := &remoteCfg{mode: mode, caddyfile: caddyfile, admin: strings.TrimRight(admin, "/")}
 	if mode == "full" {
@@ -217,13 +229,20 @@ func (c *core) runOp(ctx context.Context, rc *remoteCfg, op string, args json.Ra
 		if err := adminAllowed(a, full); err != nil {
 			return nil, err
 		}
-		return c.callAdmin(ctx, rc, a)
+		rep, err := c.callAdmin(ctx, rc, a)
+		// mode "read": the panel sees the running configuration without its
+		// secrets (DNS tokens, upstream credentials …) – a compromised panel
+		// learns nothing it could use against this server
+		if err == nil && !full && a.Method == http.MethodGet && strings.HasPrefix(a.Path, "/config") && rep.Status == http.StatusOK {
+			rep.Body = protocol.RedactConfigPath(strings.TrimPrefix(a.Path, "/config"), rep.Body)
+		}
+		return rep, err
 	case "data.files":
 		var a struct {
 			PKI bool `json:"pki"`
 		}
 		_ = json.Unmarshal(args, &a)
-		return readDataFiles(a.PKI)
+		return readDataFiles(ctx, rc.storage, a.PKI)
 	case "ws.files":
 		if err := needFull(); err != nil {
 			return nil, err
@@ -290,6 +309,11 @@ func adminAllowed(a protocol.AdminCall, full bool) error {
 	case a.Method == http.MethodGet && (strings.HasPrefix(p, "/config/") || p == "/config" || p == "/reverse_proxy/upstreams" || p == "/metrics" || strings.HasPrefix(p, "/pki/")):
 		return nil
 	case a.Method == http.MethodPost && p == "/adapt":
+		// adapting resolves {$ENV} variables and imports of any readable
+		// file – only for panels that may manage the configuration anyway
+		if !full {
+			return errNeedFull
+		}
 		return nil
 	case a.Method == http.MethodPost && p == "/load":
 		if !full {
@@ -302,16 +326,41 @@ func adminAllowed(a protocol.AdminCall, full bool) error {
 
 var adminClient = &http.Client{Timeout: 90 * time.Second}
 
+// adminSocket returns the socket path of a unix admin address
+// ("unix//run/caddy/admin.sock|0660" -> "/run/caddy/admin.sock").
+func adminSocket(admin string) (string, bool) {
+	p, ok := strings.CutPrefix(admin, "unix/")
+	if !ok {
+		return "", false
+	}
+	if i := strings.LastIndexByte(p, '|'); i >= 0 {
+		p = p[:i]
+	}
+	return p, true
+}
+
 func (c *core) callAdmin(ctx context.Context, rc *remoteCfg, a protocol.AdminCall) (*protocol.AdminReply, error) {
-	req, err := http.NewRequestWithContext(ctx, a.Method, rc.admin+a.Path, bytes.NewReader(a.Body))
+	base, client := rc.admin, adminClient
+	sock, unix := adminSocket(rc.admin)
+	if unix {
+		base = "http://localhost"
+		client = &http.Client{Timeout: adminClient.Timeout, Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sock)
+			}}}
+	}
+	req, err := http.NewRequestWithContext(ctx, a.Method, base+a.Path, bytes.NewReader(a.Body))
 	if err != nil {
 		return nil, err
 	}
 	if a.CType != "" {
 		req.Header.Set("Content-Type", a.CType)
 	}
-	req.Header.Set("Origin", rc.admin)
-	resp, err := adminClient.Do(req)
+	if !unix {
+		req.Header.Set("Origin", rc.admin)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("Caddy-Admin-API (%s) nicht erreichbar: %w", rc.admin, err)
 	}
@@ -326,10 +375,50 @@ func (c *core) callAdmin(ctx context.Context, rc *remoteCfg, a protocol.AdminCal
 // readDataFiles returns certificates (public parts only) and the ACME server
 // databases from Caddy's data directory, so the panel can show certificate
 // status and the internal CA of this server.
-func readDataFiles(withPKI bool) (map[string][]byte, error) {
+func readDataFiles(ctx context.Context, storage certmagic.Storage, withPKI bool) (map[string][]byte, error) {
 	root := caddy.AppDataDir()
+	if fs, ok := storage.(*certmagic.FileStorage); ok && fs.Path != "" {
+		root = fs.Path
+	}
 	out := map[string][]byte{}
 	total := 0
+	// another storage (database, S3, Consul …): certificates and CA
+	// certificates through the storage API, never keys
+	if storage != nil {
+		if _, isFile := storage.(*certmagic.FileStorage); !isFile {
+			for _, prefix := range []string{"certificates", "pki/authorities"} {
+				keys, err := storage.List(ctx, prefix, true)
+				if err != nil {
+					continue
+				}
+				for _, k := range keys {
+					if len(out) >= 5000 || total > 96<<20 {
+						break
+					}
+					if !(strings.HasSuffix(k, ".crt") && (prefix == "certificates" || strings.HasSuffix(k, "/root.crt") || strings.HasSuffix(k, "/intermediate.crt"))) {
+						continue
+					}
+					if b, err := storage.Load(ctx, k); err == nil && len(b) <= 1<<20 {
+						out[k] = b
+						total += len(b)
+					}
+				}
+			}
+			root = caddy.AppDataDir() // ACME server databases stay local files
+			if withPKI {
+				m, _ := filepath.Glob(filepath.Join(root, "acme_server", "*", "db"))
+				for _, p := range m {
+					if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() && st.Size() <= 32<<20 {
+						if b, err := readLocked(p); err == nil {
+							rel, _ := filepath.Rel(root, p)
+							out[filepath.ToSlash(rel)] = b
+						}
+					}
+				}
+			}
+			return out, nil
+		}
+	}
 	add := func(p string, limit int) {
 		st, err := os.Stat(p)
 		if err != nil || !st.Mode().IsRegular() || st.Size() > int64(limit) || total > 96<<20 {

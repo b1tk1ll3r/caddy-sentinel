@@ -43,9 +43,9 @@ echo "==> Caddy mit Sentinel-Modul (Caddy ${CADDY_VERSION})"
 echo "==> Sentinel-Panel"
 (
   cd "$ROOT/panel"
-  if [ "${PINNED:-0}" != "1" ]; then
-    go get github.com/corazawaf/coraza/v3@latest github.com/corazawaf/coraza-coreruleset/v4@latest
-  fi
+  # dieselben Caddy-, Coraza- und CRS-Versionen wie im Caddy-Build (das Panel
+  # nutzt den Caddyfile-Adapter und Coraza selbst)
+  upgrade
   go mod tidy
   CGO_ENABLED=1 go build -trimpath -tags coraza.disabled_operators.inspectFile -ldflags "-s -w -X ${MOD}/panel/internal/core.Version=${VERSION}" -o "$OUT/caddy-sentinel" .
 )

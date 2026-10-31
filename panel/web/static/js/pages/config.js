@@ -403,7 +403,22 @@ export async function render(root, _p, scope) {
         label: 'Prüfen und übernehmen', kind: 'primary', onClick: async () => {
           const filesToSend = {};
           for (const p of d) filesToSend[p] = buffers[p];
-          const res = await post('/config/apply', { files: filesToSend, delete: [...deleted], note: note.value });
+          // the state each file was loaded in: changed by someone else since
+          // then → conflict instead of silently overwriting their work
+          const base = {};
+          for (const p of [...d, ...deleted]) if (orig[p] !== undefined) base[p] = orig[p];
+          const body = { files: filesToSend, delete: [...deleted], note: note.value, base };
+          let res;
+          try {
+            res = await post('/config/apply', body);
+          } catch (e) {
+            if (e.status !== 409) throw e;
+            const force = await confirmDialog('Datei inzwischen geändert',
+              `${e.message}. Jemand hat die Datei geändert, seit du sie geöffnet hast. Überschreiben verwirft diese Änderungen (sie bleiben im Versionsverlauf). Zum Vergleichen abbrechen und die Seite neu laden – deine Änderungen vorher kopieren.`,
+              'Trotzdem überschreiben');
+            if (!force) return true;
+            res = await post('/config/apply', { ...body, force: true });
+          }
           lastValidation = res;
           drawDiagnostics();
           if (!res.applied) {

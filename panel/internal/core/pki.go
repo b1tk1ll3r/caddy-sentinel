@@ -237,7 +237,7 @@ func (e *Engine) PKI(ctx context.Context, inst string) ([]*PKIAuthority, error) 
 	if inst == "" {
 		inst = LocalInstance
 	}
-	root, err := e.storageRoot(ctx, inst, true)
+	root, _, err := e.certRoot(ctx, inst, true)
 	if err != nil {
 		return nil, err
 	}
@@ -451,6 +451,13 @@ func acmeDBKey(id string) string {
 
 // readACMEDB opens a snapshot copy of step-ca's bbolt database.
 func readACMEDB(dbPath string) (issued []IssuedCert, intermediates []*x509.Certificate, err error) {
+	// bbolt asserts with a panic on corrupt files – a mirrored file comes
+	// from a remote agent and must not crash the panel
+	defer func() {
+		if r := recover(); r != nil {
+			issued, intermediates, err = nil, nil, fmt.Errorf("Datenbank beschädigt: %v", r)
+		}
+	}()
 	tmp, err := os.CreateTemp("", "sentinel-acmedb-*")
 	if err != nil {
 		return nil, nil, err

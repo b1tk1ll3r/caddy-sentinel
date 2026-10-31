@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,15 +34,54 @@ func newAgentRegistry() *agentRegistry {
 	return &agentRegistry{agents: map[string]*AgentInfo{}, errs: map[string]string{}}
 }
 
+// maxAgentsPerInst bounds the registry per instance: an agent that
+// reports a new ID with every batch must not grow it without limit.
+const maxAgentsPerInst = 32
+
 func (r *agentRegistry) update(st protocol.AgentStatus, remote, inst string) (errChanged bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	st.ID = truncateStr(st.ID, 128)
 	id := st.ID
 	if id == "" {
 		id = remote
 	}
 	id = inst + "|" + id
-	r.agents[id] = &AgentInfo{AgentStatus: st, LastSeen: time.Now().Unix(), Addr: remote, Inst: inst}
+	now := time.Now().Unix()
+	if _, known := r.agents[id]; !known {
+		// forget nodes of this instance not seen for a day, then the
+		// oldest one if the instance is still at its limit
+		n, oldest, oldestKey := 0, int64(0), ""
+		for k, a := range r.agents {
+			if a.Inst != inst {
+				continue
+			}
+			if now-a.LastSeen > 86400 {
+				delete(r.agents, k)
+				delete(r.errs, k)
+				continue
+			}
+			n++
+			if oldestKey == "" || a.LastSeen < oldest {
+				oldest, oldestKey = a.LastSeen, k
+			}
+		}
+		if n >= maxAgentsPerInst && oldestKey != "" {
+			delete(r.agents, oldestKey)
+			delete(r.errs, oldestKey)
+		}
+	}
+	if len(st.Errors) > 50 {
+		keep := make(map[string]string, 50)
+		for k, v := range st.Errors {
+			if len(keep) == 50 {
+				break
+			}
+			keep[truncateStr(k, 128)] = truncateStr(v, 1024)
+		}
+		st.Errors = keep
+	}
+	r.agents[id] = &AgentInfo{AgentStatus: st, LastSeen: now, Addr: remote, Inst: inst}
 	b, _ := json.Marshal(st.Errors)
 	if r.errs[id] != string(b) {
 		r.errs[id] = string(b)
@@ -123,7 +163,7 @@ func newLiveStats() *liveStats {
 }
 
 func statusClass(s int) string {
-	if s < 100 {
+	if s < 100 || s > 599 {
 		return "other"
 	}
 	return fmt.Sprintf("%dxx", s/100)
@@ -276,14 +316,23 @@ func (t *eventThrottle) allow(key string, every time.Duration) (bool, int) {
 func (e *Engine) Ingest(b *protocol.Ingest, remote, inst string) error {
 	now := time.Now()
 	if e.agents.update(b.Agent, remote, inst) {
-		detail, _ := json.Marshal(b.Agent.Errors)
-		e.AddEvent(store.Event{Type: "agent", Severity: 3, Inst: inst, Title: e.instLabel(inst) + "Agent " + b.Agent.ID + " meldet Policy-Fehler", Detail: detail}, true)
+		// at most one event per agent and 10 minutes (an error list that
+		// changes with every batch must not flood the notifications)
+		if ok, _ := throttle.allow("agenterr|"+inst+"|"+truncateStr(b.Agent.ID, 128), 10*time.Minute); ok {
+			detail, _ := json.Marshal(b.Agent.Errors)
+			e.AddEvent(store.Event{Type: "agent", Severity: 3, Inst: inst, Title: e.instLabel(inst) + "Agent " + truncateStr(b.Agent.ID, 128) + " meldet Policy-Fehler", Detail: detail}, true)
+		}
 	}
 	for i := range b.Counters {
+		sanitizeCounter(&b.Counters[i])
 		b.Counters[i].Inst = inst
 	}
+	minT, maxT := now.Add(-time.Duration(max(e.Settings().Retention.RequestsHours, 1))*time.Hour).UnixMilli(), now.Add(5*time.Minute).UnixMilli()
 	for i := range b.Requests {
+		sanitizeRequest(&b.Requests[i], minT, maxT, now.UnixMilli())
 		b.Requests[i].Inst = inst
+		// agents of older versions report query strings unredacted
+		b.Requests[i].Query = protocol.RedactQuery(b.Requests[i].Path, b.Requests[i].Query)
 	}
 	if err := e.Store.IngestBatch(b.Batch, now.Unix()/60, b.Counters, b.Requests); err != nil {
 		if errors.Is(err, store.ErrDuplicateBatch) {
@@ -303,6 +352,82 @@ func (e *Engine) Ingest(b *protocol.Ingest, remote, inst string) error {
 		e.log.Warn("agent dropped telemetry records", "agent", b.Agent.ID, "dropped", b.Dropped)
 	}
 	return nil
+}
+
+// sanitizeRequest bounds what an agent can store with one record: the
+// time stamp lies within the retention window (records from the future
+// would escape pruning), the fields have sane lengths and unknown actions
+// are folded into "other" (each distinct value is a metrics series).
+func sanitizeRequest(r *protocol.Request, minT, maxT, now int64) {
+	if r.T < minT || r.T > maxT {
+		r.T = now
+	}
+	r.Host = truncateStr(r.Host, 255)
+	r.Method = truncateStr(r.Method, 16)
+	r.Path = truncateStr(r.Path, 2048)
+	r.Query = truncateStr(r.Query, 2048)
+	r.IP = truncateStr(r.IP, 64)
+	r.UA = truncateStr(r.UA, 512)
+	r.Referer = truncateStr(r.Referer, 1024)
+	r.Proto = truncateStr(r.Proto, 16)
+	r.Policy = truncateStr(r.Policy, 64)
+	r.Country = truncateStr(r.Country, 8)
+	r.ASOrg = truncateStr(r.ASOrg, 128)
+	r.User = truncateStr(r.User, 256)
+	r.Rule = truncateStr(r.Rule, 64)
+	r.Detail = truncateStr(r.Detail, 1024)
+	r.Ref = truncateStr(r.Ref, 64)
+	r.Why = truncateStr(r.Why, 1024)
+	if !protocol.KnownAction(r.Action) {
+		r.Action = "other"
+	}
+	// control characters from the (decoded) request line would act on a
+	// terminal when an admin copies them: shown percent-encoded
+	r.Host, r.Path, r.Query, r.UA = escapeCtl(r.Host), escapeCtl(r.Path), escapeCtl(r.Query), escapeCtl(r.UA)
+	r.Referer, r.User, r.Detail, r.Why = escapeCtl(r.Referer), escapeCtl(r.User), escapeCtl(r.Detail), escapeCtl(r.Why)
+	if len(r.Hits) > 20 {
+		r.Hits = r.Hits[:20]
+	}
+	for i := range r.Hits {
+		h := &r.Hits[i]
+		h.Msg, h.Data = truncateStr(h.Msg, 512), truncateStr(h.Data, 512)
+		if len(h.Tags) > 16 {
+			h.Tags = h.Tags[:16]
+		}
+		for j := range h.Tags {
+			h.Tags[j] = truncateStr(h.Tags[j], 128)
+		}
+	}
+}
+
+// escapeCtl replaces C0/C1 control characters and DEL with %XX.
+func escapeCtl(s string) string {
+	if !strings.ContainsFunc(s, isCtl) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if isCtl(r) {
+			fmt.Fprintf(&b, "%%%02X", r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func isCtl(r rune) bool { return r < 0x20 || r >= 0x7f && r <= 0x9f }
+
+// sanitizeCounter: see sanitizeRequest.
+func sanitizeCounter(c *protocol.Counter) {
+	c.Host = truncateStr(c.Host, 255)
+	c.Policy = truncateStr(c.Policy, 64)
+	if !protocol.KnownAction(c.Action) {
+		c.Action = "other"
+	}
+	if c.Status < 0 || c.Status > 999 {
+		c.Status = 0
+	}
 }
 
 func (e *Engine) securityEvents(reqs []protocol.Request) {
@@ -335,7 +460,7 @@ func (e *Engine) securityEvents(reqs []protocol.Request) {
 		default:
 			continue
 		}
-		ok, suppressed := throttle.allow(typ+"|"+r.IP+"|"+r.Host, 20*time.Second)
+		ok, suppressed := throttle.allow(typ+"|"+r.IP, 20*time.Second) // per client: varying Host headers do not open new slots
 		if !ok {
 			continue
 		}
@@ -344,7 +469,7 @@ func (e *Engine) securityEvents(reqs []protocol.Request) {
 			d["suppressed"] = suppressed
 		}
 		detail, _ := json.Marshal(d)
-		evs = append(evs, store.Event{TS: r.T, Type: typ, Severity: sev, IP: r.IP, Host: r.Host, Policy: r.Policy, Title: title, Detail: detail})
+		evs = append(evs, store.Event{TS: r.T, Type: typ, Severity: sev, IP: r.IP, Host: r.Host, Policy: r.Policy, Inst: r.Inst, Title: title, Detail: detail})
 	}
 	if len(evs) > 0 {
 		_ = e.Store.AddEvents(evs)

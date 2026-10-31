@@ -1,4 +1,4 @@
-import { el, mount, get, post, put, del, qs, panel, tabs, empty, fmtInt, fmtCompact, fmtUntil, fmtAgo, fmtDateTime, ipLink, rangeState, toast, errToast, modal, field, select, confirmDialog, debounce, ACTIONS, actionLabel, can } from '../ui.js';
+import { el, mount, get, post, put, del, qs, panel, tabs, empty, fmtInt, fmtCompact, fmtUntil, fmtAgo, fmtDateTime, ipLink, rangeState, toast, errToast, modal, field, select, confirmDialog, debounce, ACTIONS, actionLabel, can, NON_BLOCKING, instChip } from '../ui.js';
 import { tempPanelBody, tempDialog } from '../temp.js';
 import { timeChart } from '../charts.js';
 import { kpi, eventList, topTable, seg } from '../widgets.js';
@@ -6,7 +6,7 @@ import { bus } from '../app.js';
 
 const SIGNAL_LABEL = {
   waf_block: 'WAF-Blocks', waf_detect: 'WAF-Treffer', honeypot: 'Honeypot', not_found: '404-Scans', auth_fail: 'Auth-Fehler', bad_request: 'Fehlerhafte Requests',
-  scanner_ua: 'Scanner-Tool', rate_limit: 'Ratelimit', user_agent: 'Gesperrter UA', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß', geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed', challenge: 'Bot-Challenge',
+  scanner_ua: 'Scanner-Tool', rate_limit: 'Ratelimit', user_agent: 'Gesperrter UA', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß', geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed', challenge: 'Bot-Challenge', path_block: 'Pfad-Sperre', bot_fake: 'Falscher Suchmaschinen-Bot', bot: 'Crawler',
 };
 
 export async function render(root, _p, scope, q) {
@@ -27,13 +27,13 @@ async function overview(body, scope) {
   const q = qs({ range: rangeState.value });
   const [ov, sc, bansList, rules, paths] = await Promise.all([
     get('/stats/overview' + q, scope.signal), get('/security/scores?n=12', scope.signal), get('/bans', scope.signal),
-    get('/stats/rules' + q + '&limit=10', scope.signal), get('/stats/top' + q + '&dim=path,ip&action=any&limit=10', scope.signal),
+    get('/stats/rules' + q + '&limit=10', scope.signal), get('/stats/top' + q + '&dim=path,ip&action=blocked&limit=10', scope.signal),
   ]);
   const c = ov.current;
-  const series = [{ label: 'Blockiert', color: 'var(--series-4)', values: c.series.map(x => x.blocked) }];
+  const series = [{ label: 'Blockiert', color: 'var(--c-blocked)', values: c.series.map(x => x.blocked) }];
   const st = window.__status || {};
   mount(body,
-    st.ids_dry_run ? el('div.callout.warn', null, 'Das IDS läuft im Testmodus: Es meldet, sperrt aber niemanden. Umschalten unter ', el('a', { href: '#/settings' }, 'Einstellungen'), '.') : null,
+    st.ids_dry_run ? el('div.callout.warn', null, 'Das IDS läuft im Testmodus: Es meldet, sperrt aber niemanden. Umschalten unter ', el('a', { href: '#/settings?tab=ids' }, 'Einstellungen › Bedrohungserkennung'), '.') : null,
     !st.ids_enabled ? el('div.callout.bad', null, 'Die automatische Bedrohungserkennung ist ausgeschaltet.') : null,
     el('div.kpis', null,
       kpi('Aktive Sperren', fmtInt(bansList.length), { kind: bansList.length ? 'warn' : '' }),
@@ -45,10 +45,12 @@ async function overview(body, scope) {
       kpi('Geo & Feeds', fmtCompact((c.by_action?.geo_block || 0) + (c.by_action?.feed_block || 0))),
       kpi('Bot-Challenges', fmtCompact(c.by_action?.challenge || 0), { sub: (c.by_action?.challenge_pass ? ` · ${fmtCompact(c.by_action.challenge_pass)} gelöst` : '') }),
       kpi('Beobachtete IPs', fmtInt(st.tracked_ips || 0))),
-    el('div.grid.g-main', null,
-      panel('Blockierte Requests', timeChart({ series, t: c.series.map(x => x.t), kind: 'bar', height: 200, yFormat: fmtCompact })),
+    el('div.grid.g-main.g-top', null,
+      panel('Blockierte Requests', timeChart({ series, t: c.series.map(x => x.t), kind: 'bar', height: 260, yFormat: fmtCompact, label: 'Blockierte Requests über die Zeit' })),
       panel('Eingriffe nach Art', Object.keys(c.by_action || {}).length ? el('table', null, el('tbody', null,
-        Object.entries(c.by_action).sort((a, b) => b[1] - a[1]).map(([a, n]) => el('tr', null, el('td', null, actionLabel(a)), el('td.num', null, fmtInt(n)))))) : empty('Keine Eingriffe'))),
+        Object.entries(c.by_action).sort((a, b) => (NON_BLOCKING.has(a[0]) - NON_BLOCKING.has(b[0])) || b[1] - a[1]).map(([a, n]) => el('tr', null,
+          el('td', null, el('span.badge.' + (a === 'waf_detect' ? 'warn' : NON_BLOCKING.has(a) ? 'info' : 'bad'), null, actionLabel(a))),
+          el('td.num', null, el('a', { href: '#/analytics?action=' + encodeURIComponent(a) }, fmtInt(n))))))) : empty('Keine Eingriffe'))),
     el('div.grid.g2', null,
       panel('Auffälligste Clients', scoreTable(sc), el('a', { href: '#/security?tab=scores' }, 'Alle')),
       panel('Häufigste WAF-Regeln', rules.length ? el('div.table-wrap', null, el('table', null,
@@ -57,7 +59,7 @@ async function overview(body, scope) {
           el('td.num', null, fmtInt(r.count)), el('td.num', null, fmtInt(r.blocked)),
           el('td', null, el('a', { href: '#/policies?exclude=' + r.id, title: 'Fehlalarm? Regel in einer Policy ausnehmen' }, 'ausnehmen'))))))) : empty('Keine WAF-Treffer'))),
     el('div.grid.g2', null,
-      panel('Angegriffene Pfade', topTable(paths.path, { label: 'Pfad', onPick: (p) => { location.hash = '#/analytics?action=any&path=' + encodeURIComponent(p); } })),
+      panel('Angegriffene Pfade', topTable(paths.path, { label: 'Pfad', onPick: (p) => { location.hash = '#/analytics?action=blocked&path=' + encodeURIComponent(p); } })),
       panel('Angreifende IPs', topTable(paths.ip, { label: 'IP', render: (ip) => el('span.mono', null, ip), onPick: (ip) => { location.hash = '#/ip/' + ip; } }))),
   );
 }
@@ -108,15 +110,16 @@ async function bans(body, scope) {
       el('td', null, b.ip.includes('/') ? el('span.mono', null, b.ip) : ipLink(b.ip)),
       el('td', null, b.reason, el('div', null, b.note ? el('small', null, '📝 ' + b.note + (b.author ? ' (' + b.author + ')' : '')) : null,
         can('bans') ? el('a.small-link', { href: '#', onclick: (e) => { e.preventDefault(); noteDialog(b, () => bans(body, scope)); } }, b.note ? ' ändern' : '+ Notiz') : null)),
-      el('td', null, el('span.badge' + (b.source === 'ids' ? '.bad' : b.source === 'manual' ? '.primary' : ''), null, { ids: 'IDS', manual: 'manuell', rate: 'Ratelimit' }[b.source] || b.source)),
+      el('td', null, el('span.badge' + (b.source === 'ids' ? '.bad' : b.source === 'manual' ? '.primary' : ''), null, { ids: 'IDS', manual: 'manuell', rate: 'Ratelimit' }[b.source] || b.source),
+        b.inst ? el('div', { title: 'Gilt nur auf dieser Caddy-Instanz: Die Punkte stammen allein aus deren Meldungen.' }, el('small', null, 'nur '), instChip(b.inst, { always: true })) : null),
       el('td.nowrap', { title: fmtDateTime(b.created * 1000) }, fmtAgo(b.created * 1000)),
       el('td.nowrap', null, fmtUntil(b.until)),
       el('td.num', null, b.bans || 1),
-      el('td', null, el('button.btn.sm', { onclick: () => unban(b.ip) }, 'Aufheben'))))))) : empty('Keine aktiven Sperren', 'Gesperrte IPs erhalten sofort 403 auf allen Sites mit Sentinel.'));
+      el('td', null, can('bans') ? el('button.btn.sm', { onclick: () => unban(b.ip) }, 'Aufheben') : null)))))) : empty('Keine aktiven Sperren', 'Gesperrte IPs erhalten sofort 403 auf allen Sites mit Sentinel.'));
   const pols = (await get('/policies', scope.signal)).policies;
   const temp = tempPanelBody('', Object.fromEntries(pols.map(p => [p.id, p.name])), scope.signal);
   mount(body,
-    panel(`Aktive Sperren (${list.length})`, box, el('button.btn.primary', { onclick: () => banDialog(() => bans(body, scope)) }, 'IP sperren')),
+    panel(`Aktive Sperren (${list.length})`, box, can('bans') ? el('button.btn.primary', { onclick: () => banDialog(() => bans(body, scope)) }, 'IP sperren') : null),
     panel('Befristete Freigaben und Sperren', el('div.stack', null,
       el('p.muted', { style: { margin: 0 } }, 'Einträge mit Enddatum: global „vertrauenswürdig“ (alle Prüfungen übersprungen, z. B. für einen Pentest) oder „nie sperren“, pro Policy Erlaubt- und Sperrliste. Sie laufen von selbst ab.'),
       temp), can('bans') ? el('button.btn', { onclick: () => tempDialog({ policies: pols, onDone: () => temp.reload() }, modal) }, 'Befristet eintragen …') : null));

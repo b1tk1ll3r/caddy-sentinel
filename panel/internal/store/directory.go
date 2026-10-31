@@ -52,21 +52,25 @@ CREATE TABLE IF NOT EXISTS dir_tombstones (
 }
 
 type DirUser struct {
-	Username    string   `json:"username"`
-	Display     string   `json:"display"`
-	Email       string   `json:"email"`
-	DN          string   `json:"dn"`
-	Groups      []string `json:"groups"`
-	TOTPSecret  string   `json:"-"`
-	TOTPEnabled bool     `json:"totp_enabled"`
-	TOTPLast    int64    `json:"-"` // last accepted time step (replay protection)
-	Created     int64    `json:"created"`
-	LastLogin   int64    `json:"last_login"`
-	LastIP      string   `json:"last_ip"`
-	LastHost    string   `json:"last_host"`
-	Logins      int      `json:"logins"`
-	Disabled    bool     `json:"disabled"`
-	Revoked     int64    `json:"revoked"` // sessions issued before are invalid
+	Username string   `json:"username"`
+	Display  string   `json:"display"`
+	Email    string   `json:"email"`
+	DN       string   `json:"dn"`
+	Groups   []string `json:"groups"`
+	// GroupDNs: full DNs of the directory groups (only source "ldap").
+	GroupDNs []string `json:"group_dns,omitempty"`
+	// Subject: stable, never reused OIDC subject of the account.
+	Subject     string `json:"-"`
+	TOTPSecret  string `json:"-"`
+	TOTPEnabled bool   `json:"totp_enabled"`
+	TOTPLast    int64  `json:"-"` // last accepted time step (replay protection)
+	Created     int64  `json:"created"`
+	LastLogin   int64  `json:"last_login"`
+	LastIP      string `json:"last_ip"`
+	LastHost    string `json:"last_host"`
+	Logins      int    `json:"logins"`
+	Disabled    bool   `json:"disabled"`
+	Revoked     int64  `json:"revoked"` // sessions issued before are invalid
 	// Source: "ldap" (directory), "local" (password in Sentinel) or
 	// "oidc:<provider>" (OAuth2/OIDC).
 	Source    string `json:"source"`
@@ -80,15 +84,17 @@ type DirUser struct {
 	// Recovery holds SHA-256 hashes of unused recovery codes.
 	Recovery     []string `json:"-"`
 	RecoveryLeft int      `json:"recovery_left"`
+	// Passkeys is filled in by the API (number of registered passkeys).
+	Passkeys int `json:"passkeys"`
 }
 
-const dirCols = `username,display,email,dn,groups,totp_secret,totp_enabled,totp_last,created,last_login,last_ip,last_host,logins,disabled,revoked,source,pw_hash,expires,note,created_by,must_change,pw_changed,recovery`
+const dirCols = `username,display,email,dn,groups,totp_secret,totp_enabled,totp_last,created,last_login,last_ip,last_host,logins,disabled,revoked,source,pw_hash,expires,note,created_by,must_change,pw_changed,recovery,subject,group_dns`
 
 func scanDirUser(row interface{ Scan(...any) error }) (*DirUser, error) {
 	u := &DirUser{}
-	var groups, rec string
+	var groups, rec, gdns string
 	var en, dis, mc int
-	err := row.Scan(&u.Username, &u.Display, &u.Email, &u.DN, &groups, &u.TOTPSecret, &en, &u.TOTPLast, &u.Created, &u.LastLogin, &u.LastIP, &u.LastHost, &u.Logins, &dis, &u.Revoked, &u.Source, &u.PWHash, &u.Expires, &u.Note, &u.CreatedBy, &mc, &u.PWChanged, &rec)
+	err := row.Scan(&u.Username, &u.Display, &u.Email, &u.DN, &groups, &u.TOTPSecret, &en, &u.TOTPLast, &u.Created, &u.LastLogin, &u.LastIP, &u.LastHost, &u.Logins, &dis, &u.Revoked, &u.Source, &u.PWHash, &u.Expires, &u.Note, &u.CreatedBy, &mc, &u.PWChanged, &rec, &u.Subject, &gdns)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -99,6 +105,7 @@ func scanDirUser(row interface{ Scan(...any) error }) (*DirUser, error) {
 	if u.Groups == nil {
 		u.Groups = []string{}
 	}
+	_ = json.Unmarshal([]byte(gdns), &u.GroupDNs)
 	u.TOTPEnabled, u.Disabled, u.MustChange = en == 1, dis == 1, mc == 1
 	_ = json.Unmarshal([]byte(rec), &u.Recovery)
 	u.RecoveryLeft = len(u.Recovery)
@@ -128,13 +135,14 @@ func (s *Store) DirUsers() ([]DirUser, error) {
 
 // UpsertDirUser stores the directory attributes after a successful bind.
 func (s *Store) UpsertDirUser(u *DirUser) error {
-	g, _ := json.Marshal(u.Groups)
+	g, _ := json.Marshal(nonNil(u.Groups))
+	gd, _ := json.Marshal(nonNil(u.GroupDNs))
 	if cur, err := s.DirUser(u.Username); err == nil && cur.Source != SourceLDAP {
 		return errors.New("der Name gehört zu einem Konto aus einer anderen Quelle (" + cur.Source + ")")
 	}
-	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,dn,groups,created,source) VALUES(?,?,?,?,?,?,'ldap')
-		ON CONFLICT(username) DO UPDATE SET display=excluded.display, email=excluded.email, dn=excluded.dn, groups=excluded.groups`,
-		strings.ToLower(u.Username), u.Display, u.Email, u.DN, string(g), time.Now().Unix())
+	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,dn,groups,group_dns,created,source,subject) VALUES(?,?,?,?,?,?,?,'ldap',?)
+		ON CONFLICT(username) DO UPDATE SET display=excluded.display, email=excluded.email, dn=excluded.dn, groups=excluded.groups, group_dns=excluded.group_dns`,
+		strings.ToLower(u.Username), u.Display, u.Email, u.DN, string(g), string(gd), time.Now().Unix(), NewSubject())
 	return err
 }
 
@@ -147,6 +155,11 @@ func (s *Store) DirSetTOTP(name, secret string, enabled bool) error {
 	en := 0
 	if enabled {
 		en = 1
+	}
+	if secret == "" && !enabled {
+		// 2FA reset: the recovery codes belong to the old device setup
+		_, err := s.Exec(`UPDATE dir_users SET totp_secret='', totp_enabled=0, totp_last=0, recovery='[]' WHERE username=?`, strings.ToLower(name))
+		return err
 	}
 	_, err := s.Exec(`UPDATE dir_users SET totp_secret=?, totp_enabled=?, totp_last=0 WHERE username=?`, secret, en, strings.ToLower(name))
 	return err
@@ -172,6 +185,21 @@ func (s *Store) DirSetDisabled(name string, disabled bool) error {
 	return err
 }
 
+// DirSubject returns the stable OIDC subject of an account and assigns a
+// random one to a record that has none yet.
+func (s *Store) DirSubject(name string) (string, error) {
+	name = strings.ToLower(name)
+	if _, err := s.Exec(`UPDATE dir_users SET subject=? WHERE username=? AND subject=''`, NewSubject(), name); err != nil {
+		return "", err
+	}
+	var sub string
+	err := s.DB.QueryRow(`SELECT subject FROM dir_users WHERE username=?`, name).Scan(&sub)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return sub, err
+}
+
 // DirRevoke ends all site sessions of a user.
 func (s *Store) DirRevoke(name string) error {
 	_, err := s.Exec(`UPDATE dir_users SET revoked=? WHERE username=?`, time.Now().Unix(), strings.ToLower(name))
@@ -187,6 +215,9 @@ func (s *Store) DirDelete(name string) error {
 		return err
 	}
 	_, _ = s.Exec(`DELETE FROM dir_tombstones WHERE revoked<?`, now-90*86400)
+	_, _ = s.Exec(`DELETE FROM passkeys WHERE username=?`, strings.ToLower(name))
+	_, _ = s.Exec(`DELETE FROM oidc_refresh WHERE username=?`, name)
+	_, _ = s.Exec(`DELETE FROM oidc_consents WHERE username=?`, name)
 	_, err := s.Exec(`DELETE FROM dir_users WHERE username=?`, name)
 	return err
 }

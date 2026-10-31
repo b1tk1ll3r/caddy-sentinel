@@ -354,6 +354,14 @@ func (h *cmdHub) take(ctx context.Context, inst string, wait time.Duration) []pr
 	}
 }
 
+// waitingFor reports a pending command of an instance.
+func (h *cmdHub) waitingFor(inst, id string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	p := h.waiting[id]
+	return p != nil && p.inst == inst
+}
+
 func (h *cmdHub) resolve(inst string, res protocol.CommandResult) {
 	h.mu.Lock()
 	p := h.waiting[res.ID]
@@ -704,14 +712,16 @@ func (e *Engine) storageRoot(ctx context.Context, inst string, withPKI ...bool) 
 	busy := rt.mirroring
 	if !fresh && have && !busy {
 		rt.mirroring = true
-		go func() {
+		goSafe(e.log, "mirror refresh", func() {
+			defer func() {
+				rt.mirrorMu.Lock()
+				rt.mirroring = false
+				rt.mirrorMu.Unlock()
+			}()
 			bg, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 			_ = e.refreshMirror(bg, rt, dir, pki)
-			rt.mirrorMu.Lock()
-			rt.mirroring = false
-			rt.mirrorMu.Unlock()
-		}()
+		})
 	}
 	rt.mirrorMu.Unlock()
 	if fresh || have {
@@ -793,7 +803,13 @@ func (s *Server) handleAgentCommands(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentCommandResult(w http.ResponseWriter, r *http.Request) {
 	var res protocol.CommandResult
-	if err := json.NewDecoder(io.LimitReader(r.Body, 128<<20)).Decode(&res); err != nil {
+	// results are only taken for a command that is waiting for this
+	// instance; the limit still bounds what a single answer may hold
+	if !s.e.cmds.waitingFor(agentInst(r), r.URL.Query().Get("id")) && r.URL.Query().Get("id") != "" {
+		writeErr(w, http.StatusNotFound, "kein wartender Befehl")
+		return
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&res); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}

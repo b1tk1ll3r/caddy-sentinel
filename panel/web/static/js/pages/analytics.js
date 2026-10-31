@@ -14,9 +14,9 @@ export async function render(root, _p, scope, q) {
   const pols = (await get('/policies', scope.signal)).policies;
 
   const series = [
-    { label: 'Requests', color: 'var(--series-1)', values: [] },
-    { label: 'Fehler (4xx/5xx)', color: 'var(--series-3)', values: [] },
-    { label: 'Blockiert', color: 'var(--series-4)', values: [] },
+    { label: 'Requests', color: 'var(--c-requests)', values: [] },
+    { label: 'Fehler (4xx/5xx)', color: 'var(--c-4xx)', values: [] },
+    { label: 'Blockiert', color: 'var(--c-blocked)', values: [] },
   ];
   const chart = timeChart({ series, t: [], kind: 'area', height: 200, yFormat: fmtCompact });
   const kpis = el('div.kpis');
@@ -101,7 +101,9 @@ export async function render(root, _p, scope, q) {
 
   function exportCSV() {
     const head = ['zeit', 'host', 'methode', 'pfad', 'query', 'status', 'ip', 'land', 'asn', 'dauer_ms', 'bytes', 'aktion', 'policy', 'user_agent'];
-    const esc = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+    // values come from requests: a leading = + - @ (or tab/CR) would be
+    // read as a formula by Excel/LibreOffice, so it gets a ' in front
+    const esc = (v) => { let s = String(v ?? ''); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
     const lines = [head.join(';')].concat(reqRows.map(r => [new Date(r.t).toISOString(), r.host, r.m, r.p, r.q, r.s, r.ip, r.cc, r.asn ? 'AS' + r.asn + ' ' + (r.aso || '') : '', r.d, r.b, r.a, r.pol, r.ua].map(esc).join(';')));
     const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
     const a = el('a', { href: URL.createObjectURL(blob), download: `sentinel-requests-${Date.now()}.csv` });

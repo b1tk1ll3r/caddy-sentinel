@@ -77,13 +77,13 @@ func (s *Server) handleAccountCreate(w http.ResponseWriter, r *http.Request) {
 	if pw == "" {
 		pw, generated = generatePassword(), true
 	}
-	if len(pw) < 10 {
-		writeErr(w, 400, "Das Passwort muss mindestens 10 Zeichen haben")
+	if len(pw) < 10 || len(pw) > maxPasswordBytes {
+		writeErr(w, 400, "Das Passwort muss 10 bis 72 Zeichen haben")
 		return
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(pw), 11)
 	u := &store.DirUser{Username: name, Display: strings.TrimSpace(req.Display), Email: strings.TrimSpace(req.Email),
-		Groups: cleanList(req.Groups), Expires: req.Expires, Note: strings.TrimSpace(req.Note), CreatedBy: userFrom(r).Username}
+		Groups: withoutDNs(cleanList(req.Groups)), Expires: req.Expires, Note: strings.TrimSpace(req.Note), CreatedBy: userFrom(r).Username}
 	if err := s.e.Store.CreateLocalAccount(u, string(hash)); err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -111,7 +111,7 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	cur.Display, cur.Email, cur.Note, cur.Expires = strings.TrimSpace(req.Display), strings.TrimSpace(req.Email), strings.TrimSpace(req.Note), req.Expires
 	if cur.Source == store.SourceLocal {
-		cur.Groups = cleanList(req.Groups)
+		cur.Groups = withoutDNs(cleanList(req.Groups)) // DNs are reserved for directory groups
 	}
 	if err := s.e.Store.UpdateAccount(cur); err != nil {
 		writeErr(w, 500, err.Error())
@@ -139,8 +139,8 @@ func (s *Server) handleAccountPassword(w http.ResponseWriter, r *http.Request) {
 	if pw == "" {
 		pw, generated = generatePassword(), true
 	}
-	if len(pw) < 10 {
-		writeErr(w, 400, "Das Passwort muss mindestens 10 Zeichen haben")
+	if len(pw) < 10 || len(pw) > maxPasswordBytes {
+		writeErr(w, 400, "Das Passwort muss 10 bis 72 Zeichen haben")
 		return
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(pw), 11)
@@ -248,7 +248,7 @@ func (e *Engine) siteTokensForState() []protocol.AuthToken {
 			exp = u.Expires
 		}
 		out = append(out, protocol.AuthToken{ID: t.ID, Name: t.Name, Hash: t.Hash, User: u.Username, Display: u.Display,
-			Groups: u.Groups, Policies: t.Policies, Expires: exp})
+			Groups: accessGroups(u), Policies: t.Policies, Expires: exp})
 	}
 	return out
 }

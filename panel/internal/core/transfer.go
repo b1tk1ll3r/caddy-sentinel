@@ -103,7 +103,14 @@ func (s *Server) handlePolicyTransfer(w http.ResponseWriter, r *http.Request) {
 		want[sct] = true
 	}
 	out := []transferTarget{}
+	seen := map[string]bool{}
 	for _, tid := range req.Targets {
+		// each existing policy once (the preview costs a few clones and
+		// diffs per target; the request must not multiply that)
+		if seen[tid] || len(seen) >= 500 {
+			continue
+		}
+		seen[tid] = true
 		dst := s.e.Policy(tid)
 		if dst == nil || tid == src.ID {
 			continue

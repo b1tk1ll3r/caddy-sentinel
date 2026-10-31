@@ -27,7 +27,7 @@ Firewall mit eigenen Regelsätzen und Limits pro Site.
 - Live-Validierung über die Caddy-Admin-API (`/adapt`) mit Fehlerzeile direkt im Editor – auch für importierte Dateien; „Vollständig prüfen“ mit `caddy validate`
 - Mehrere Dateien (Caddyfile + `import`ierte `*.caddy`), Gliederung, Formatieren (`caddy fmt`, Umschalt+Alt+F), Vorlagen, „Sentinel einfügen“
 - Übernehmen ohne Neustart; lehnt Caddy die Konfiguration ab, werden die alten Dateien automatisch wiederhergestellt
-- Versionsverlauf mit Diff und Wiederherstellung, Erkennung externer Änderungen
+- Versionsverlauf mit Diff und Wiederherstellung; außerhalb des Panels geänderte Dateien erscheinen als Version „Extern geändert“
 
 **Fehleranalyse – woran scheitert eine Anfrage?**
 - Jede Anfrage im Request-Explorer, Live-Traffic und auf der IP-Seite hat eine Diagnose: wer geantwortet hat (Sentinel, Caddy, Backend oder Client), an welcher Stelle der Prüfkette sie hängen blieb, die konkrete Ursache mit Beleg (passender Sperrlisten-Eintrag, Ratelimit mit Grenze, WAF-Treffer, Geo-Treffer, fehlende Gruppe beim Site-Login, nicht erreichbares Backend …) und direkte Wege zur Lösung (Policy-Abschnitt, Pfad-Regel, Sperre aufheben, WAF-Regel ausnehmen)
@@ -129,6 +129,7 @@ Firewall mit eigenen Regelsätzen und Limits pro Site.
 - Vorlagen: Admin-Bereich, öffentlicher Bereich, Webhook, API mit Bearer-Token, Health-Check, statische Dateien, Weiterleitung, Pfad sperren, nicht indexieren
 - **Single Sign-on**: einmal anmelden, alle Sites unter einer Domain nutzen (Domain-Cookie, Abmelden überall), Gruppen und 2FA weiter pro Site geprüft
 - Kontoseite `/.sentinel/auth/me` (auch als JSON für Apps), Ratelimits pro angemeldetem Benutzer
+- **OIDC-Server**: Sentinel als Anmeldedienst (OpenID Provider) für Anwendungen wie Grafana, Nextcloud, Gitea, Proxmox oder Portainer – mit AD, Zugangskonten und OAuth-Anbietern als Quelle, zweitem Faktor, Gruppen pro Anwendung, PKCE, Zustimmungsseite, rotierenden Refresh-Tokens und Abmelden über alle Anwendungen. Die Anmeldung läuft über eine eigene Caddy-Site; das Panel bleibt intern (Handbuch Kapitel 7.14)
 
 **Betrieb**
 - Verfügbarkeits-Monitore mit Statusbalken, Uptime (24 h/7 T/30 T), Antwortzeit, Schlüsselwort- und Statusprüfung; Alarm bei Ausfall und Wiederherstellung
@@ -156,7 +157,7 @@ Kurzfassung – alle Wege (systemd, Docker Compose, selbst bauen, Updates, Rollb
 **Server mit systemd** (amd64, arm64, armv7):
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/b1tk1ll3r/caddy-sentinel/main/scripts/install.sh)
+bash <(wget -qO- https://github.com/b1tk1ll3r/caddy-sentinel/releases/latest/download/install.sh)
 ```
 
 Derselbe Befehl aktualisiert später auf die neueste Version (mit Vorabprüfung, Sicherung und automatischem Rollback). Alternativ:
@@ -177,7 +178,13 @@ docker compose up -d                   # Update: docker compose pull && docker c
 
 Danach `http://127.0.0.1:7600` öffnen (z. B. `ssh -L 7600:127.0.0.1:7600 server`) und das Admin-Konto anlegen. Konfiguration des Panels: `/etc/default/caddy-sentinel`.
 
-**GitHub Actions:** Pushes und Pull Requests laufen durch Tests und einen Test-Build (`ci.yml`). Ein Tag `v1.2.3` baut alle Binaries, erstellt das Release mit Prüfsummen und veröffentlicht beide Docker-Images (`release.yml`).
+**Getrennte Benutzer:** Caddy läuft als `caddy`, das Panel als eigener Systembenutzer `caddy-sentinel` (ohne Login, Zusatzgruppe `caddy`). Die Datenbank liegt in `/var/lib/caddy-sentinel/data` (`0700`) und ist für Caddy nicht lesbar – auch nicht über eine Caddyfile mit `file_server`. Caddy liest vom Panel nur das Agent-Token und die Prüf-Kopien, das Panel nicht Caddys private Schlüssel: Zertifikate und interne CA kommen über den Sentinel-Agenten, „Vollständig prüfen“ öffnet keine Log- und Schlüsseldateien. Ältere Installationen stellt das Update automatisch um (Rollback stellt den alten Stand wieder her). Details: [docs/INSTALL.md › Benutzer und Rechte](docs/INSTALL.md#benutzer-und-rechte).
+
+**Admin-API nur als Unix-Socket:** Caddys Admin-API lauscht nicht auf `localhost:2019` (dort könnte jeder lokale Prozess Caddy umkonfigurieren), sondern auf `/run/caddy/admin.sock` (`0660`, nur Caddy und die Gruppe `caddy`, also das Panel) – gesetzt über `CADDY_ADMIN` in der Ergänzung der Caddy-Unit. Ältere Installationen stellt das Update um. Details: [docs/INSTALL.md › Benutzer und Rechte](docs/INSTALL.md#benutzer-und-rechte).
+
+**Herkunft prüfen:** Releases enthalten eine SSH-Signatur der Prüfsummen (`SHA256SUMS.sig`). `install.sh` und `caddy-sentinel-update` prüfen sie mit dem eingebauten öffentlichen Schlüssel über `ssh-keygen -Y verify` – Pflicht, sobald ein Schlüssel hinterlegt ist (Einrichtung: [docs/INSTALL.md › Signaturschlüssel](docs/INSTALL.md#signaturschlüssel-für-releases-einrichten-einmalig)). Zusätzlich lässt `--verify-attestation` (bzw. `SENTINEL_VERIFY_ATTESTATION=1`) jedes Archiv mit `gh attestation verify` prüfen (GitHub-CLI mit Anmeldung nötig).
+
+**GitHub Actions:** Pushes und Pull Requests laufen durch Tests, `govulncheck` und einen Test-Build (`ci.yml`). Ein Tag `v1.2.3` löst die Versionen auf, prüft sie mit `govulncheck` (erreichbare Schwachstelle = kein Release), baut alle Binaries, erstellt das Release mit signierten Prüfsummen und Herkunftsnachweis und veröffentlicht beide Docker-Images (`release.yml`).
 
 ### Caddyfile
 
@@ -227,20 +234,22 @@ Wer OAuth/OIDC für den Site-Login nutzt, muss `/oauth/*` für alle Benutzer err
 Für Länder/ASN werden `.mmdb`-Dateien benötigt, z. B. kostenlos von DB-IP („IP to Country Lite“, „IP to ASN Lite“, CC BY 4.0) oder MaxMind GeoLite2 (kostenloses Konto):
 
 ```bash
-sudo install -d -o caddy -g caddy /var/lib/caddy-sentinel/geo
+sudo install -d -o caddy-sentinel -g caddy -m 2750 /var/lib/caddy-sentinel/geo
 # Dateien herunterladen und entpacken, z. B. nach
 #   /var/lib/caddy-sentinel/geo/country.mmdb und /var/lib/caddy-sentinel/geo/asn.mmdb
+# lesbar für Panel und Caddy (Gruppe caddy):
+sudo chown caddy-sentinel:caddy /var/lib/caddy-sentinel/geo/*.mmdb && sudo chmod 0640 /var/lib/caddy-sentinel/geo/*.mmdb
 ```
 
-Pfade unter *Einstellungen › Netz & Vertrauen* eintragen – sie gelten für Panel und Caddy. Auf einem separaten Caddy-Host lassen sie sich mit `geoip_country`/`geoip_asn` in der globalen `sentinel`-Option überschreiben. Ein monatliches Update per Cronjob genügt.
+Pfade unter *Einstellungen › Netz & Vertrauen* eintragen – sie gelten für Panel und Caddy (nicht nach `/var/lib/caddy-sentinel/data/` legen: das kann Caddy nicht lesen). Auf einem separaten Caddy-Host lassen sie sich mit `geoip_country`/`geoip_asn` in der globalen `sentinel`-Option überschreiben. Ein monatliches Update per Cronjob genügt.
 
 ### Zertifikate
 
-Unter *Einstellungen › Agent & Caddy* das Caddy-Datenverzeichnis angeben (Paketinstallation: `/var/lib/caddy/.local/share/caddy`). Das Panel liest nur die `.crt`-Dateien.
+Das Panel überwacht die Zertifikate von Caddy, ohne Caddys Datenverzeichnis (mit den privaten Schlüsseln) lesen zu dürfen: Der Sentinel-Agent in Caddy liefert nur die öffentlichen Teile (`.crt`, CA-Zertifikate), das Panel spiegelt sie in `/var/lib/caddy-sentinel/data/mirror/local` – genauso wie bei weiteren Caddy-Servern. Dafür muss Caddy mit `sentinel` laufen und mit dem Panel verbunden sein (Fernverwaltung nicht `off`). Kann das Panel das unter *Einstellungen › Agent & Caddy* angegebene Verzeichnis selbst lesen (z. B. Docker mit eingehängtem Volume), liest es nur die `.crt`-Dateien direkt.
 
 ### Interne CA
 
-Die Seite *Interne CA* liest `<Caddy-Datenverzeichnis>/pki/authorities/*` und die ACME-Datenbank `acme_server/<ca>/db`. Caddy hält die Datenbank geöffnet; das Panel liest deshalb eine Kopie (nur lesend). Beides funktioniert, wenn das Panel als Benutzer `caddy` läuft (Standard der mitgelieferten Unit). Typische Konfiguration einer internen CA:
+Die Seite *Interne CA* zeigt `<Caddy-Datenverzeichnis>/pki/authorities/*` und die ACME-Datenbank `acme_server/<ca>/db` – ebenfalls über den Agenten (Root- und Zwischenzertifikat, Kopie der ACME-Datenbank; nie Schlüssel). Typische Konfiguration einer internen CA:
 
 ```caddyfile
 ca.firma.local {
@@ -268,6 +277,8 @@ AD-Passwörter werden nicht gespeichert; das Panel prüft sie bei jeder Anmeldun
 
 ## Erste Schritte
 
+Ausführlich – mit allen Voreinstellungen und jeder Funktion des Panels – im **[Handbuch](docs/HANDBUCH.md)**.
+
 1. **Editor**: `sentinel` in alle Sites einfügen und übernehmen.
 2. **Policies › Standard**: Die WAF startet im Modus *Erkennen*. Ein paar Tage Treffer unter *Sicherheit* beobachten, Fehlalarme ausnehmen (Link „ausnehmen“ bei den Regeln), dann auf *Blockieren* stellen.
 3. **Ratelimits**: Vorlage „Login-Schutz“ für Login-Pfade.
@@ -292,23 +303,50 @@ AD-Passwörter werden nicht gespeichert; das Panel prüft sie bei jeder Anmeldun
 
 ## Sicherheit
 
-- **Pfade werden normalisiert**, bevor Regeln greifen: `/a/../b`, `//b` und `/./b` gelten als `/b`. Diese Form bekommt auch das Backend. So kommt niemand über Ausnahmen wie `/.well-known/acme-challenge/../admin` am Login oder an Pfadregeln vorbei. Kodierte Pfade (`%2F`) bleiben unverändert.
-- **Identitäts-Header** (`Remote-User` usw.) entfernt Sentinel auf Sites mit Login immer aus Client-Anfragen. Das gilt auch für vertrauenswürdige Quellen und solange noch kein Zustand vom Panel vorliegt.
+- **Pfade werden normalisiert**, bevor Regeln greifen: `/a/../b`, `//b` und `/./b` gelten als `/b`. Diese Form bekommt auch das Backend. Pfade, die Backends anders auflösen als Sentinel – `..;`-Segmente (Tomcat, Jetty), Backslashes (Windows) und NUL –, lehnt Sentinel mit 400 ab. Einschränkende Pfad-Regeln (Sperre, „nur aus Netzen“, Login, API-Schlüssel) greifen auch bei anderer Groß-/Kleinschreibung und mit Pfad-Parametern (`/ADMIN/`, `/admin;x/`); freigebende Regeln nur bei genau passendem Pfad. Die ACME-Ausnahme gilt nur für echte Challenge-Token (`/.well-known/acme-challenge/<token>`).
+- **Identitäts-Header** (`Remote-User`, `Remote-Groups` …) entfernt Sentinel aus jeder Client-Anfrage – auf allen Sites, auch ohne Login, und in jeder Schreibweise (`Remote_User` landet bei FastCGI in derselben Variable `HTTP_REMOTE_USER`).
+- **Anmeldeseite** antwortet wie ihr Ziel: Ist die Site „nur aus dem LAN“ erreichbar, ist es auch `/.sentinel/auth/login`. Logins aus fremden Seiten (auch `Origin: null` aus Sandbox-Frames) lehnt Sentinel ab. Fehlermeldungen von OAuth-Anbietern erscheinen nur als feste Texte.
+- **API-Schlüssel** aus Pfad-Regeln gibt Sentinel nicht an das Backend weiter. Eine Schlüssel-Regel im Testmodus schaltet den Login nicht ab.
+- **Zwei-Faktor**: Hat ein Konto schon einen zweiten Faktor (Passkey für eine andere Adresse, Wiederherstellungscodes), bietet weder Site- noch Panel-Login die Einrichtung einer neuen App an. Die Panel-2FA gilt auch bei Anmeldung über OAuth. Self-Service-Änderungen von OAuth-Konten verlangen eine frische Anmeldung.
+- **Öffentliche OAuth-Anbieter** (GitHub, Google, gitlab.com, Microsoft „common“): Benutzer- und Gruppennamen tragen die Anbieter-ID als Präfix (`github:meine-org`) und können keine AD-Gruppe oder keinen AD-Namen treffen. Ohne erlaubte Domains öffnen sie nur Sites, die Gruppen/Benutzer festlegen oder den Anbieter ausdrücklich zulassen.
+- **Fehlversuche** zählt das Panel, bevor es das Passwort prüft – parallele Anfragen kommen nicht über das Limit. Lange Benutzernamen und große Anfragen beim Login werden abgewiesen; unbekannte Namen kosten dieselbe Zeit wie bekannte.
 - **SSO-Cookies** öffnen nur Sites, die die Anmeldequelle des Kontos zulassen (AD, Zugangskonto, OIDC-Anbieter).
 - **Eigene WAF-Regeln** dürfen nur Regel-Direktiven enthalten: `SecRule`, `SecAction`, `SecMarker`, `SecRuleRemove…`, `SecRuleUpdate…` und `SecDefaultAction`. Alles, was Dateien schreibt (`SecDebugLog`, `SecAuditLog`, `Sec…Dir`), Code nachlädt (`SecRemoteRules`, `Include`) oder Programme startet (`@inspectFile`), wird abgelehnt. `@inspectFile` ist in den Release-Builds außerdem gar nicht enthalten (Build-Tag `coraza.disabled_operators.inspectFile`).
-- **Rollen**: Leser dürfen Caddyfiles nicht mehr über Caddy prüfen lassen, denn das würde Umgebungsvariablen und lesbare Dateien preisgeben. Globale „vertrauenswürdige Quellen“ darf nur ein Administrator freigeben, auch zeitlich begrenzt.
+- **Eigene WAF-Regeln** zerlegt Sentinel genau wie Coraza: Eine Kommentarzeile mit `\` am Ende verschluckt keine Direktive mehr. Eigene, nicht gespeicherte WAF-Einstellungen im WAF-Tester gibt es nur für Bearbeiter; gleichzeitige WAF-Builds sind begrenzt. Geprüfte Bodies über 128 KiB liegen in einer temporären Datei statt im Speicher.
+- **Rollen**: Leser dürfen Caddyfiles nicht mehr über Caddy prüfen lassen, denn das würde Umgebungsvariablen und lesbare Dateien preisgeben. Leser und Support sehen Caddyfile und Konfiguration ohne Geheimnisse (Tokens, Passwort-Hashes, Zugangsdaten in Headern). Globale „vertrauenswürdige Quellen“ darf nur ein Administrator freigeben, auch zeitlich begrenzt. Sperren größer als /16 (IPv4) bzw. /32 (IPv6) nur durch Administratoren, nie die eigene Adresse oder „Nie sperren“-Einträge. AD-Panelkonten verlieren Sitzungen und API-Tokens, sobald sie gesperrt oder aus den Panel-Gruppen entfernt sind; API-Tokens externer Konten laufen nach höchstens 90 Tagen ab.
+- **Fernverwaltung „read“** erlaubt kein `POST /adapt` mehr (das hätte Umgebungsvariablen des Caddy-Hosts aufgelöst).
+- **Monitore und Feeds** erreichen keine link-lokalen Ziele (Cloud-Metadaten).
 - **Panel hinter einem Reverse-Proxy**: Die echte Client-IP übernimmt das Panel nur von Proxys in `SENTINEL_TRUSTED_PROXIES` (Standard: localhost). Fehlversuche zählt es pro IP (10 in 15 Minuten) und pro Konto (30 in 15 Minuten).
 - **Panel-Sitzungen** speichert das Panel nur noch als Hash. Nach dem Update auf diese Version muss sich jeder einmal neu anmelden.
 - **Passwort-Reset**: Die Mail wird nur verschickt, wenn der Host der Anfrage als Site-Adresse in Caddy steht (z. B. `wiki.example.com` oder `*.example.com`). Auf einer reinen Catch-all-Site (`:80`) gibt es keinen Reset-Link, sonst ließe sich der Link über den Host-Header auf eine fremde Domain umlenken.
 - **Ratelimits** zählen IPv6-Clients pro /64-Netz. Der Speicher des Ratelimiters ist begrenzt.
 - **Agent ↔ Panel**: Der Agent schickt höchstens 2.000 Einträge pro Stapel, jeweils mit einer ID. Wiederholte Stapel speichert das Panel kein zweites Mal. Lehnt das Panel einen Stapel dauerhaft ab, verwirft der Agent ihn, statt alle späteren Daten dahinter zu blockieren.
-- **Docker**: Caddy bekommt nur das Agent-Token (Volume `sentinel-token`), nicht mehr die Datenbank des Panels.
+- **Docker**: Caddy bekommt nur das Agent-Token (Volume `sentinel-token`), nicht mehr die Datenbank des Panels; Caddyfile und Prüf-Kopien (eigenes Volume `sentinel-staging`) hängen bei Caddy nur lesend, das Admin-Socket-Volume beim Panel nur lesend. Beide Container laufen ohne Linux-Capabilities (Caddy nur `NET_BIND_SERVICE`), das Panel mit `no-new-privileges` in einem festen Netz und vertraut `X-Forwarded-For` nur dem eigenen Caddy.
+- **Admin-API** von Caddy (systemd) nur als Unix-Socket `/run/caddy/admin.sock` (`0660`, Gruppe `caddy`) statt `localhost:2019` für alle lokalen Prozesse.
+- **Oberfläche**: „Als curl kopieren“ quotet alle Werte (ein präparierter Pfad wird im Terminal nicht ausgeführt), der CSV-Export schützt vor Formel-Injection, die Content-Security-Policy verbietet fremde Formularziele, `<base>` und Plugins.
+- **Releases**: GitHub-Actions sind auf Commit-SHAs festgelegt, `SHA256SUMS` ist per SSH signiert und wird von `install.sh`/`caddy-sentinel-update` zwingend geprüft (sobald ein Schlüssel hinterlegt ist), Archive tragen zusätzlich einen signierten Herkunftsnachweis (`gh attestation verify`), ein älteres Release lässt sich über eine manipulierte `VERSION`-Datei nicht unterschieben, `install.sh` kommt aus dem Release statt aus dem Hauptzweig, das Agent-Token lässt sich per `SENTINEL_AGENT_TOKEN` übergeben. Vor einem Release laufen `govulncheck` und die Tests mit genau den ausgelieferten Versionen.
+- **Zugangsdaten bleiben bei Sentinel**: Die Cookies `__sentinel_*` (Login, SSO, Challenge) und Zugriffstokens (`Authorization: Bearer sst_…`) entfernt der Agent, bevor die Anfrage an das Backend geht – auch auf Pfaden ohne Login. So kann keine Anwendung unter der SSO-Domain fremde Sitzungen abgreifen.
+- **Protokoll ohne Geheimnisse**: Werte von Query-Parametern wie `token`, `password`, `code`, `state`, `key`, `signature` speichert das Panel als `***`, auf Sentinels eigenen Seiten (`/.sentinel/…`, etwa Reset-Links) alle Werte.
+- **IDS ohne Fehlsperren durch Polling**: 404, 400, 401/403 des Backends bei GET und WAF-Treffer im Erkennungsmodus zählen je IP und Pfad nur einmal in 10 Minuten, Ratelimit-Treffer einmal pro Minute. Fehlgeschlagene Anmeldungen zählen jedes Mal.
+- **Konten**: „2FA zurücksetzen“ macht auch die Wiederherstellungscodes ungültig. Abgelaufene Konten können sich weder am Panel anmelden noch ihr Passwort zurücksetzen.
 
-Bekannte Grenzen:
-- Alle Caddy-Instanzen teilen das Geheimnis, mit dem Site-Sitzungen signiert werden. Wer eine Instanz kompromittiert, kann Sitzungen für alle Sites ausstellen. Instanzen deshalb wie das Panel selbst schützen.
-- Abmelden löscht das Cookie, macht eine kopierte Sitzung aber nicht ungültig. Dafür gibt es „Auf allen Geräten abmelden“.
-- Die Sicherung (*Einstellungen › Sicherung*) enthält gespeicherte Geheimnisse (SMTP, LDAP, OAuth) im Klartext. Sie gehört entsprechend geschützt abgelegt.
-- Hinter einem TLS-terminierenden Load Balancer vor Caddy setzt Sentinel Cookies ohne `Secure`. TLS also möglichst in Caddy terminieren.
+- **Sitzungen** des Site-Logins stellt nur das Panel aus und signiert sie mit Ed25519. Caddy-Instanzen bekommen nur den öffentlichen Schlüssel und je ein eigenes Geheimnis für Challenge-Cookies und OAuth-Starts; Links in Benachrichtigungen signiert ein Schlüssel, der das Panel nie verlässt. Nach dem Update auf diese Version melden sich alle Site-Benutzer einmal neu an. Bei mehreren Servern zuerst das Panel aktualisieren, dann die Agents: Ein neuer Agent braucht die vom Panel signierten Sitzungen.
+- **Abmelden** sperrt die Kennung der Sitzung auf allen Instanzen – auch eine kopierte Sitzung ist danach ungültig. SSO-Cookies gelten auf jeder Site höchstens so lange, wie deren eigene Sitzungsdauer erlaubt.
+- **Passkeys (WebAuthn)** als zweiter Faktor im Site-Login, neben der Authenticator-App – ohne externe Bibliothek, mit Prüfung von Herkunft, Challenge, Signatur und Zähler.
+- **Cookies** tragen `Secure` auch hinter einem TLS-terminierenden Proxy, dem Caddy vertraut (`X-Forwarded-Proto: https`).
+- **IPv6-Sperren** erfassen das /64-Netz des Clients (einstellbar); „Nie sperren“ gilt auch für Ratelimit-Sperren im Agent.
+- **Editor**: Wer eine Datei übernimmt, die inzwischen jemand anderes geändert hat, bekommt eine Konfliktmeldung statt eines stillen Überschreibens. Abgelehnte Übernahmen stehen als solche im Audit-Log.
+- **Sicherungen** sind mit einem Passwort verschlüsselt (AES-256-GCM, scrypt). Der Rollback stellt auch Caddyfile und `/etc/default/caddy-sentinel` wieder her (abweichende Fassungen landen in `/var/backups/caddy-sentinel/vor-rollback-<Zeit>/`, nur für root).
+- **WAF**: Antworten optional prüfen (nur melden, auch bei gzip/zstd), zu große Bodies wahlweise ablehnen statt teilweise prüfen.
+
+Bekannte Grenzen (Details in Kapitel 13 des Handbuchs):
+- Panel (`caddy-sentinel`) und Caddy (`caddy`) laufen getrennt, teilen sich aber die Gruppe `caddy`: Wer Caddy übernimmt, liest das Agent-Token der lokalen Instanz und die Prüf-Kopien der Caddyfile; die Datenbank des Panels bleibt ihm verschlossen. Wer das Panel übernimmt, kann `/etc/caddy` schreiben und über den Admin-Socket Caddy steuern, aber Caddys private Schlüssel nicht lesen.
+- Setzt die Caddyfile selbst eine globale Option `admin` (z. B. `localhost:2019`), hat sie Vorrang vor dem Unix-Socket – Installation und Update warnen nur.
+- Die Signatur der Prüfsummen schützt Updates; den allerersten Aufruf von `bash <(wget …/install.sh)` nur, wenn man `install.sh` vorher selbst prüft. Docker-Images sind nicht signiert, die Basis-Images nicht per Digest festgelegt (Begründung in docs/INSTALL.md).
+- „Vollständig prüfen“ öffnet keine Dateien, die nur Caddy lesen darf (Log-Dateien, Schlüssel bei `tls <cert> <key>`); diese prüft Caddy erst beim Übernehmen.
+- Passkeys gibt es nur für den Site-Login, nicht für die Anmeldung am Panel selbst.
+- Die WAF kann anhand einer Antwort nicht blockieren, nur melden.
+- Eine unverschlüsselte Sicherung (ausdrücklich gewählt oder `GET /api/backup`) enthält Geheimnisse im Klartext.
 
 ## Lizenz
 

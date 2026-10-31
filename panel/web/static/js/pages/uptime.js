@@ -1,4 +1,4 @@
-import { el, mount, get, post, put, del, panel, field, toggle, toast, errToast, modal, confirmDialog, empty, fmtMs, fmtAgo, fmtDateTime, fmtPct } from '../ui.js';
+import { can, el, mount, get, post, put, del, panel, field, toggle, toast, errToast, modal, confirmDialog, empty, fmtMs, fmtAgo, fmtDateTime, fmtPct } from '../ui.js';
 import { spark } from '../charts.js';
 import { setActions, bus } from '../app.js';
 
@@ -7,9 +7,10 @@ export async function render(root, _p, scope) {
     const mons = await get('/monitors', scope.signal);
     draw(mons);
   };
-  setActions(
+  if (can('policy')) setActions(
     el('button.btn', { onclick: suggest }, 'Sites übernehmen'),
     el('button.btn.primary', { onclick: () => edit() }, 'Monitor hinzufügen'));
+  else setActions();
 
   function pct(v) { return v < 0 ? '–' : fmtPct(v).replace(',0 %', ' %'); }
   function bars(b) {
@@ -38,7 +39,7 @@ export async function render(root, _p, scope) {
             el('td', null, bars(m.bars || [])),
             el('td.num', null, pct(m.uptime_24h)), el('td.num', null, pct(m.uptime_7d)), el('td.num', null, pct(m.uptime_30d)),
             el('td.nowrap', null, spark(m.lat || [], { width: 110 }), el('small', null, 'Ø ' + fmtMs(m.avg_ms))),
-            el('td.nowrap', null, el('button.btn.sm', { onclick: () => edit(m) }, 'Bearbeiten')));
+            el('td.nowrap', null, can('policy') ? el('button.btn.sm', { onclick: () => edit(m) }, 'Bearbeiten') : null));
         })))) : empty('Noch keine Monitore', 'Übernimm die Hosts aus deiner Caddy-Konfiguration oder lege eine Adresse an.', el('button.btn', { onclick: suggest }, 'Sites übernehmen'))));
   }
 

@@ -70,7 +70,8 @@ func (m *monitorRunner) CheckOnce(ctx context.Context, mon store.Monitor) store.
 	}
 	ctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: mon.Insecure}, DisableKeepAlives: true}
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: mon.Insecure}, DisableKeepAlives: true,
+		DialContext: noMetadataDialer().DialContext}
 	client := &http.Client{Transport: tr, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return http.ErrUseLastResponse

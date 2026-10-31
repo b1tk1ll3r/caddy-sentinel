@@ -201,6 +201,7 @@ func HashAPIKey(key string) string {
 type CompiledRule struct {
 	R        *PathRule
 	matchers []func(string) bool
+	fold     []func(string) bool // same patterns, case-insensitive (input lower-cased)
 	methods  map[string]bool
 	nets     []netip.Prefix
 	only     []netip.Prefix
@@ -221,6 +222,17 @@ func CompilePathRule(r *PathRule) (*CompiledRule, error) {
 			return nil, fmt.Errorf("Regel %q: %v", r.Name, err)
 		}
 		c.matchers = append(c.matchers, m)
+		var fm func(string) bool
+		if strings.HasPrefix(p, "~") {
+			re, err := regexp.Compile("(?i)" + p[1:])
+			if err != nil {
+				return nil, fmt.Errorf("Regel %q: %v", r.Name, err)
+			}
+			fm = re.MatchString
+		} else if fm, err = pathMatcher(strings.ToLower(p)); err != nil {
+			return nil, fmt.Errorf("Regel %q: %v", r.Name, err)
+		}
+		c.fold = append(c.fold, fm)
 	}
 	for _, m := range r.Methods {
 		if m = strings.ToUpper(strings.TrimSpace(m)); m != "" {
@@ -408,6 +420,109 @@ func (c *CompiledRule) CheckAPIKey(headerValue string) bool {
 	return ok == 1
 }
 
+// Restrictive reports whether the rule narrows access (block, source
+// networks, login, users/groups, second factor or API key).
+func (c *CompiledRule) Restrictive() bool {
+	r := c.R
+	return r.Action == "block" || len(c.only) > 0 || len(c.keys) > 0 || r.Auth == "on" ||
+		len(r.AuthGroups) > 0 || len(r.AuthUsers) > 0 || r.TOTP == "on" ||
+		r.WAF == "block" || r.WAF == "detect" || r.Challenge == "always"
+}
+
+// matchFold is Match on a lower-cased path against the case-insensitive patterns.
+func (c *CompiledRule) matchFold(lower, method string, ip netip.Addr) bool {
+	if !c.R.Enabled || len(c.fold) == 0 {
+		return false
+	}
+	if len(c.methods) > 0 && !c.methods[strings.ToUpper(method)] {
+		return false
+	}
+	if len(c.nets) > 0 && (!ip.IsValid() || !inNets(c.nets, ip)) {
+		return false
+	}
+	for _, m := range c.fold {
+		if m(lower) {
+			return true
+		}
+	}
+	return false
+}
+
+// StripPathParams removes path parameters (";jsessionid=…") from every
+// segment, as Java servers (Tomcat, Jetty) do before routing, and then
+// resolves the result like they do: "/;x/admin/" is "/admin/" there.
+func StripPathParams(p string) string {
+	if !strings.Contains(p, ";") {
+		return p
+	}
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		if j := strings.IndexByte(s, ';'); j >= 0 {
+			segs[i] = s[:j]
+		}
+	}
+	return CanonicalPath(strings.Join(segs, "/"))
+}
+
+// CanonicalPath resolves "." and ".." segments and merges slashes; a
+// trailing slash is kept. Non-absolute paths stay as they are.
+func CanonicalPath(p string) string {
+	if !strings.HasPrefix(p, "/") {
+		return p
+	}
+	if !strings.Contains(p, "//") && !strings.Contains(p, "/.") {
+		return p
+	}
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && c != "/" {
+		c += "/"
+	}
+	return c
+}
+
+// MatchVariants are the forms of a request path the backend may resolve
+// to: literal, lower case and without path parameters (for matching
+// restrictions such as rate limits and honeypots).
+func MatchVariants(p string) []string {
+	out := []string{p}
+	np := StripPathParams(p)
+	if np != p {
+		out = append(out, np)
+	}
+	if l := strings.ToLower(np); l != np {
+		out = append(out, l)
+	}
+	return out
+}
+
+// MatchRequest selects the rule for a request path the way backends may
+// resolve it: restricting rules also match without path parameters and
+// regardless of case (IIS/Windows, Express, Java servers), so "/ADMIN/" or
+// "/admin;x/" cannot slip past a rule for "/admin/". Permissive rules
+// (allow, login off) only count when the literal path matches as well.
+func MatchRequest(rules []*CompiledRule, urlPath, method string, ip netip.Addr) *CompiledRule {
+	t := time.Now()
+	np := StripPathParams(urlPath)
+	r := MatchRulesAt(rules, np, method, ip, t)
+	if r != nil && np != urlPath && !r.Restrictive() && !r.Match(urlPath, method, ip) {
+		r = nil
+	}
+	if r != nil && r.Restrictive() {
+		return r
+	}
+	lower := strings.ToLower(np)
+	if lower == np && np == urlPath {
+		return r
+	}
+	for _, c := range rules {
+		// only rules reached through case or parameters alone
+		if c.Restrictive() && c.matchFold(lower, method, ip) && !c.Match(urlPath, method, ip) && c.ActiveAt(t) {
+			return c
+		}
+	}
+	return r
+}
+
 // MatchRules returns the first matching rule that is in force now.
 func MatchRules(rules []*CompiledRule, urlPath, method string, ip netip.Addr) *CompiledRule {
 	return MatchRulesAt(rules, urlPath, method, ip, time.Now())
@@ -443,8 +558,9 @@ func EffectiveAuth(a AuthPolicy, r *PathRule) AuthPolicy {
 	case "off":
 		a.RequireTOTP = false
 	}
-	if r.Action == "allow" || len(r.APIKeys) > 0 {
-		// "allow" skips the login; API keys replace it
+	if r.Action == "allow" || (len(r.APIKeys) > 0 && !r.Test) {
+		// "allow" skips the login; API keys replace it – but not while the
+		// key check only runs in test mode (it lets every request through)
 		if r.Auth != "on" {
 			a.Enabled = false
 		}

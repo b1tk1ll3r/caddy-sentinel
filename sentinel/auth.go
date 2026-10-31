@@ -45,56 +45,48 @@ const (
 // headers forwarded upstream; always stripped from client requests
 var authHeaders = []string{"Remote-User", "Remote-Name", "Remote-Email", "Remote-Groups"}
 
-type authSession struct {
-	U   string   `json:"u"`
-	D   string   `json:"d,omitempty"`
-	E   string   `json:"e,omitempty"`
-	G   []string `json:"g,omitempty"`
-	P   string   `json:"p"` // policy ID, or "sso"
-	H   string   `json:"h"` // host, or SSO domain
-	IP  string   `json:"ip,omitempty"`
-	S   string   `json:"s,omitempty"` // login source (directory | local | oidc:<id>)
-	F   int      `json:"f"`           // factors: 1 = password, 2 = password + TOTP
-	Iat int64    `json:"iat"`
-	Exp int64    `json:"exp"`
-}
+// authSession is a site-login session, signed by the panel (Ed25519). The
+// agent only verifies it.
+type authSession = protocol.SiteSession
 
+// authKey derives this instance's key for CSRF tokens on the account page.
 func authKey(secret []byte) []byte {
 	m := hmac.New(sha256.New, secret)
 	m.Write([]byte("sentinel-site-auth-v1"))
 	return m.Sum(nil)
 }
 
-func encodeSession(key []byte, s *authSession) string {
-	raw, _ := json.Marshal(s)
-	m := hmac.New(sha256.New, key)
-	m.Write(raw)
-	return b64.EncodeToString(raw) + "." + b64.EncodeToString(m.Sum(nil))
+// originOf is scheme://host[:port] as the browser sees this site.
+func originOf(r *http.Request) string {
+	scheme := "http"
+	if isSecure(r) {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
-func decodeSession(key []byte, v string) (*authSession, bool) {
-	payload, mac, ok := strings.Cut(v, ".")
-	if !ok {
-		return nil, false
+// isSecure reports whether the browser talks HTTPS to us: directly, or via a
+// TLS-terminating proxy that Caddy trusts (servers { trusted_proxies }).
+func isSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
 	}
-	raw, err := b64.DecodeString(payload)
-	if err != nil {
-		return nil, false
+	if trusted, _ := caddyhttp.GetVar(r.Context(), caddyhttp.TrustedProxyVarKey).(bool); trusted {
+		p := r.Header.Get("X-Forwarded-Proto")
+		if i := strings.IndexByte(p, ','); i >= 0 {
+			p = p[:i]
+		}
+		return strings.EqualFold(strings.TrimSpace(p), "https")
 	}
-	got, err := b64.DecodeString(mac)
-	if err != nil {
-		return nil, false
+	return false
+}
+
+// sessionHours is the session lifetime a policy allows (default 12 h).
+func sessionHours(a protocol.AuthPolicy) int64 {
+	if a.SessionHours > 0 {
+		return int64(a.SessionHours)
 	}
-	m := hmac.New(sha256.New, key)
-	m.Write(raw)
-	if subtle.ConstantTimeCompare(got, m.Sum(nil)) != 1 {
-		return nil, false
-	}
-	var s authSession
-	if json.Unmarshal(raw, &s) != nil {
-		return nil, false
-	}
-	return &s, true
+	return 12
 }
 
 // ssoFor returns the SSO domain that covers host for this policy ("" = none).
@@ -111,20 +103,60 @@ func (pol *cpolicy) ssoFor(host string) string {
 
 // session returns the valid login session of r for policy pol, if any. With
 // SSO the domain-wide cookie is accepted as well.
+// openSource reports a session source of an open provider (OpenSourceAllowed).
+func (st *runtimeState) openSource(source string) bool {
+	id, ok := strings.CutPrefix(source, "oidc:")
+	if !ok {
+		return false
+	}
+	for _, p := range st.raw.AuthProviders {
+		if p.ID == id {
+			return p.Open
+		}
+	}
+	return false
+}
+
+// providerKnown reports whether the OAuth provider of a session source is
+// still offered for site logins.
+func (st *runtimeState) providerKnown(source string) bool {
+	id, _ := strings.CutPrefix(source, "oidc:")
+	for _, p := range st.raw.AuthProviders {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (st *runtimeState) session(r *http.Request, pol *cpolicy, host, ip string, now time.Time) *authSession {
-	if st.secret == nil {
+	if st.sessPub == nil {
 		return nil
 	}
-	key := authKey(st.secret)
 	check := func(s *authSession) bool {
 		if s.Exp < now.Unix() {
 			return false
+		}
+		// an SSO session from a site with a longer lifetime ends here after
+		// this site's own session duration
+		if now.Unix()-s.Iat > sessionHours(pol.p.Auth)*3600 {
+			return false
+		}
+		if s.J != "" {
+			if _, revoked := st.raw.RevokedSessions[s.J]; revoked {
+				return false
+			}
 		}
 		if pol.p.Auth.BindIP && s.IP != ip {
 			return false
 		}
 		// an SSO cookie from a site with other login sources must not open this one
 		if len(pol.p.Auth.Sources) > 0 && !protocol.SourceAllowed(pol.p.Auth, s.S) {
+			return false
+		}
+		// a provider that was switched off or removed ends its sessions
+		// (fail closed: its "open" flag is unknown now)
+		if strings.HasPrefix(s.S, "oidc:") && !st.providerKnown(s.S) {
 			return false
 		}
 		if before, ok := st.raw.AuthRevoked[strings.ToLower(s.U)]; ok && s.Iat <= before {
@@ -134,7 +166,7 @@ func (st *runtimeState) session(r *http.Request, pol *cpolicy, host, ip string, 
 	}
 	if d := pol.ssoFor(host); d != "" {
 		if c, err := r.Cookie(ssoCookie); err == nil {
-			if s, ok := decodeSession(key, c.Value); ok && s.P == "sso" && s.H == d && check(s) {
+			if s, ok := protocol.VerifySession(st.sessPub, c.Value); ok && s.P == "sso" && s.H == d && check(s) {
 				return s
 			}
 		}
@@ -143,7 +175,7 @@ func (st *runtimeState) session(r *http.Request, pol *cpolicy, host, ip string, 
 	if err != nil {
 		return nil
 	}
-	s, ok := decodeSession(key, c.Value)
+	s, ok := protocol.VerifySession(st.sessPub, c.Value)
 	if !ok || s.P != pol.p.ID || s.H != host || !check(s) {
 		return nil
 	}
@@ -166,7 +198,7 @@ func factorsNeeded(a protocol.AuthPolicy, pol *cpolicy, addr netip.Addr) int {
 // authGate enforces the site login with the effective settings a (policy
 // plus path rule). It returns handled=true when it wrote a response.
 func (h *Handler) authGate(w http.ResponseWriter, r *http.Request, info *reqInfo, st *runtimeState, pol *cpolicy, addr netip.Addr, a protocol.AuthPolicy) (bool, error) {
-	if pathExempt(pol.authExempt, r.URL.Path) {
+	if pathExempt(pol.authExempt, r.URL.Path) || isACME(r.URL.Path) {
 		return false, nil
 	}
 	if !pol.authBypass.empty() {
@@ -219,6 +251,8 @@ func (h *Handler) authGate(w http.ResponseWriter, r *http.Request, info *reqInfo
 		} else {
 			info.rec.Why = "keine gültige Sitzung"
 		}
+		// never cacheable – also not with cache headers of a path rule
+		w.Header().Set("Cache-Control", "no-store")
 		if wantsHTML(r) && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 			info.rec.Status, info.rec.Action = http.StatusFound, protocol.ActionAuth
 			loc := authLoginPath + "?rd=" + url.QueryEscape(r.URL.RequestURI())
@@ -238,7 +272,7 @@ func (h *Handler) authGate(w http.ResponseWriter, r *http.Request, info *reqInfo
 		return true, h.finish(w, info, http.StatusUnauthorized, protocol.ActionAuth, msg, 0)
 	}
 	info.rec.User = sess.U
-	if !protocol.AuthAllowed(a, sess.U, sess.G) {
+	if !protocol.AuthAllowed(a, sess.U, sess.G) || (st.openSource(sess.S) && !protocol.OpenSourceAllowed(a, sess.S)) {
 		info.rec.Detail = sess.U
 		info.rec.Why = "Gruppen des Kontos: " + strings.Join(sess.G, ", ")
 		if len(sess.G) == 0 {
@@ -246,7 +280,7 @@ func (h *Handler) authGate(w http.ResponseWriter, r *http.Request, info *reqInfo
 		}
 		return true, h.authPage(w, r, info, http.StatusForbidden, protocol.ActionAuthDenied, authView{
 			Title: pageTitle(pol, info.rec.Host), Step: "denied", User: displayName(sess), RD: r.URL.RequestURI(),
-			Error: "Dein Konto hat keinen Zugriff auf diesen Bereich.",
+			Error: "Dein Konto hat keinen Zugriff auf diesen Bereich.", CSRF: csrfFor(st, sess),
 		})
 	}
 	caddyhttp.SetVar(r.Context(), "sentinel.user", sess.U)
@@ -317,9 +351,13 @@ func clearCookie(name, domain string, secure bool) *http.Cookie {
 // serveAuth handles /.sentinel/auth/*.
 func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInfo, st *runtimeState, pol *cpolicy, addr netip.Addr) error {
 	title := pageTitle(pol, info.rec.Host)
-	if r.Method == http.MethodPost {
-		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodPost:
+	default:
+		w.Header().Set("Allow", "GET, HEAD, POST")
+		return h.finish(w, info, http.StatusMethodNotAllowed, protocol.ActionAuthFail, "method not allowed", 0)
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
 		return h.finish(w, info, http.StatusBadRequest, protocol.ActionAuthFail, "bad request", 0)
 	}
@@ -333,11 +371,22 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 		rdPath = rdPath[:i]
 	}
 	var rule *protocol.PathRule
-	if cr := protocol.MatchRules(pol.rules, rdPath, http.MethodGet, addr); cr != nil {
+	cr := protocol.MatchRequest(pol.rules, rdPath, http.MethodGet, addr)
+	if cr != nil {
 		rule = cr.R
 	}
 	eff := protocol.EffectiveAuth(pol.p.Auth, rule)
-	secure := r.TLS != nil
+	// the login pages are no way around "only from these networks" or a
+	// block: they answer like the target – and when the target needs no
+	// login at all, like the site root
+	denies := func(c *protocol.CompiledRule) bool {
+		return c != nil && !c.R.Test && (c.R.Action == "block" || !c.AllowedFrom(addr))
+	}
+	if denies(cr) || (!eff.Enabled && denies(protocol.MatchRequest(pol.rules, "/", http.MethodGet, addr))) {
+		info.rec.Why = "Anmeldeseite nur aus freigegebenen Netzen"
+		return h.block(w, info, pol, protocol.ActionIPDeny, "nur aus freigegebenen Netzen", http.StatusForbidden)
+	}
+	secure := isSecure(r)
 	now := time.Now()
 	sess := st.session(r, pol, info.rec.Host, addr.String(), now)
 	if sess != nil {
@@ -347,7 +396,7 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 	base.Password, base.PasswordHint = passwordSources(st, eff)
 	base.Reset = st.sources["feature:reset"] && st.sources["local"] && protocol.SourceAllowed(eff, "local")
 	for _, p := range st.raw.AuthProviders {
-		if protocol.SourceAllowed(eff, "oidc:"+p.ID) && st.raw.PanelURL != "" {
+		if protocol.SourceAllowed(eff, "oidc:"+p.ID) && (!p.Open || protocol.OpenSourceAllowed(eff, "oidc:"+p.ID)) && st.raw.PanelURL != "" {
 			base.Providers = append(base.Providers, providerView{Name: p.Name, Href: authOAuthStart + "?p=" + url.QueryEscape(p.ID) + "&rd=" + url.QueryEscape(rd)})
 		}
 	}
@@ -355,6 +404,26 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 
 	switch r.URL.Path {
 	case authLogoutPath:
+		// Signing out changes state: only by POST from this site with the
+		// session's CSRF token. A plain link (or a foreign page) gets a
+		// confirmation page instead of signing the user out.
+		if sess != nil && (r.Method != http.MethodPost || !sameOrigin(r) ||
+			subtle.ConstantTimeCompare([]byte(r.PostFormValue("csrf")), []byte(csrfFor(st, sess))) != 1) {
+			v := view("logout_confirm")
+			v.User, v.CSRF, v.SSO = displayName(sess), csrfFor(st, sess), pol.ssoFor(info.rec.Host)
+			return h.authPage(w, r, info, http.StatusOK, "", v)
+		}
+		// end the session for good, not just in this browser: a copy of the
+		// cookie must stop working too
+		if sess != nil && sess.J != "" {
+			if tok := sessionCookieValue(r, sess); tok != "" {
+				go func(tok string) {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					_, _ = h.core.authCall(ctx, protocol.AuthRequest{Policy: pol.p.ID, Host: info.rec.Host, IP: addr.String(), Step: "logout", Session: tok})
+				}(tok)
+			}
+		}
 		http.SetCookie(w, clearCookie(authCookie, "", secure))
 		if d := pol.ssoFor(info.rec.Host); d != "" {
 			http.SetCookie(w, clearCookie(ssoCookie, d, secure))
@@ -398,15 +467,23 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 			return h.authPage(w, r, info, http.StatusServiceUnavailable, protocol.ActionAuth, v)
 		}
 		if e := r.URL.Query().Get("error"); e != "" {
+			// fixed texts only: the parameter comes from the address bar
 			v := view("password")
-			v.Error = "Anmeldung abgebrochen: " + truncate(e, 200)
+			switch e {
+			case "access_denied":
+				v.Error = "Anmeldung beim Anbieter abgebrochen oder abgelehnt."
+			case "login_required", "interaction_required", "consent_required":
+				v.Error = "Der Anbieter verlangt eine erneute Anmeldung. Bitte noch einmal versuchen."
+			default:
+				v.Error = "Die Anmeldung beim Anbieter ist fehlgeschlagen. Bitte noch einmal versuchen."
+			}
 			return h.authPage(w, r, info, http.StatusUnauthorized, protocol.ActionAuthFail, v)
 		}
-		req := protocol.AuthRequest{Policy: pol.p.ID, Host: info.rec.Host, IP: addr.String(), UA: info.rec.UA, Step: "code", Code: r.URL.Query().Get("code")}
+		req := protocol.AuthRequest{Policy: pol.p.ID, Host: info.rec.Host, IP: addr.String(), UA: info.rec.UA, Step: "code", Code: r.URL.Query().Get("code"), Origin: originOf(r), RD: rd}
 		if c, err := r.Cookie(oauthCookie); err == nil {
 			req.Ticket = c.Value // must match the nonce of the flow (login CSRF)
 		}
-		http.SetCookie(w, &http.Cookie{Name: oauthCookie, Value: "", Path: authPrefix, MaxAge: -1, HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteLaxMode})
+		http.SetCookie(w, &http.Cookie{Name: oauthCookie, Value: "", Path: authPrefix, MaxAge: -1, HttpOnly: true, Secure: isSecure(r), SameSite: http.SameSiteLaxMode})
 		if rule != nil {
 			req.Rule = rule.ID
 		}
@@ -422,8 +499,12 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 		return h.authPage(w, r, info, http.StatusServiceUnavailable, protocol.ActionAuth, v)
 	}
 	need := factorsNeeded(eff, pol, addr)
+	if r.FormValue("mfa") == "1" {
+		need = 2 // an application (OIDC) asks for a second factor
+	}
+	fresh := r.FormValue("fresh") == "1" // an application asks for a new login
 	if r.Method != http.MethodPost {
-		if sess != nil && sess.F >= need && protocol.AuthAllowed(eff, sess.U, sess.G) {
+		if !fresh && sess != nil && sess.F >= need && protocol.AuthAllowed(eff, sess.U, sess.G) && (!st.openSource(sess.S) || protocol.OpenSourceAllowed(eff, sess.S)) {
 			http.Redirect(w, r, rd, http.StatusSeeOther)
 			info.rec.Status = http.StatusSeeOther
 			h.core.report(info.rec, false)
@@ -432,7 +513,9 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 		v := view("password")
 		if sess != nil {
 			v.Username = sess.U
-			if sess.F < need {
+			if fresh && sess.F >= need {
+				v.Info = "Die Anwendung bittet um eine erneute Anmeldung."
+			} else if sess.F < need {
 				v.Info = "Für diesen Bereich ist zusätzlich ein Code aus der Authenticator-App nötig. Bitte erneut anmelden."
 			} else {
 				v.Info = "Dein Konto " + sess.U + " hat keinen Zugriff auf diesen Bereich – mit einem anderen Konto anmelden?"
@@ -445,12 +528,12 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 	}
 
 	// POST: one login step
-	if o := r.Header.Get("Origin"); o != "" && o != "null" {
-		if u, err := url.Parse(o); err != nil || !strings.EqualFold(u.Host, r.Host) {
-			v := view("password")
-			v.Error = "Ungültige Herkunft der Anfrage."
-			return h.authPage(w, r, info, http.StatusForbidden, protocol.ActionAuthFail, v)
-		}
+	// login CSRF: no logins from foreign pages, sandboxed frames included
+	// ("Origin: null" – then Sec-Fetch-Site decides)
+	if !sameOrigin(r) {
+		v := view("password")
+		v.Error = "Ungültige Herkunft der Anfrage."
+		return h.authPage(w, r, info, http.StatusForbidden, protocol.ActionAuthFail, v)
 	}
 	req := protocol.AuthRequest{
 		Policy: pol.p.ID, Host: info.rec.Host, IP: addr.String(), UA: info.rec.UA,
@@ -459,11 +542,16 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 		Password: r.PostFormValue("password"),
 		Ticket:   r.PostFormValue("ticket"),
 		Code:     strings.ReplaceAll(strings.TrimSpace(r.PostFormValue("code")), " ", ""),
+		Origin:   originOf(r),
+		WebAuthn: r.PostFormValue("webauthn"),
+		RD:       rd,
 	}
 	if rule != nil {
 		req.Rule = rule.ID
 	}
-	if req.Step != "totp" && req.Step != "enroll" && req.Step != "pwchange" {
+	switch req.Step {
+	case "totp", "enroll", "pwchange", "passkey", "passkey_enroll":
+	default:
 		req.Step = "password"
 	}
 	if req.Step == "pwchange" {
@@ -485,7 +573,7 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request, info *reqInf
 
 // authResult renders the outcome of a login step (password, code, OAuth).
 func (h *Handler) authResult(w http.ResponseWriter, r *http.Request, info *reqInfo, st *runtimeState, pol *cpolicy, addr netip.Addr, req protocol.AuthRequest, res *protocol.AuthResponse, err error, base authView) error {
-	secure := r.TLS != nil
+	secure := isSecure(r)
 	now := time.Now()
 	rd := base.RD
 	view := func(step string) authView { v := base; v.Step = step; return v }
@@ -512,13 +600,25 @@ func (h *Handler) authResult(w http.ResponseWriter, r *http.Request, info *reqIn
 		if f <= 0 {
 			f = 1
 		}
-		ns := &authSession{U: res.User.Name, D: res.User.Display, E: res.User.Email, G: res.User.Groups, S: res.User.Source,
-			P: pol.p.ID, H: info.rec.Host, F: f, Iat: now.Unix(), Exp: now.Unix() + int64(ttl)}
-		if pol.p.Auth.BindIP {
-			ns.IP = addr.String()
+		_, _ = ttl, f
+		// the panel issues and signs the session; check that it fits this
+		// site before handing it to the browser
+		ns, ok := protocol.VerifySession(st.sessPub, res.Session)
+		if !ok || ns.Exp <= now.Unix() || (ns.P != pol.p.ID && ns.P != "sso") || (ns.P == pol.p.ID && ns.H != info.rec.Host) || (ns.P == "sso" && ns.H != pol.ssoFor(info.rec.Host)) {
+			h.log.Warn("sentinel: site login: panel sent no valid session (versions of panel and agent differ?)")
+			v := view("password")
+			v.Username, v.Error = req.Username, "Anmeldung derzeit nicht möglich (Sitzung ungültig). Bitte die Administration informieren."
+			return h.authPage(w, r, info, http.StatusServiceUnavailable, protocol.ActionAuth, v)
 		}
-		setSessionCookie(w, st, pol, info.rec.Host, ns, secure)
+		setSessionCookie(w, ns, res.Session, secure)
 		w.Header().Set("Cache-Control", "no-store")
+		if strings.HasPrefix(rd, protocol.OIDCPrefix) {
+			// the authorization request ends in a redirect to the
+			// application; browsers check form-action along redirects of a
+			// form post, so continue with a fresh navigation
+			info.rec.Action, info.rec.Detail = protocol.ActionAuthOK, res.User.Name
+			return h.continuePage(w, info, rd)
+		}
 		http.Redirect(w, r, rd, http.StatusSeeOther)
 		info.rec.Status, info.rec.Action, info.rec.Detail = http.StatusSeeOther, protocol.ActionAuthOK, res.User.Name
 		info.rec.Dur = float64(time.Since(info.start).Microseconds()) / 1000
@@ -527,11 +627,13 @@ func (h *Handler) authResult(w http.ResponseWriter, r *http.Request, info *reqIn
 	case "totp":
 		v := view("totp")
 		v.Ticket, v.User, v.Error = res.Ticket, userLabel(res), res.Message
+		v.WebAuthn, v.Passkey, v.NoTOTP = res.WebAuthn, res.Passkey, res.NoTOTP
 		return h.authPage(w, r, info, http.StatusOK, "", v)
 	case "enroll":
 		v := view("enroll")
 		v.Ticket, v.User, v.Error = res.Ticket, userLabel(res), res.Message
 		v.QR, v.Secret, v.URI = template.URL(res.QR), res.Secret, res.URI
+		v.WebAuthn, v.Passkey = res.WebAuthn, res.Passkey
 		return h.authPage(w, r, info, http.StatusOK, "", v)
 	case "pwchange":
 		v := view("pwchange")
@@ -547,6 +649,12 @@ func (h *Handler) authResult(w http.ResponseWriter, r *http.Request, info *reqIn
 	step, status, action := "password", http.StatusUnauthorized, protocol.ActionAuthFail
 	if res.Ticket != "" {
 		step = req.Step // wrong code: stay on the code step
+		switch step {
+		case "passkey":
+			step = "totp"
+		case "passkey_enroll":
+			step = "enroll"
+		}
 	}
 	if res.Status == "forbidden" {
 		status, action = http.StatusForbidden, protocol.ActionAuthDenied
@@ -563,6 +671,7 @@ func (h *Handler) authResult(w http.ResponseWriter, r *http.Request, info *reqIn
 	v := view(step)
 	v.Username, v.Ticket, v.User, v.Error = req.Username, res.Ticket, userLabel(res), msg
 	v.QR, v.Secret, v.URI = template.URL(res.QR), res.Secret, res.URI
+	v.WebAuthn, v.Passkey, v.NoTOTP = res.WebAuthn, res.Passkey, res.NoTOTP
 	return h.authPage(w, r, info, status, action, v)
 }
 
@@ -602,6 +711,7 @@ type oauthStart struct {
 	RD       string `json:"rd"`
 	Exp      int64  `json:"exp"`
 	Nonce    string `json:"n"`
+	Inst     string `json:"i,omitempty"` // instance (its secret signs this)
 }
 
 func (h *Handler) oauthStart(w http.ResponseWriter, r *http.Request, info *reqInfo, st *runtimeState, pol *cpolicy, addr netip.Addr, rule *protocol.PathRule, rd string, base authView) error {
@@ -617,13 +727,13 @@ func (h *Handler) oauthStart(w http.ResponseWriter, r *http.Request, info *reqIn
 		return h.authPage(w, r, info, http.StatusBadRequest, protocol.ActionAuthFail, v)
 	}
 	scheme := "http"
-	if r.TLS != nil {
+	if isSecure(r) {
 		scheme = "https"
 	}
 	nonce := make([]byte, 12)
 	_, _ = rand.Read(nonce)
 	so := oauthStart{Provider: prov, Policy: pol.p.ID, Host: info.rec.Host, Origin: scheme + "://" + r.Host, IP: addr.String(), RD: rd,
-		Exp: time.Now().Add(10 * time.Minute).Unix(), Nonce: b64.EncodeToString(nonce)}
+		Exp: time.Now().Add(10 * time.Minute).Unix(), Nonce: b64.EncodeToString(nonce), Inst: st.raw.Instance}
 	if rule != nil {
 		so.Rule = rule.ID
 	}
@@ -632,7 +742,7 @@ func (h *Handler) oauthStart(w http.ResponseWriter, r *http.Request, info *reqIn
 	m.Write(raw)
 	blob := b64.EncodeToString(raw) + "." + b64.EncodeToString(m.Sum(nil))
 	loc := strings.TrimRight(st.raw.PanelURL, "/") + "/oauth/site?d=" + url.QueryEscape(blob)
-	http.SetCookie(w, &http.Cookie{Name: oauthCookie, Value: so.Nonce, Path: authPrefix, MaxAge: 900, HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: oauthCookie, Value: so.Nonce, Path: authPrefix, MaxAge: 900, HttpOnly: true, Secure: isSecure(r), SameSite: http.SameSiteLaxMode})
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, loc, http.StatusFound)
 	info.rec.Status, info.rec.Action, info.rec.Detail = http.StatusFound, protocol.ActionAuth, "OAuth "+prov
@@ -641,17 +751,12 @@ func (h *Handler) oauthStart(w http.ResponseWriter, r *http.Request, info *reqIn
 	return nil
 }
 
-// setSessionCookie stores ns as host cookie, or as domain cookie with SSO.
-func setSessionCookie(w http.ResponseWriter, st *runtimeState, pol *cpolicy, host string, ns *authSession, secure bool) {
+// setSessionCookie stores the signed session val as host cookie, or as
+// domain cookie for SSO sessions.
+func setSessionCookie(w http.ResponseWriter, ns *authSession, val string, secure bool) {
 	name, domain := authCookie, ""
-	if d := pol.ssoFor(host); d != "" {
-		name, domain, ns.P, ns.H = ssoCookie, d, "sso", d
-	}
-	val := encodeSession(authKey(st.secret), ns)
-	// keep the cookie below browser limits: drop groups if necessary
-	for len(val) > 3800 && len(ns.G) > 0 {
-		ns.G = ns.G[:len(ns.G)/2]
-		val = encodeSession(authKey(st.secret), ns)
+	if ns.P == "sso" {
+		name, domain = ssoCookie, ns.H
 	}
 	ttl := int(ns.Exp - time.Now().Unix())
 	if ttl < 1 {
@@ -731,6 +836,16 @@ type authView struct {
 	Token    string
 	OK       string
 	Wide     bool
+	// passkeys: options for the browser (JSON), whether to offer them, and
+	// whether the account has no authenticator app
+	WebAuthn string
+	Passkey  bool
+	NoTOTP   bool
+	Nonce    string
+	// OpenID Provider: application name, consent items, form target
+	App    string
+	Scopes []string
+	Action string
 }
 
 // Heading is the page title for the step.
@@ -744,12 +859,20 @@ func (v authView) Heading() string {
 		return "Mein Konto"
 	case "acct_enroll":
 		return "Authenticator-App einrichten"
+	case "acct_passkey":
+		return "Passkey einrichten"
 	case "codes":
 		return "Wiederherstellungscodes"
 	case "pwchange":
 		return "Neues Passwort festlegen"
 	case "reset_request", "reset_sent", "reset", "reset_done":
 		return "Passwort zurücksetzen"
+	case "consent":
+		return "Zugriff erlauben?"
+	case "oidc_logout":
+		return "Abmelden?"
+	case "message":
+		return "Anmeldung nicht möglich"
 	}
 	return "Anmelden"
 }
@@ -766,6 +889,14 @@ func (v authView) SecretGroups() string {
 }
 
 func (h *Handler) authPage(w http.ResponseWriter, r *http.Request, info *reqInfo, status int, action string, v authView) error {
+	csp := "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+	if v.WebAuthn != "" {
+		// the passkey dialog needs a few lines of script – only on these pages
+		nb := make([]byte, 16)
+		_, _ = rand.Read(nb)
+		v.Nonce = b64.EncodeToString(nb)
+		csp += "; script-src 'nonce-" + v.Nonce + "'"
+	}
 	var buf bytes.Buffer
 	if err := authTmpl.Execute(&buf, v); err != nil {
 		return err
@@ -775,7 +906,7 @@ func (h *Handler) authPage(w http.ResponseWriter, r *http.Request, info *reqInfo
 	hd.Set("Cache-Control", "no-store")
 	hd.Set("X-Frame-Options", "DENY")
 	hd.Set("Referrer-Policy", "no-referrer")
-	hd.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+	hd.Set("Content-Security-Policy", csp)
 	w.WriteHeader(status)
 	n, _ := w.Write(buf.Bytes())
 	info.rec.Status, info.rec.Action, info.rec.Bytes = status, action, int64(n)
@@ -862,31 +993,40 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}td{padding:5px 6px 5p
 {{if .PasswordHint}}<p class="foot">{{.PasswordHint}}</p>{{end}}
 {{else if eq .Step "totp"}}
 {{if .User}}<p class="who">Konto: <b>{{.User}}</b></p>{{end}}
-<form method="post" action="/.sentinel/auth/login" autocomplete="off">
+{{if .Passkey}}<form id="pk" method="post" action="/.sentinel/auth/login" data-mode="get" data-opts="{{.WebAuthn}}">
+<input type="hidden" name="step" value="passkey"><input type="hidden" name="rd" value="{{.RD}}"><input type="hidden" name="ticket" value="{{.Ticket}}"><input type="hidden" name="webauthn">
+<button type="submit">Mit Passkey bestätigen</button><p class="hint" id="pk-msg"></p></form>
+{{if not .NoTOTP}}<div class="or"><span>oder</span></div>{{end}}{{end}}
+{{if not .NoTOTP}}<form method="post" action="/.sentinel/auth/login" autocomplete="off">
 <input type="hidden" name="step" value="totp"><input type="hidden" name="rd" value="{{.RD}}"><input type="hidden" name="ticket" value="{{.Ticket}}">
-<label for="c">Code aus der Authenticator-App</label><input id="c" class="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required autofocus>
-<button type="submit">Bestätigen</button></form>
+<label for="c">Code aus der Authenticator-App</label><input id="c" class="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required {{if not .Passkey}}autofocus{{end}}>
+<button type="submit"{{if .Passkey}} class="alt"{{end}}>Bestätigen</button></form>{{end}}
 <details><summary>Gerät nicht zur Hand?</summary>
 <form method="post" action="/.sentinel/auth/login" autocomplete="off">
 <input type="hidden" name="step" value="totp"><input type="hidden" name="rd" value="{{.RD}}"><input type="hidden" name="ticket" value="{{.Ticket}}">
 <label for="rc">Wiederherstellungscode</label><input id="rc" name="code" placeholder="xxxxx-xxxxx" autocapitalize="none" spellcheck="false" maxlength="16" required>
-<p class="hint">Jeder Code funktioniert einmal. Danach unter „Mein Konto“ die App auf dem neuen Gerät einrichten. Ohne Codes hilft die Administration.</p>
+<p class="hint">Jeder Code funktioniert einmal. Danach unter „Mein Konto“ die App oder einen Passkey auf dem neuen Gerät einrichten. Ohne Codes hilft die Administration.</p>
 <button type="submit" class="alt">Mit Wiederherstellungscode anmelden</button></form></details>
 <p class="foot"><a href="/.sentinel/auth/login?rd={{.RD}}">Mit anderem Konto anmelden</a></p>
 {{else if eq .Step "enroll"}}
 {{if .User}}<p class="who">Konto: <b>{{.User}}</b></p>{{end}}
-<p style="margin:8px 0 0;font-size:14px">Für diese Seite ist ein zweiter Faktor nötig. Richte ihn jetzt einmalig ein:</p>
+<p style="margin:8px 0 0;font-size:14px">Für diese Seite ist ein zweiter Faktor nötig. Richte ihn jetzt einmalig ein.</p>
+{{if .Passkey}}<form id="pk" method="post" action="/.sentinel/auth/login" data-mode="create" data-opts="{{.WebAuthn}}">
+<input type="hidden" name="step" value="passkey_enroll"><input type="hidden" name="rd" value="{{.RD}}"><input type="hidden" name="ticket" value="{{.Ticket}}"><input type="hidden" name="webauthn">
+<p class="hint">Am einfachsten mit einem Passkey: Fingerabdruck, Gesichtserkennung oder Geräte-PIN dieses Geräts, eines Smartphones oder eines Sicherheitsschlüssels.</p>
+<button type="submit">Passkey einrichten und anmelden</button><p class="hint" id="pk-msg"></p></form>
+<div class="or"><span>oder Authenticator-App</span></div>{{end}}
 <ol><li>Authenticator-App öffnen (z.&nbsp;B. Microsoft Authenticator, Google Authenticator, 2FAS)</li><li>QR-Code scannen</li><li>Angezeigten 6-stelligen Code eingeben</li></ol>
 {{if .QR}}<img class="qr" src="{{.QR}}" alt="QR-Code für die Authenticator-App">{{end}}
 <div class="secret" title="Schlüssel für die manuelle Eingabe">{{.SecretGroups}}</div>
 <form method="post" action="/.sentinel/auth/login" autocomplete="off">
 <input type="hidden" name="step" value="enroll"><input type="hidden" name="rd" value="{{.RD}}"><input type="hidden" name="ticket" value="{{.Ticket}}">
-<label for="c">Code aus der App</label><input id="c" class="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required autofocus>
+<label for="c">Code aus der App</label><input id="c" class="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required{{if not .Passkey}} autofocus{{end}}>
 <button type="submit">Einrichten und anmelden</button></form>
 {{else if eq .Step "denied"}}
 {{if .User}}<p class="who">Angemeldet als <b>{{.User}}</b></p>{{end}}
 <p style="font-size:14px">Wende dich an die Administration, wenn du Zugriff benötigst.</p>
-<p class="foot"><a href="/.sentinel/auth/logout">Abmelden</a> · <a href="/.sentinel/auth/login?rd={{.RD}}">Mit anderem Konto anmelden</a></p>
+<form method="post" action="/.sentinel/auth/logout" class="foot"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="alt">Abmelden</button> · <a href="/.sentinel/auth/login?rd={{.RD}}">Mit anderem Konto anmelden</a></form>
 {{else if eq .Step "me"}}
 {{if .OK}}<div class="ok" role="status">{{.OK}}</div>{{end}}
 <dl><dt>Konto</dt><dd>{{.User}}</dd>
@@ -909,11 +1049,28 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}td{padding:5px 6px 5p
 <label for="c2">Aktueller Code aus der App</label><input id="c2" name="code" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" maxlength="16" required>
 <p class="hint">Zehn Codes zum Ausdrucken oder für den Passwortmanager. Bisherige Codes werden ungültig.</p>
 <button type="submit">Codes erzeugen</button></form></details>
-{{else}}<p class="t muted">Noch nicht eingerichtet. Mit einer Authenticator-App ist dein Konto auch bei bekanntem Passwort geschützt.</p>
+{{else}}<p class="t muted">{{if .Passkeys}}Authenticator-App: nicht eingerichtet – du meldest dich mit Passkey an.{{else}}Noch nicht eingerichtet. Mit einer Authenticator-App oder einem Passkey ist dein Konto auch bei bekanntem Passwort geschützt.{{end}}</p>
 <details><summary>Authenticator-App einrichten</summary>
 <form method="post" action="/.sentinel/auth/me" autocomplete="off"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="do" value="totp">
 {{if eq $ra "password"}}<label for="p1">Passwort zur Bestätigung</label><input id="p1" name="password" type="password" autocomplete="current-password" required>{{end}}
 <button type="submit">Weiter</button></form></details>{{end}}
+<p class="t" style="margin-top:14px"><b>Passkeys</b></p>
+{{if .Passkeys}}<table>{{range .Passkeys}}<tr><td>{{.Name}}</td><td class="r muted">seit {{unix .Created}}{{if .LastUsed}}<br>zuletzt {{unix .LastUsed}}{{end}}</td>
+<td class="r"><details style="border:0;padding:0;margin:0"><summary style="padding:0;font-weight:400">Entfernen</summary>
+<form method="post" action="/.sentinel/auth/me" autocomplete="off"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="do" value="passkey_del"><input type="hidden" name="id" value="{{.ID}}">
+{{if eq $ra "code"}}<input name="code" placeholder="Code aus der App" autocomplete="one-time-code" maxlength="16" required>{{else if eq $ra "password"}}<input name="password" type="password" placeholder="Passwort" autocomplete="current-password" required>{{end}}
+<button type="submit" class="alt">Entfernen</button></form></details></td></tr>{{end}}</table>
+{{if not .TOTP}}<details{{if not .RecoveryLeft}} open{{end}}><summary>Wiederherstellungscodes{{if .RecoveryLeft}} ({{.RecoveryLeft}} übrig){{end}}</summary>
+<form method="post" action="/.sentinel/auth/me" autocomplete="off"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="do" value="recovery">
+{{if eq $ra "password"}}<label for="pr">Passwort zur Bestätigung</label><input id="pr" name="password" type="password" autocomplete="current-password" required>{{end}}
+<p class="hint">Für den Fall, dass kein Gerät mit Passkey zur Hand ist. Bisherige Codes werden ungültig.</p>
+<button type="submit">Codes erzeugen</button></form></details>{{end}}
+{{else}}<p class="t muted">Mit einem Passkey bestätigst du die Anmeldung per Fingerabdruck, Gesichtserkennung oder Geräte-PIN – ohne Code abzutippen.</p>{{end}}
+<details><summary>Passkey hinzufügen</summary>
+<form method="post" action="/.sentinel/auth/me" autocomplete="off"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="do" value="passkey_begin">
+{{if eq $ra "code"}}<label for="pc">Aktueller Code aus der App</label><input id="pc" name="code" autocomplete="one-time-code" maxlength="16" required>{{else if eq $ra "password"}}<label for="pp">Passwort zur Bestätigung</label><input id="pp" name="password" type="password" autocomplete="current-password" required>{{end}}
+<p class="hint">Funktioniert nur über HTTPS. Der Passkey gilt für {{if $.SSO}}alle Seiten unter {{$.SSO}}{{else}}diese Seite{{end}}.</p>
+<button type="submit">Weiter</button></form></details>
 <h2>Passwort</h2>
 {{if .CanPassword}}<p class="t muted">{{if .PWChanged}}Zuletzt geändert am {{unix .PWChanged}}.{{else}}Von der Administration gesetzt.{{end}}</p>
 <details><summary>Passwort ändern</summary>
@@ -932,7 +1089,7 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}td{padding:5px 6px 5p
 <form method="post" action="/.sentinel/auth/me"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="do" value="logout_all">
 <button type="submit" class="alt" style="margin-top:6px">Auf allen Geräten abmelden</button></form>
 {{end}}
-<a class="btn" href="/.sentinel/auth/logout">Abmelden</a>
+<form method="post" action="/.sentinel/auth/logout"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="btn">Abmelden</button></form>
 {{else if eq .Step "acct_enroll"}}
 <ol><li>Authenticator-App auf dem neuen Gerät öffnen</li><li>QR-Code scannen</li><li>Angezeigten 6-stelligen Code eingeben</li></ol>
 {{if .QR}}<img class="qr" src="{{.QR}}" alt="QR-Code für die Authenticator-App">{{end}}
@@ -941,6 +1098,13 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}td{padding:5px 6px 5p
 <label for="c">Code aus der neuen App</label><input id="c" class="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required autofocus>
 <button type="submit">Einrichten</button></form>
 <p class="foot"><a href="/.sentinel/auth/me">Abbrechen – alte App bleibt gültig</a></p>
+{{else if eq .Step "acct_passkey"}}
+<form id="pk" method="post" action="/.sentinel/auth/me" data-mode="create" data-opts="{{.WebAuthn}}">
+<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="do" value="passkey_add"><input type="hidden" name="ticket" value="{{.Ticket}}"><input type="hidden" name="webauthn">
+<label for="pn">Name des Passkeys</label><input id="pn" name="name" maxlength="60" placeholder="z. B. Laptop, Smartphone, YubiKey" autofocus>
+<p class="hint">Nach dem Klick fragt der Browser nach Fingerabdruck, Gesichtserkennung, Geräte-PIN oder dem Sicherheitsschlüssel.</p>
+<button type="submit">Passkey erstellen</button><p class="hint" id="pk-msg"></p></form>
+<p class="foot"><a href="/.sentinel/auth/me">Abbrechen</a></p>
 {{else if eq .Step "codes"}}
 {{if .OK}}<div class="ok" role="status">{{.OK}}</div>{{end}}
 <p class="t">Bewahre diese Codes sicher auf – sie werden nur jetzt angezeigt. Jeder Code ersetzt einmal den Code aus der App.</p>
@@ -975,8 +1139,50 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}td{padding:5px 6px 5p
 {{else if eq .Step "reset_done"}}
 {{if .OK}}<div class="ok" role="status">{{.OK}}</div>{{end}}
 <a class="btn" href="/.sentinel/auth/login">Zur Anmeldung</a>
+{{else if eq .Step "consent"}}
+{{if .User}}<p class="who">Angemeldet als <b>{{.User}}</b></p>{{end}}
+<p style="font-size:14px">Die Anwendung <b>{{.App}}</b> möchte dich anmelden und erhält dabei:</p>
+<ul style="font-size:14px;margin:0 0 14px 18px;padding:0">{{range .Scopes}}<li>{{.}}</li>{{end}}</ul>
+<form method="post" action="/.sentinel/oidc/authorize"><input type="hidden" name="ticket" value="{{.Ticket}}">
+<button type="submit" name="decision" value="allow">Erlauben</button>
+<button type="submit" name="decision" value="deny" class="alt" style="margin-top:8px">Ablehnen</button></form>
+<p class="hint">Deine Entscheidung gilt für diese Anwendung, bis sie mehr Angaben verlangt.</p>
+{{else if eq .Step "oidc_logout"}}
+{{if .User}}<p class="who">Angemeldet als <b>{{.User}}</b></p>{{end}}
+<p style="font-size:14px">{{if .App}}Die Anwendung <b>{{.App}}</b> möchte dich abmelden.{{else}}Möchtest du dich abmelden?{{end}} Danach bist du bei allen Anwendungen dieser Anmeldung abgemeldet.</p>
+<form method="post" action="{{.Action}}"><input type="hidden" name="confirm" value="1"><button type="submit">Abmelden</button></form>
+<p class="foot"><a href="/">Abbrechen</a></p>
+{{else if eq .Step "message"}}
+<p class="foot"><a href="/.sentinel/auth/me">Mein Konto</a></p>
+{{else if eq .Step "logout_confirm"}}
+{{if .User}}<p class="who">Angemeldet als <b>{{.User}}</b></p>{{end}}
+<form method="post" action="/.sentinel/auth/logout"><input type="hidden" name="csrf" value="{{.CSRF}}">
+<button type="submit">{{if .SSO}}Von allen Seiten unter {{.SSO}} abmelden{{else}}Abmelden{{end}}</button></form>
+<p class="foot"><a href="/">Abbrechen</a></p>
 {{else if eq .Step "logout"}}
 <p style="font-size:14px">Du wurdest {{if .SSO}}von allen Seiten unter {{.SSO}}{{else}}von dieser Seite{{end}} abgemeldet.</p>
 <p class="foot"><a href="/.sentinel/auth/login">Erneut anmelden</a></p>
 {{end}}
+{{if .Nonce}}<script nonce="{{.Nonce}}">
+(function(){
+var f=document.getElementById('pk');if(!f)return;
+var b=f.querySelector('button'),m=document.getElementById('pk-msg');
+if(!window.PublicKeyCredential||!navigator.credentials){b.disabled=true;m.textContent='Dieser Browser unterstützt keine Passkeys.';return;}
+function d(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0);});}
+function e(buf){var a=new Uint8Array(buf),s='';for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
+f.addEventListener('submit',function(ev){
+ev.preventDefault();m.textContent='';b.disabled=true;
+var o=JSON.parse(f.getAttribute('data-opts')).publicKey,create=f.getAttribute('data-mode')==='create';
+o.challenge=d(o.challenge);
+if(create){o.user.id=d(o.user.id);(o.excludeCredentials||[]).forEach(function(c){c.id=d(c.id);});}
+else{(o.allowCredentials||[]).forEach(function(c){c.id=d(c.id);});}
+(create?navigator.credentials.create({publicKey:o}):navigator.credentials.get({publicKey:o})).then(function(c){
+var r={id:c.id,type:c.type,response:{clientDataJSON:e(c.response.clientDataJSON)}};
+if(create){r.response.attestationObject=e(c.response.attestationObject);}
+else{r.response.authenticatorData=e(c.response.authenticatorData);r.response.signature=e(c.response.signature);}
+f.querySelector('input[name=webauthn]').value=JSON.stringify(r);f.submit();
+}).catch(function(x){b.disabled=false;m.textContent=x&&x.name==='NotAllowedError'?'Abgebrochen oder Zeit abgelaufen – bitte erneut versuchen.':(x&&x.name==='InvalidStateError'?'Dieser Passkey ist schon eingerichtet.':'Passkey nicht möglich: '+(x&&x.message||x));});
+});
+})();
+</script>{{end}}
 </main></body></html>`))

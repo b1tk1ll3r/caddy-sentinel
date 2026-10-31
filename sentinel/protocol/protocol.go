@@ -42,8 +42,28 @@ type State struct {
 	// challenge mode "suspicious" (set by the IDS for medium threat scores).
 	Challenges []Ban `json:"challenges"`
 
-	// ChallengeSecret signs challenge tokens and pass cookies (hex).
+	// ChallengeSecret signs challenge tokens, pass cookies and OAuth start
+	// requests (hex). Each instance gets its own.
 	ChallengeSecret string `json:"challenge_secret"`
+
+	// Instance is the ID of the Caddy instance this state is meant for.
+	Instance string `json:"instance,omitempty"`
+
+	// SessionKey is the panel's Ed25519 public key (base64) that site-login
+	// sessions are signed with.
+	SessionKey string `json:"session_key,omitempty"`
+
+	// RevokedSessions are session IDs ended by "Abmelden" before their
+	// expiry (ID -> expiry unix time).
+	RevokedSessions map[string]int64 `json:"revoked_sessions,omitempty"`
+
+	// NeverBan: IPs/CIDRs the agent must not ban locally (rate limit "ban"
+	// still answers 429).
+	NeverBan []string `json:"never_ban,omitempty"`
+
+	// BanIPv6Prefix: local rate-limit bans of IPv6 clients cover this prefix
+	// length (64 = the whole /64 the limit counted; 0/128 = single address).
+	BanIPv6Prefix int `json:"ban_ipv6_prefix,omitempty"`
 
 	// GeoIP database paths (MaxMind/DB-IP .mmdb) on the Caddy host.
 	GeoIP GeoIP `json:"geoip"`
@@ -66,6 +86,9 @@ type State struct {
 	// AuthFeatures switches optional login page features on ("reset" =
 	// password reset by e-mail for access accounts).
 	AuthFeatures []string `json:"auth_features,omitempty"`
+
+	// IdP: Sentinel acts as OpenID Provider on this host (the issuer's).
+	IdP *IdPState `json:"idp,omitempty"`
 }
 
 // AuthToken lets scripts and services reach a protected site with
@@ -85,6 +108,25 @@ type AuthToken struct {
 type AuthProvider struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// Open: anyone can create an account there (GitHub, Google, …) and the
+	// provider has no e-mail domain restriction – see OpenSourceAllowed.
+	Open bool `json:"open,omitempty"`
+}
+
+// OpenSourceAllowed reports whether a site accepts accounts of an open
+// provider (source "oidc:<id>"): only when it restricts users or groups or
+// lists the provider explicitly as login source. Otherwise every account
+// on GitHub & Co. would get in.
+func OpenSourceAllowed(a AuthPolicy, source string) bool {
+	if len(a.AllowedGroups) > 0 || len(a.AllowedUsers) > 0 {
+		return true
+	}
+	for _, s := range a.Sources {
+		if s == source {
+			return true
+		}
+	}
+	return false
 }
 
 // TokenPrefix marks site access tokens.
@@ -114,6 +156,9 @@ type Ban struct {
 	IP     string `json:"ip"`    // IP or CIDR
 	Until  int64  `json:"until"` // unix seconds, 0 = permanent
 	Reason string `json:"reason"`
+	// Inst limits the ban to one Caddy instance ("" = all). The panel only
+	// hands an instance the bans that apply to it.
+	Inst string `json:"inst,omitempty"`
 }
 
 // Policy describes everything Sentinel enforces for a site.
@@ -307,8 +352,73 @@ type AuthRequest struct {
 	// self-service steps (acct_*).
 	Account string `json:"account,omitempty"`
 	Issued  int64  `json:"issued,omitempty"`
-	// Origin (scheme://host[:port]) for links in e-mails (reset_request).
+	// Origin (scheme://host[:port]) for links in e-mails (reset_request)
+	// and passkeys (expected origin).
 	Origin string `json:"origin,omitempty"`
+	// Session is the signed session cookie for the step "logout" (its ID is
+	// revoked) and the passkey account steps.
+	Session string `json:"session,omitempty"`
+	// WebAuthn carries the browser's JSON answer for passkey steps.
+	WebAuthn string `json:"webauthn,omitempty"`
+	// RD is the target after a login step (an OIDC authorization request
+	// may raise the requirements of the login, e.g. a second factor).
+	RD string `json:"rd,omitempty"`
+	// OIDC carries a call of the OpenID Connect provider (Step "oidc").
+	OIDC *OIDCRequest `json:"oidc,omitempty"`
+}
+
+// OIDC endpoint paths on the issuer host (Sentinel as OpenID Provider).
+const (
+	OIDCPrefix    = "/.sentinel/oidc/"
+	OIDCAuthorize = "/.sentinel/oidc/authorize"
+	OIDCToken     = "/.sentinel/oidc/token"
+	OIDCUserinfo  = "/.sentinel/oidc/userinfo"
+	OIDCJWKS      = "/.sentinel/oidc/jwks"
+	OIDCLogout    = "/.sentinel/oidc/logout"
+	OIDCRevoke    = "/.sentinel/oidc/revoke"
+	OIDCDiscovery = "/.well-known/openid-configuration"
+)
+
+// OIDCRequest is an OpenID Connect endpoint call on the issuer host that
+// the agent forwards to the panel.
+type OIDCRequest struct {
+	// Endpoint: config | jwks | authorize | consent | token | userinfo |
+	// revoke | logout
+	Endpoint string `json:"endpoint"`
+	Method   string `json:"method,omitempty"`
+	Query    string `json:"query,omitempty"` // raw query string
+	Form     string `json:"form,omitempty"`  // raw urlencoded body
+	// Authorization header (client authentication, bearer token).
+	Authorization string `json:"authorization,omitempty"`
+}
+
+// OIDCReply tells the agent how to answer an OIDCRequest.
+type OIDCReply struct {
+	// Kind: http (write Status/CType/Body) | redirect (Location) | login
+	// (send the browser to the login page with RD) | consent (render the
+	// consent page) | error (render Message as an error page) | logout
+	// (end the session, then redirect to Location or show the logout page)
+	// | confirm_logout (ask before ending the session)
+	Kind     string `json:"kind"`
+	Status   int    `json:"status,omitempty"`
+	CType    string `json:"ctype,omitempty"`
+	Body     string `json:"body,omitempty"`
+	Location string `json:"location,omitempty"`
+	// login: RD is the authorization URL to come back to; MFA asks for a
+	// second factor, Fresh shows the form even with a valid session.
+	RD    string `json:"rd,omitempty"`
+	MFA   bool   `json:"mfa,omitempty"`
+	Fresh bool   `json:"fresh,omitempty"`
+	// consent
+	Client string   `json:"client,omitempty"`
+	Scopes []string `json:"scopes,omitempty"`
+	Ticket string   `json:"ticket,omitempty"`
+	// Message for error pages and the consent page.
+	Message string `json:"message,omitempty"`
+	// Cacheable answers (discovery, keys) may be kept for MaxAge seconds.
+	MaxAge int `json:"max_age,omitempty"`
+	// Headers to add (http answers), e.g. WWW-Authenticate.
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // AuthResponse answers an AuthRequest.
@@ -329,21 +439,41 @@ type AuthResponse struct {
 	// Self-service: account overview, recovery codes (shown once).
 	Account *AccountInfo `json:"account,omitempty"`
 	Codes   []string     `json:"codes,omitempty"`
+	// Session is the panel-signed session cookie value for Status "ok".
+	Session string `json:"session,omitempty"`
+	// WebAuthn holds options for navigator.credentials (JSON) and
+	// PasskeyOnly reports that the second factor may be a passkey.
+	WebAuthn string `json:"webauthn,omitempty"`
+	Passkey  bool   `json:"passkey,omitempty"`
+	// NoTOTP: the account has no authenticator app (passkey or recovery
+	// code only).
+	NoTOTP bool `json:"no_totp,omitempty"`
 	// NeedCode: the step needs a TOTP or recovery code (reset_check).
 	NeedCode bool `json:"need_code,omitempty"`
+	// OIDC answers a Step "oidc" request.
+	OIDC *OIDCReply `json:"oidc,omitempty"`
 }
 
 // AccountInfo is what the self-service page shows about the signed-in account.
 type AccountInfo struct {
-	Source       string       `json:"source"` // ldap | local | oidc:<id>
-	SourceLabel  string       `json:"source_label"`
-	Email        string       `json:"email,omitempty"`
-	TOTP         bool         `json:"totp"`
-	RecoveryLeft int          `json:"recovery_left"`
-	CanPassword  bool         `json:"can_password"` // password kept in Sentinel
-	PWChanged    int64        `json:"pw_changed,omitempty"`
-	Expires      int64        `json:"expires,omitempty"`
-	Recent       []LoginEntry `json:"recent,omitempty"`
+	Source       string        `json:"source"` // ldap | local | oidc:<id>
+	SourceLabel  string        `json:"source_label"`
+	Email        string        `json:"email,omitempty"`
+	TOTP         bool          `json:"totp"`
+	Passkeys     []PasskeyInfo `json:"passkeys,omitempty"`
+	RecoveryLeft int           `json:"recovery_left"`
+	CanPassword  bool          `json:"can_password"` // password kept in Sentinel
+	PWChanged    int64         `json:"pw_changed,omitempty"`
+	Expires      int64         `json:"expires,omitempty"`
+	Recent       []LoginEntry  `json:"recent,omitempty"`
+}
+
+// PasskeyInfo describes a registered passkey on the account page.
+type PasskeyInfo struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Created  int64  `json:"created"`
+	LastUsed int64  `json:"last_used,omitempty"`
 }
 
 // LoginEntry is one line of the account's recent sign-in activity.
@@ -391,7 +521,18 @@ func AuthAllowed(a AuthPolicy, user string, groups []string) bool {
 		}
 	}
 	for _, want := range a.AllowedGroups {
-		w := GroupCN(want)
+		if IsDN(want) {
+			// a full DN only matches exactly this directory group, never a
+			// same-named group from another OU or another source
+			w := NormalizeDN(want)
+			for _, g := range groups {
+				if IsDN(g) && NormalizeDN(g) == w {
+					return true
+				}
+			}
+			continue
+		}
+		w := strings.TrimSpace(want)
 		for _, g := range groups {
 			if strings.EqualFold(GroupCN(g), w) {
 				return true
@@ -399,6 +540,93 @@ func AuthAllowed(a AuthPolicy, user string, groups []string) bool {
 		}
 	}
 	return false
+}
+
+// IsDN reports whether s is a distinguished name of the form "CN=x,…"
+// (at least two RDNs) rather than a plain group name.
+func IsDN(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 4 || !strings.EqualFold(s[:3], "cn=") {
+		return false
+	}
+	return len(splitRDNs(s)) >= 2
+}
+
+// splitRDNs splits a DN at unescaped commas.
+func splitRDNs(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case ',':
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	return append(out, s[start:])
+}
+
+// NormalizeDN returns a canonical form of a DN for comparisons: attribute
+// types and values lower-cased, spaces around separators removed and
+// escapes resolved ("CN=Admins\, Linux , OU=G" -> "cn=admins, linux,ou=g"
+// with the escaped comma kept as "\,").
+func NormalizeDN(s string) string {
+	parts := splitRDNs(strings.TrimSpace(s))
+	for i, p := range parts {
+		typ, val, _ := strings.Cut(p, "=")
+		parts[i] = strings.ToLower(strings.TrimSpace(typ)) + "=" + escapeDNValue(strings.ToLower(unescapeDNValue(strings.TrimSpace(val))))
+	}
+	return strings.Join(parts, ",")
+}
+
+func unescapeDNValue(v string) string {
+	if !strings.Contains(v, `\`) {
+		return v
+	}
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		if v[i] != '\\' || i+1 >= len(v) {
+			b.WriteByte(v[i])
+			continue
+		}
+		if i+2 < len(v) && isHex(v[i+1]) && isHex(v[i+2]) {
+			b.WriteByte(unhex(v[i+1])<<4 | unhex(v[i+2]))
+			i += 2
+			continue
+		}
+		i++
+		b.WriteByte(v[i])
+	}
+	return b.String()
+}
+
+func escapeDNValue(v string) string {
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		switch v[i] {
+		case ',', '+', '"', '\\', '<', '>', ';', '=':
+			b.WriteByte('\\')
+		}
+		b.WriteByte(v[i])
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
 }
 
 // GroupCN returns the CN of a distinguished name ("CN=VPN,OU=x,DC=y" ->
@@ -479,6 +707,13 @@ type WAF struct {
 	InspectBody bool `json:"inspect_body"`
 	// BodyLimit for inspection in bytes (default 1 MiB).
 	BodyLimit int `json:"body_limit"`
+	// BodyLimitAction: "" / "partial" inspects the first BodyLimit bytes of
+	// larger bodies, "reject" answers 413.
+	BodyLimitAction string `json:"body_limit_action,omitempty"`
+	// InspectResponse checks text responses (HTML, JSON, XML, plain text) up
+	// to BodyLimit against the CRS response rules – detection only, the
+	// response is never held back or changed.
+	InspectResponse bool `json:"inspect_response,omitempty"`
 }
 
 type WAFExclusion struct {
@@ -657,6 +892,19 @@ const (
 	ActionToken       = "auth_token"    // invalid or expired site access token
 )
 
+// KnownAction reports whether a is an action an agent can report (also
+// with the TestPrefix of path-rule dry runs).
+func KnownAction(a string) bool {
+	switch strings.TrimPrefix(a, TestPrefix) {
+	case "", ActionBanned, ActionIPDeny, ActionMaintenance, ActionMethod, ActionUserAgent, ActionHoneypot,
+		ActionBodyLimit, ActionRateLimit, ActionRateBan, ActionWAFBlock, ActionWAFDetect, ActionGeo, ActionFeed,
+		ActionFeedMatch, ActionChallenge, ActionChallengeOK, ActionAuth, ActionAuthFail, ActionAuthDenied,
+		ActionAuthOK, ActionPathBlock, ActionRedirect, ActionAPIKey, ActionBot, ActionBotLimit, ActionBotFake, ActionToken:
+		return true
+	}
+	return false
+}
+
 // IsBlocking reports whether an action means the request was not served.
 func IsBlocking(action string) bool {
 	if strings.HasPrefix(action, TestPrefix) {
@@ -676,4 +924,11 @@ type Hit struct {
 	Tags     []string `json:"tags,omitempty"`
 	Data     string   `json:"data,omitempty"`
 	Disrupt  bool     `json:"dis,omitempty"`
+}
+
+// IdPState is the part of the OpenID Provider configuration the agents
+// need: the host that serves the endpoints. Clients, keys and tokens stay
+// in the panel.
+type IdPState struct {
+	Host string `json:"host"` // issuer host name (lower case, without port)
 }

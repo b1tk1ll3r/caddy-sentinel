@@ -250,9 +250,11 @@ func (s *Store) UserByID(id int64) (*User, error) {
 }
 
 func (s *Store) SetPassword(id int64, hash string) error {
+	// a new password ends every session and API token of the account: a
+	// token created by whoever knew the old password must not survive
 	_, err := s.Exec(`UPDATE users SET pw_hash=? WHERE id=?`, hash, id)
 	if err == nil {
-		_, err = s.Exec(`DELETE FROM sessions WHERE user_id=?`, id)
+		err = s.RevokeUserAccess(id)
 	}
 	return err
 }
@@ -416,13 +418,19 @@ type Ban struct {
 	Bans    int     `json:"bans"` // total bans of this IP (offender history)
 	Note    string  `json:"note"`
 	Author  string  `json:"author"`
+	// Inst: the ban applies only to this Caddy instance ("" = all).
+	Inst string `json:"inst"`
 }
 
+// PutBan stores a ban. A ban limited to one instance never narrows an
+// active ban for all instances; bans for two different instances add up
+// to a ban for all.
 func (s *Store) PutBan(b Ban) error {
 	return s.Tx(context.Background(), func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`INSERT INTO bans(ip,reason,source,created,until,score,note,author) VALUES(?,?,?,?,?,?,?,?)
-			ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason,source=excluded.source,created=excluded.created,until=excluded.until,score=excluded.score,note=excluded.note,author=excluded.author`,
-			b.IP, b.Reason, b.Source, b.Created, b.Until, b.Score, b.Note, b.Author); err != nil {
+		if _, err := tx.Exec(`INSERT INTO bans(ip,reason,source,created,until,score,note,author,inst) VALUES(?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason,source=excluded.source,created=excluded.created,until=excluded.until,score=excluded.score,note=excluded.note,author=excluded.author,
+			inst=CASE WHEN bans.until<>0 AND bans.until<=? THEN excluded.inst WHEN bans.inst=excluded.inst THEN excluded.inst ELSE '' END`,
+			b.IP, b.Reason, b.Source, b.Created, b.Until, b.Score, b.Note, b.Author, b.Inst, time.Now().Unix()); err != nil {
 			return err
 		}
 		_, err := tx.Exec(`INSERT INTO offenders(ip,bans,last_ban) VALUES(?,1,?) ON CONFLICT(ip) DO UPDATE SET bans=bans+1,last_ban=excluded.last_ban`, b.IP, b.Created)
@@ -452,7 +460,7 @@ func (s *Store) DeleteBan(ip string) (bool, error) {
 // ActiveBans returns non-expired bans.
 func (s *Store) ActiveBans() ([]Ban, error) {
 	now := time.Now().Unix()
-	rows, err := s.DB.Query(`SELECT b.ip,COALESCE(b.reason,''),COALESCE(b.source,''),b.created,b.until,COALESCE(b.score,0),COALESCE(o.bans,0),COALESCE(b.note,''),COALESCE(b.author,'')
+	rows, err := s.DB.Query(`SELECT b.ip,COALESCE(b.reason,''),COALESCE(b.source,''),b.created,b.until,COALESCE(b.score,0),COALESCE(o.bans,0),COALESCE(b.note,''),COALESCE(b.author,''),b.inst
 		FROM bans b LEFT JOIN offenders o ON o.ip=b.ip WHERE b.until=0 OR b.until>? ORDER BY b.created DESC`, now)
 	if err != nil {
 		return nil, err
@@ -461,7 +469,7 @@ func (s *Store) ActiveBans() ([]Ban, error) {
 	var out []Ban
 	for rows.Next() {
 		var b Ban
-		if err := rows.Scan(&b.IP, &b.Reason, &b.Source, &b.Created, &b.Until, &b.Score, &b.Bans, &b.Note, &b.Author); err != nil {
+		if err := rows.Scan(&b.IP, &b.Reason, &b.Source, &b.Created, &b.Until, &b.Score, &b.Bans, &b.Note, &b.Author, &b.Inst); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -630,6 +638,12 @@ func (s *Store) Prune(requestHours, eventDays, rollupDays int) error {
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
+		// hourly aggregates are small: keep them at least 8 days, so top
+		// lists, failure analysis and the weekly report cover a full week
+		// even with a short raw retention
+		if week := now.Add(-8 * 24 * time.Hour).UnixMilli(); week < cut {
+			cut = week
+		}
 		s.PruneAgg(cut)
 	}
 	if eventDays > 0 {
@@ -643,6 +657,7 @@ func (s *Store) Prune(requestHours, eventDays, rollupDays int) error {
 		}
 	}
 	_, _ = s.Exec(`DELETE FROM sessions WHERE expires<?`, now.Unix())
+	s.pruneRevokedSessions()
 	_, _ = s.Exec(`DELETE FROM ingest_batches WHERE ts<?`, now.Add(-6*time.Hour).Unix())
 	// repeat-offender history: one year; Caddyfile versions: newest 200 per instance
 	_, _ = s.Exec(`DELETE FROM offenders WHERE last_ban<?`, now.AddDate(-1, 0, 0).Unix())

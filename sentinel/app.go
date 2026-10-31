@@ -16,6 +16,8 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -94,6 +96,11 @@ func (a *App) Provision(ctx caddy.Context) error {
 		a.Panel = "http://127.0.0.1:7600"
 	}
 	a.Panel = strings.TrimRight(a.Panel, "/")
+	if u, err := url.Parse(a.Panel); err == nil && u.Scheme == "http" && !panelHostLocal(u.Hostname()) {
+		// token, passwords of site logins and the whole policy state travel
+		// over this connection
+		ctx.Logger().Warn("sentinel: the panel is reached over plain http – use https:// for panels on other hosts", zap.String("panel", a.Panel))
+	}
 	if a.Token == "" {
 		a.Token = os.Getenv("SENTINEL_TOKEN")
 	}
@@ -126,6 +133,7 @@ func (a *App) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return err
 	}
+	rc.storage = ctx.Storage()
 	key := a.Panel + "|" + a.Token
 	val, _, err := cores.LoadOrNew(key, func() (caddy.Destructor, error) {
 		return newCore(a.Panel, a.Token, a.CacheFile, a.FailClosed, protocol.GeoIP{CountryDB: a.GeoIPCountry, ASNDB: a.GeoIPASN}, ctx.Logger().Named("core")), nil
@@ -334,11 +342,13 @@ func (c *core) fetchState(ctx context.Context, cur int64) (bool, error) {
 	start := time.Now()
 	c.syncFeeds(ctx, &s)
 	c.updateGeo(s.GeoIP)
-	rs, err := safeCompile(&s, c.state.Load())
+	prev := c.state.Load()
+	rs, err := safeCompile(&s, prev)
 	if err != nil {
 		return false, err // keep enforcing the previous state
 	}
 	c.state.Store(rs)
+	c.liftLocalBans(prev, rs)
 	c.saveCache(raw)
 	c.log.Info("sentinel: applied state", zap.Int64("version", s.Version),
 		zap.Int("policies", len(s.Policies)), zap.Int("bans", len(s.Bans)),
@@ -687,4 +697,39 @@ func safeCompile(s *protocol.State, prev *runtimeState) (rs *runtimeState, err e
 		}
 	}()
 	return compileState(s, prev), nil
+}
+
+// liftLocalBans drops local rate-limit bans the panel has confirmed and an
+// administrator has lifted since (banned before, not banned now). Bans the
+// panel has not confirmed yet stay in force until they expire.
+func (c *core) liftLocalBans(prev, next *runtimeState) {
+	if prev == nil {
+		return
+	}
+	now := time.Now().Unix()
+	c.localBans.Range(func(k, _ any) bool {
+		a, err := netip.ParseAddr(k.(string))
+		if err != nil {
+			p, perr := netip.ParsePrefix(k.(string))
+			if perr != nil {
+				return true
+			}
+			a = p.Addr()
+		}
+		if _, was := prev.banned(a, now); was {
+			if _, still := next.banned(a, now); !still {
+				c.localBans.Delete(k)
+			}
+		}
+		return true
+	})
+}
+
+// panelHostLocal: loopback, private networks and single-label names
+// (Docker service names) – where plain http to the panel is usual.
+func panelHostLocal(h string) bool {
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate()
+	}
+	return h == "localhost" || !strings.Contains(h, ".")
 }

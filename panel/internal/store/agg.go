@@ -639,7 +639,7 @@ func (s *Store) failuresAgg(from, to int64, inst, host string, limit int) ([]Fai
 	return out, true, nil
 }
 
-// PruneAgg drops aggregates older than the raw retention.
+// PruneAgg drops aggregates older than before.
 func (s *Store) PruneAgg(before int64) {
 	h := before / hourMs * hourMs
 	_, _ = s.Exec(`DELETE FROM agg_top WHERE hour<?`, h)

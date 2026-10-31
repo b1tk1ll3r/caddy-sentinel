@@ -1,6 +1,7 @@
 package sentinel
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -31,6 +32,8 @@ type runtimeState struct {
 	secret     []byte
 	tokens     map[string]*protocol.AuthToken // raw SHA-256 -> token
 	sources    map[string]bool                // password sources available
+	sessPub    ed25519.PublicKey              // verifies site-login sessions
+	neverBan   *ipSet[struct{}]               // no local rate-limit bans
 }
 
 type wildHost struct {
@@ -83,6 +86,11 @@ func compileState(s *protocol.State, prev *runtimeState) *runtimeState {
 		wafs:       map[string]coraza.WAF{},
 		challenges: newIPSet[protocol.Ban](),
 		secret:     challengeSecret(s.ChallengeSecret),
+		sessPub:    protocol.ParseSessionKey(s.SessionKey),
+		neverBan:   newIPSet[struct{}](),
+	}
+	for _, n := range s.NeverBan {
+		rs.neverBan.add(n, struct{}{})
 	}
 	rs.tokens = map[string]*protocol.AuthToken{}
 	for i := range s.AuthTokens {
@@ -154,8 +162,9 @@ func compilePolicy(p *protocol.Policy, rs, prev *runtimeState) (*cpolicy, error)
 	for _, a := range p.Geo.ASNs {
 		cp.asns[a] = true
 	}
-	cp.exempt = append([]string{"/.well-known/acme-challenge/"}, p.Challenge.ExemptPaths...)
-	cp.authExempt = append([]string{"/.well-known/acme-challenge/"}, p.Auth.ExemptPaths...)
+	// ACME HTTP-01 requests are exempt via isACME (exact token form only)
+	cp.exempt = p.Challenge.ExemptPaths
+	cp.authExempt = p.Auth.ExemptPaths
 	cp.authBypass = newIPSet[struct{}]()
 	for _, n := range p.Auth.BypassNetworks {
 		if !cp.authBypass.add(n, struct{}{}) {
@@ -180,7 +189,7 @@ func compilePolicy(p *protocol.Policy, rs, prev *runtimeState) (*cpolicy, error)
 		cr, err := protocol.CompilePathRule(&p.PathRules[i])
 		if err != nil {
 			errs = append(errs, err.Error())
-			if pr := &p.PathRules[i]; pr.Enabled && !pr.Test && (pr.Action == "block" || pr.Auth == "on" || len(pr.OnlyNetworks) > 0) {
+			if pr := &p.PathRules[i]; pr.Enabled && !pr.Test && (pr.Action == "block" || pr.Auth == "on" || len(pr.OnlyNetworks) > 0 || len(pr.APIKeys) > 0) {
 				ruleFailed = err.Error()
 			}
 			continue
@@ -259,7 +268,12 @@ func compilePolicy(p *protocol.Policy, rs, prev *runtimeState) (*cpolicy, error)
 		}
 	}
 	if p.WAF.Mode == "block" && cp.waf == nil {
-		errs = append(errs, "WAF nicht aktiv")
+		// a blocking WAF that cannot be built must not silently let
+		// everything through: fail closed like a broken restrictive rule
+		if !cp.broken {
+			cp.broken, cp.brokenWhy = true, "WAF lässt sich nicht erstellen"
+		}
+		errs = append(errs, "WAF nicht aktiv – Policy gesperrt (503), bis die WAF-Konfiguration korrigiert ist")
 	}
 	if len(errs) > 0 {
 		return cp, fmt.Errorf("%s", strings.Join(errs, "; "))

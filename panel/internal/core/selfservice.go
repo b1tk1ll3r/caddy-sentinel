@@ -107,13 +107,17 @@ func (e *Engine) recoveryUsed(req protocol.AuthRequest, name string) {
 		Detail: mustJSONDetail(fmt.Sprintf("noch %d Codes übrig – vermutlich neues oder verlorenes Gerät", left))}, false)
 }
 
+// maxPasswordBytes is the longest password bcrypt can hash; longer ones
+// are refused instead of silently storing an unusable hash.
+const maxPasswordBytes = 72
+
 // validNewPassword checks a password the account holder chose.
 func validNewPassword(u *store.DirUser, pw string) error {
 	switch {
 	case len(pw) < 10:
 		return errors.New("Das neue Passwort muss mindestens 10 Zeichen haben.")
-	case len(pw) > 200:
-		return errors.New("Das neue Passwort ist zu lang (höchstens 200 Zeichen).")
+	case len(pw) > maxPasswordBytes:
+		return errors.New("Das neue Passwort ist zu lang (höchstens 72 Byte).")
 	case strings.EqualFold(pw, u.Username), u.Email != "" && strings.EqualFold(pw, u.Email):
 		return errors.New("Das Passwort darf nicht dem Benutzernamen entsprechen.")
 	case u.PWHash != "" && bcrypt.CompareHashAndPassword([]byte(u.PWHash), []byte(pw)) == nil:
@@ -200,11 +204,19 @@ func (e *Engine) accountOf(req protocol.AuthRequest) (*store.DirUser, *protocol.
 func (e *Engine) reauth(req protocol.AuthRequest, u *store.DirUser) error {
 	dir := e.Settings().Directory
 	window := time.Duration(dir.LockoutMinutes) * time.Minute
-	if dirLock.locked(u.Username, req.IP, dir.LockoutAttempts, window) {
+	// the attempt counts before the check (parallel requests cannot exceed
+	// the budget); it is given back unless the proof was wrong
+	if !dirLock.reserve(u.Username, req.IP, dir.LockoutAttempts, window) {
 		return fmt.Errorf("Zu viele Fehlversuche – bitte %d Minuten warten.", dir.LockoutMinutes)
 	}
+	failed := false
+	defer func() {
+		if !failed {
+			dirLock.release(u.Username, req.IP)
+		}
+	}()
 	fail := func(msg string) error {
-		dirLock.add(u.Username, req.IP)
+		failed = true
 		e.access(req, u.Username, "fail", "Self-Service: "+msg)
 		return errors.New(msg + ".")
 	}
@@ -238,6 +250,12 @@ func (e *Engine) reauth(req protocol.AuthRequest, u *store.DirUser) error {
 			}
 			return errors.New("Der Anmeldedienst ist gestört. Bitte später erneut versuchen.")
 		}
+	default:
+		// provider accounts have no password here: a recent sign-in at the
+		// provider is the proof (a stolen older session is not enough)
+		if time.Now().Unix()-req.Issued > 10*60 {
+			return errors.New("Zur Sicherheit bitte zuerst abmelden und neu anmelden – danach ist diese Änderung 10 Minuten lang möglich.")
+		}
 	}
 	dirLock.clear(u.Username)
 	return nil
@@ -245,7 +263,8 @@ func (e *Engine) reauth(req protocol.AuthRequest, u *store.DirUser) error {
 
 func (e *Engine) accountInfo(u *store.DirUser) *protocol.AccountInfo {
 	ai := &protocol.AccountInfo{Source: u.Source, SourceLabel: sourceLabel(e, u.Source), Email: u.Email, TOTP: u.TOTPEnabled,
-		RecoveryLeft: u.RecoveryLeft, CanPassword: u.Source == store.SourceLocal, PWChanged: u.PWChanged, Expires: u.Expires}
+		RecoveryLeft: u.RecoveryLeft, CanPassword: u.Source == store.SourceLocal, PWChanged: u.PWChanged, Expires: u.Expires,
+		Passkeys: e.passkeyInfo(u.Username)}
 	if es, err := e.Store.AccessLog(store.AccessFilter{User: u.Username, Limit: 8}); err == nil {
 		for _, a := range es {
 			ai.Recent = append(ai.Recent, protocol.LoginEntry{TS: a.TS, Host: a.Host, IP: a.IP, Result: a.Result, Detail: a.Detail, Device: deviceLabel(a.UA)})
@@ -364,6 +383,49 @@ func (e *Engine) selfService(req protocol.AuthRequest) *protocol.AuthResponse {
 		r := answer("ok", "Neue Wiederherstellungscodes erzeugt – die alten gelten nicht mehr.")
 		r.Codes = codes
 		return r
+
+	case "acct_passkey_begin":
+		if err := e.reauth(req, u); err != nil {
+			return fail(err)
+		}
+		origin, rpID := e.passkeyContext(req)
+		if rpID == "" {
+			return fail(errors.New("Passkeys gehen nur über HTTPS – diese Seite ist nicht per HTTPS aufgerufen."))
+		}
+		t := &authTicket{id: &DirIdentity{Username: u.Username, Display: u.Display}, policy: req.Policy, host: req.Host, ip: req.IP,
+			stage: "acct_passkey", origin: origin, rpID: rpID}
+		r := answer("passkey_register", "")
+		r.WebAuthn = registrationOptions(t, u.Username, u.Display, rpID, e.passkeysFor(u.Username, rpID))
+		r.Ticket = siteTickets.put(t)
+		return r
+
+	case "acct_passkey_add":
+		t := siteTickets.get(req.Ticket)
+		if t == nil || t.stage != "acct_passkey" || t.id.Username != u.Username || t.host != req.Host || t.ip != req.IP {
+			return fail(errors.New("Die Einrichtung ist abgelaufen – bitte neu starten."))
+		}
+		siteTickets.drop(req.Ticket)
+		cred, err := verifyRegistration(req.WebAuthn, t.challenge, t.origin, t.rpID)
+		if err == nil {
+			err = e.storePasskey(u.Username, cred, t.rpID, req.Username)
+		}
+		if err != nil {
+			e.access(req, u.Username, "fail", "Self-Service: Passkey – "+err.Error())
+			return fail(err)
+		}
+		e.access(req, u.Username, "change", "Passkey hinzugefügt (Self-Service)")
+		return answer("ok", "Der Passkey ist eingerichtet. Du kannst ihn ab jetzt als zweiten Faktor verwenden.")
+
+	case "acct_passkey_del":
+		if err := e.reauth(req, u); err != nil {
+			return fail(err)
+		}
+		ok, err := e.Store.DeletePasskey(u.Username, req.Ticket)
+		if err != nil || !ok {
+			return fail(errors.New("Passkey nicht gefunden."))
+		}
+		e.access(req, u.Username, "change", "Passkey entfernt (Self-Service)")
+		return answer("ok", "Der Passkey ist entfernt.")
 
 	case "acct_logout_all":
 		if err := e.Store.DirRevoke(u.Username); err != nil {
@@ -504,7 +566,7 @@ func (e *Engine) passwordReset(req protocol.AuthRequest, a protocol.AuthPolicy) 
 			return invalid
 		}
 		u, err := e.Store.DirUser(r.Username)
-		if err != nil || u.Source != store.SourceLocal || u.Disabled {
+		if err != nil || u.Source != store.SourceLocal || u.Disabled || (u.Expires > 0 && u.Expires <= time.Now().Unix()) {
 			return invalid
 		}
 		au := &protocol.AuthUser{Name: u.Username, Display: u.Display}
@@ -519,12 +581,15 @@ func (e *Engine) passwordReset(req protocol.AuthRequest, a protocol.AuthPolicy) 
 			return again(fmt.Sprintf("Zu viele Fehlversuche – bitte %d Minuten warten.", dir.LockoutMinutes))
 		}
 		if u.TOTPEnabled {
+			if !dirLock.reserve(u.Username, req.IP, dir.LockoutAttempts, time.Duration(dir.LockoutMinutes)*time.Minute) {
+				return again(fmt.Sprintf("Zu viele Fehlversuche – bitte %d Minuten warten.", dir.LockoutMinutes))
+			}
 			ok, via := e.checkSecondFactor(u, req.Code)
 			if !ok {
-				dirLock.add(u.Username, req.IP)
 				e.access(req, u.Username, "fail", "Passwort-Reset: Code falsch")
 				return again("Der Code ist ungültig.")
 			}
+			dirLock.release(u.Username, req.IP)
 			if via == "Wiederherstellungscode" {
 				e.recoveryUsed(req, u.Username)
 			}

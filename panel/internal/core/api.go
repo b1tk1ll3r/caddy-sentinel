@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -26,8 +27,58 @@ import (
 // Version is set at build time (-ldflags "-X ...core.Version=v1.2.3").
 var Version = "dev"
 
+// ingestBody is protocol.Ingest with bounded lists: a request record
+// costs a few bytes in JSON ("{}") but hundreds in memory, so the lists are
+// decoded element by element and refused beyond the agent's batch size.
 type ingestBody struct {
-	protocol.Ingest
+	Agent    protocol.AgentStatus `json:"agent"`
+	Requests ingestRequests       `json:"requests"`
+	Counters ingestCounters       `json:"counters"`
+	Dropped  int64                `json:"dropped"`
+	Batch    string               `json:"batch,omitempty"`
+}
+
+func (b *ingestBody) ingest() *protocol.Ingest {
+	return &protocol.Ingest{Agent: b.Agent, Requests: b.Requests, Counters: b.Counters, Dropped: b.Dropped, Batch: b.Batch}
+}
+
+type ingestRequests []protocol.Request
+type ingestCounters []protocol.Counter
+
+var errBatchTooLarge = errors.New("Stapel zu groß")
+
+func (l *ingestRequests) UnmarshalJSON(b []byte) error {
+	return decodeCapped(b, (*[]protocol.Request)(l), protocol.MaxBatchRequests)
+}
+
+func (l *ingestCounters) UnmarshalJSON(b []byte) error {
+	return decodeCapped(b, (*[]protocol.Counter)(l), 20000)
+}
+
+func decodeCapped[T any](b []byte, out *[]T, max int) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	t, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return nil
+	}
+	if d, ok := t.(json.Delim); !ok || d != '[' {
+		return errors.New("Liste erwartet")
+	}
+	for dec.More() {
+		if len(*out) >= max {
+			return errBatchTooLarge
+		}
+		var v T
+		if err := dec.Decode(&v); err != nil {
+			return err
+		}
+		*out = append(*out, v)
+	}
+	_, err = dec.Token()
+	return err
 }
 
 func contextWithUser(ctx context.Context, u *store.User) context.Context {
@@ -44,6 +95,17 @@ func parseRange(r *http.Request) store.Range {
 		rg.From = f
 		if t, err := strconv.ParseInt(q.Get("to"), 10, 64); err == nil && t > f {
 			rg.To = t
+		}
+		// bounded: no data older than the longest retention, nothing far
+		// in the future (series are filled densely between from and to)
+		if min := now - maxRangeSeconds; rg.From < min {
+			rg.From = min
+		}
+		if max := now + 86400; rg.To > max {
+			rg.To = max
+		}
+		if rg.To <= rg.From {
+			rg.From = rg.To - 3600
 		}
 		return rg
 	}
@@ -65,6 +127,10 @@ func parseRange(r *http.Request) store.Range {
 	}
 	return rg
 }
+
+// maxRangeSeconds bounds custom time ranges (longest retention of hourly
+// aggregates is well below).
+const maxRangeSeconds = 400 * 86400
 
 func autoStep(rg store.Range) int64 {
 	span := rg.To - rg.From
@@ -163,6 +229,10 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	step := autoStep(rg)
 	if st := atoiDef(r.URL.Query().Get("step"), 0); st >= 60 {
 		step = int64(st)
+	}
+	// at most ~2000 points per series
+	if min := (rg.To - rg.From) / 2000; step < min {
+		step = min
 	}
 	ov, err := s.e.Store.Overview(rg, step)
 	if err != nil {
@@ -334,6 +404,10 @@ func (s *Server) handleBanCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "ungültige IP/CIDR")
 		return
 	}
+	if err := s.e.checkManualBan(req.IP, userFrom(r).Role, clientIP(r)); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if req.Reason == "" {
 		req.Reason = "manuell"
 	}
@@ -345,6 +419,51 @@ func (s *Server) handleBanCreate(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.e.Store.SetBanNote(req.IP, n, userFrom(r).Username)
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// checkManualBan keeps manual bans from taking everything down: never the
+// own address or an entry of "never ban", networks larger than /16 (IPv4)
+// or /32 (IPv6) only for administrators, and nobody bans more than a /8
+// (IPv4) or /16 (IPv6).
+func (e *Engine) checkManualBan(ipOrCIDR, role, client string) error {
+	var p netip.Prefix
+	if strings.Contains(ipOrCIDR, "/") {
+		pp, err := netip.ParsePrefix(ipOrCIDR)
+		if err != nil {
+			return fmt.Errorf("ungültige IP/CIDR")
+		}
+		p = pp.Masked()
+	} else {
+		a, err := netip.ParseAddr(ipOrCIDR)
+		if err != nil {
+			return fmt.Errorf("ungültige IP/CIDR")
+		}
+		a = a.Unmap()
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	if p.Addr().Is4() && p.Bits() < 8 || p.Addr().Is6() && p.Bits() < 16 {
+		return fmt.Errorf("So große Netze (%s) lassen sich nicht sperren – das träfe große Teile des Internets", p)
+	}
+	if role != "admin" && (p.Addr().Is4() && p.Bits() < 16 || p.Addr().Is6() && p.Bits() < 32) {
+		return fmt.Errorf("Netze größer als /16 (IPv4) bzw. /32 (IPv6) darf nur ein Administrator sperren")
+	}
+	if c, err := netip.ParseAddr(client); err == nil && p.Contains(c.Unmap()) {
+		return fmt.Errorf("Diese Sperre träfe deine eigene Adresse (%s)", c.Unmap())
+	}
+	for _, n := range e.Settings().IDS.NeverBan {
+		q, err := netip.ParsePrefix(n)
+		if err != nil {
+			a, aerr := netip.ParseAddr(n)
+			if aerr != nil {
+				continue
+			}
+			q = netip.PrefixFrom(a.Unmap(), a.Unmap().BitLen())
+		}
+		if p.Overlaps(q) {
+			return fmt.Errorf("%s überschneidet sich mit „Nie sperren“ (%s)", p, n)
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleBanNote(w http.ResponseWriter, r *http.Request) {
@@ -640,6 +759,32 @@ func (c *boundedCache) Store(k string, v any) {
 	}
 }
 
+// wafBuilds limits concurrent WAF builds (each CRS instance needs tens of MB).
+var wafBuilds = make(chan struct{}, 2)
+
+// cachedWAF returns the WAF for wc from the cache or builds it.
+func cachedWAF(ctx context.Context, wc protocol.WAF) (coraza.WAF, error) {
+	h := wafconf.Hash(wc)
+	if v, ok := wafCache.Load(h); ok {
+		return v.(coraza.WAF), nil
+	}
+	select {
+	case wafBuilds <- struct{}{}:
+		defer func() { <-wafBuilds }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if v, ok := wafCache.Load(h); ok {
+		return v.(coraza.WAF), nil
+	}
+	waf, err := wafconf.Build(wc)
+	if err != nil {
+		return nil, err
+	}
+	wafCache.Store(h, waf)
+	return waf, nil
+}
+
 func (s *Server) handleWAFTest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Policy   string            `json:"policy"`
@@ -653,6 +798,12 @@ func (s *Server) handleWAFTest(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	if (req.WAF != nil || len(req.Rules) > 0) && !RoleCan(userFrom(r).Role, "policy") {
+		// own WAF settings and rules are drafts of policy editors; everyone
+		// else tests saved policies (building a WAF costs time and memory)
+		writeErr(w, 403, "Eigene WAF-Einstellungen testen darf "+capRoles("policy")+".")
 		return
 	}
 	var wc protocol.WAF
@@ -693,18 +844,10 @@ func (s *Server) handleWAFTest(w http.ResponseWriter, r *http.Request) {
 		wc.Mode = "block"
 	}
 	start := time.Now()
-	h := wafconf.Hash(wc)
-	var waf coraza.WAF
-	if v, ok := wafCache.Load(h); ok {
-		waf = v.(coraza.WAF)
-	} else {
-		var err error
-		waf, err = wafconf.Build(wc)
-		if err != nil {
-			writeErr(w, 400, "WAF-Fehler: "+err.Error())
-			return
-		}
-		wafCache.Store(h, waf)
+	waf, err := cachedWAF(r.Context(), wc)
+	if err != nil {
+		writeErr(w, 400, "WAF-Fehler: "+err.Error())
+		return
 	}
 	compile := time.Since(start)
 	if req.Method == "" {
@@ -794,6 +937,9 @@ func (s *Server) handleConfigFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, err.Error())
 		return
 	}
+	if !RoleCan(userFrom(r).Role, "config") {
+		c = RedactCaddyfile(c) // readers: no secrets
+	}
 	writeJSON(w, 200, map[string]any{"path": r.URL.Query().Get("path"), "content": c})
 }
 
@@ -870,9 +1016,17 @@ func (s *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.e.Apply(r.Context(), instFrom(r), req, userFrom(r).Username)
+	var ce *ConflictError
+	if errors.As(err, &ce) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": ce.Error(), "conflict": ce.Files})
+		return
+	}
 	if err != nil {
 		writeErr(w, 502, err.Error())
 		return
+	}
+	if !res.Applied {
+		w.Header().Set(auditOutcomeHeader, "von Caddy abgelehnt, nichts geändert")
 	}
 	writeJSON(w, 200, res)
 }
@@ -904,6 +1058,11 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	files := map[string]string{}
 	_ = json.Unmarshal([]byte(v.Content), &files)
 	v.Content = ""
+	if !RoleCan(userFrom(r).Role, "config") {
+		for k, c := range files {
+			files[k] = RedactCaddyfile(c)
+		}
+	}
 	writeJSON(w, 200, map[string]any{"version": v, "files": files})
 }
 
@@ -913,6 +1072,9 @@ func (s *Server) handleVersionRestore(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if res != nil && !res.Applied {
+		w.Header().Set(auditOutcomeHeader, "von Caddy abgelehnt, nichts geändert")
 	}
 	writeJSON(w, 200, res)
 }
@@ -927,6 +1089,9 @@ func (s *Server) handleCaddyConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 502, caddyx.Describe(err))
 		return
+	}
+	if !RoleCan(userFrom(r).Role, "config") {
+		cfg = RedactCaddyJSON(cfg)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(cfg)
@@ -1183,8 +1348,13 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentInfo(w http.ResponseWriter, r *http.Request) {
 	listen := s.e.cfg.Listen
-	if strings.HasPrefix(listen, ":") {
+	switch {
+	case strings.HasPrefix(listen, ":"):
 		listen = "127.0.0.1" + listen
+	case strings.HasPrefix(listen, "0.0.0.0:"):
+		listen = "127.0.0.1" + strings.TrimPrefix(listen, "0.0.0.0")
+	case strings.HasPrefix(listen, "[::]:"):
+		listen = "[::1]" + strings.TrimPrefix(listen, "[::]")
 	}
 	writeJSON(w, 200, map[string]any{
 		"token":      s.e.AgentToken(),

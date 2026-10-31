@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strings"
@@ -417,6 +418,13 @@ func (s *Server) handleWAFExclude(w http.ResponseWriter, r *http.Request) {
 			pr.ID = "pr-" + RandomToken(4)
 		}
 		pr.Enabled = true
+		// The first matching path rule wins: a new rule on top would switch
+		// off what an existing rule for these paths enforces (networks,
+		// login, API keys). Then change the existing rule instead.
+		if other := overlappingRule(p.PathRules, pr.Paths); other != nil {
+			writeErr(w, 409, "Für diesen Pfad gilt schon die Pfad-Regel „"+other.Name+"“ – eine neue Regel davor würde deren Einschränkungen aufheben. Stattdessen eine Ausnahme wählen oder in der bestehenden Regel den WAF-Modus auf „nur melden“ stellen.")
+			return
+		}
 		p.PathRules = append([]protocol.PathRule{pr}, p.PathRules...)
 	case len(req.RemoveRules) > 0:
 		seen := map[string]bool{}
@@ -437,4 +445,38 @@ func (s *Server) handleWAFExclude(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// overlappingRule returns an enabled path rule that already matches one of
+// the given paths (prefix "/x/" or exact "=/x").
+func overlappingRule(rules []protocol.PathRule, paths []string) *protocol.PathRule {
+	for i := range rules {
+		if !rules[i].Enabled {
+			continue
+		}
+		c, err := protocol.CompilePathRule(&rules[i])
+		if err != nil {
+			continue
+		}
+		for _, p := range paths {
+			sample := strings.TrimPrefix(p, "=")
+			if !strings.HasPrefix(sample, "/") {
+				continue
+			}
+			for _, m := range []string{"GET", "POST", "PUT"} {
+				if c.Match(sample, m, netip.Addr{}) || (len(rules[i].Networks) > 0 && pathOnly(&rules[i], sample, m)) {
+					return &rules[i]
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// pathOnly matches a rule limited to networks on path and method alone.
+func pathOnly(r *protocol.PathRule, path, method string) bool {
+	cp := *r
+	cp.Networks = nil
+	c, err := protocol.CompilePathRule(&cp)
+	return err == nil && c.Match(path, method, netip.Addr{})
 }

@@ -10,21 +10,43 @@ import (
 
 func TestMapClaims(t *testing.T) {
 	p := &OAuthProvider{UsernameClaim: "preferred_username", GroupsClaim: "groups", AllowedDomains: []string{"firma.de"}}
-	id, err := p.mapClaims(map[string]any{"preferred_username": "Max@Firma.de", "email": "max@firma.de", "name": "Max M", "groups": []any{"/it", "wiki"}})
+	id, err := p.mapClaims(map[string]any{"preferred_username": "Max@Firma.de", "email": "max@firma.de", "email_verified": true, "name": "Max M", "groups": []any{"/it", "wiki"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id.Username != "max@firma.de" || id.Display != "Max M" || strings.Join(id.Groups, ",") != "it,wiki" {
 		t.Fatalf("unexpected identity %+v", id)
 	}
-	if _, err := p.mapClaims(map[string]any{"preferred_username": "x", "email": "x@other.org"}); err == nil {
+	if _, err := p.mapClaims(map[string]any{"preferred_username": "x", "email": "x@other.org", "email_verified": true}); err == nil {
 		t.Error("foreign domain accepted")
 	}
+	// without email_verified the address proves nothing – except for
+	// providers that only hand out managed addresses (Entra ID, GitHub)
+	if _, err := p.mapClaims(map[string]any{"preferred_username": "x", "email": "x@firma.de"}); err == nil {
+		t.Error("unconfirmed e-mail accepted as domain proof")
+	}
+	pe := &OAuthProvider{Preset: "entra", AllowedDomains: []string{"firma.de"}}
+	if _, err := pe.mapClaims(map[string]any{"preferred_username": "x@firma.de", "email": "x@firma.de"}); err != nil {
+		t.Errorf("entra address rejected: %v", err)
+	}
 	// unverified e-mail is neither identity nor domain proof
+	// and with an explicitly chosen claim there is no fallback to a claim
+	// the user may pick freely (preferred_username, sub)
 	p2 := &OAuthProvider{UsernameClaim: "email"}
-	id, err = p2.mapClaims(map[string]any{"email": "a@b.c", "email_verified": false, "sub": "123"})
-	if err != nil || id.Username != "123" {
-		t.Fatalf("unverified e-mail used: %+v %v", id, err)
+	if id, err := p2.mapClaims(map[string]any{"email": "a@b.c", "email_verified": false, "preferred_username": "a@b.c", "sub": "123"}); err == nil {
+		t.Fatalf("unverified e-mail led to a login as %q", id.Username)
+	}
+	if id, err := p2.mapClaims(map[string]any{"email": "a@b.c", "email_verified": true}); err != nil || id.Username != "a@b.c" {
+		t.Fatalf("verified e-mail: %+v %v", id, err)
+	}
+	// without a configured claim the default order still applies
+	p3 := &OAuthProvider{}
+	if id, err := p3.mapClaims(map[string]any{"email": "a@b.c", "email_verified": false, "sub": "123"}); err != nil || id.Username != "123" {
+		t.Fatalf("default claim order: %+v %v", id, err)
+	}
+	// DN-shaped group names from a provider are dropped
+	if id, err := p.mapClaims(map[string]any{"preferred_username": "x", "email": "x@firma.de", "email_verified": true, "groups": []any{"CN=Admins,OU=T0,DC=corp", "wiki"}}); err != nil || strings.Join(id.Groups, ",") != "wiki" {
+		t.Fatalf("DN group from provider kept: %+v %v", id, err)
 	}
 }
 
@@ -64,7 +86,8 @@ func TestWizardBuild(t *testing.T) {
 }
 
 func TestActionSigning(t *testing.T) {
-	e := &Engine{challengeSecret: strings.Repeat("ab", 32)}
+	e := newTestPanel(t).e
+	e.challengeSecret = strings.Repeat("ab", 32)
 	tok := e.signAction(actionClaim{Action: "ban", IP: "192.0.2.1", Secs: 60})
 	c, err := e.verifyAction(tok)
 	if err != nil || c.IP != "192.0.2.1" || c.Action != "ban" {
@@ -73,7 +96,7 @@ func TestActionSigning(t *testing.T) {
 	if _, err := e.verifyAction(tok[:len(tok)-2] + "AA"); err == nil {
 		t.Error("tampered token accepted")
 	}
-	if !takeAction(c.Nonce, c.Exp) || takeAction(c.Nonce, c.Exp) {
+	if !e.takeAction(c.Nonce, c.Exp) || e.takeAction(c.Nonce, c.Exp) {
 		t.Error("single use broken")
 	}
 }

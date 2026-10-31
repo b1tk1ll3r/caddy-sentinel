@@ -14,6 +14,7 @@
 #                  Cross-Build der passende Cross-Compiler
 #   CADDY_VERSION  leer = Version aus go.mod, sonst z. B. "latest" oder "v2.11.0"
 #   UPGRADE_WAF=1  Coraza und OWASP CRS auf die neueste Version heben
+#                  (beides gilt für sentinel, caddy und panel gleichermaßen)
 #   SKIP_TESTS=1   Tests überspringen
 #   RESOLVE_ONLY=1 nur Versionen auflösen und testen, nichts bauen
 #   OUT            Ausgabeverzeichnis (Standard: ./dist)
@@ -58,8 +59,19 @@ if [ -n "${CADDY_VERSION:-}" ] || [ "${UPGRADE_WAF:-0}" = 1 ]; then
   pkgs=()
   [ -n "${CADDY_VERSION:-}" ] && pkgs+=("github.com/caddyserver/caddy/v2@${CADDY_VERSION}")
   [ "${UPGRADE_WAF:-0}" = 1 ] && pkgs+=(github.com/corazawaf/coraza/v3@latest github.com/corazawaf/coraza-coreruleset/v4@latest)
-  for d in sentinel caddy; do (cd "$d" && retry host_go get "${pkgs[@]}" && retry host_go mod tidy); done
-  (cd panel && retry host_go mod tidy)
+  # auch das Panel: es bindet Caddy (Caddyfile-Adapter) und Coraza selbst
+  # ein und soll exakt dieselben Versionen enthalten wie der Caddy-Build
+  for d in sentinel caddy panel; do (cd "$d" && retry host_go get "${pkgs[@]}" && retry host_go mod tidy); done
+  # "latest" einmal aufgelöst: alle Module auf dieselbe konkrete Version
+  # festlegen (sonst könnte ein zwischendurch erschienenes Release in nur
+  # einem Modul landen)
+  pinned=()
+  for m in github.com/caddyserver/caddy/v2 github.com/corazawaf/coraza/v3 github.com/corazawaf/coraza-coreruleset/v4; do
+    v=$(cd caddy && host_go list -m -f '{{.Version}}' "$m" 2>/dev/null) || continue
+    [ -n "$v" ] && pinned+=("$m@$v")
+  done
+  for d in sentinel panel; do (cd "$d" && retry host_go get "${pinned[@]}" && retry host_go mod tidy); done
+  echo "==> Versionen: ${pinned[*]}"
 fi
 
 # frisch geklont ohne go.sum: Abhängigkeiten auflösen

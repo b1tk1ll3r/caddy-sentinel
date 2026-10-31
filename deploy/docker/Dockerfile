@@ -4,7 +4,11 @@
 #   docker build -f deploy/docker/Dockerfile --target caddy -t caddy-sentinel .
 #   docker build -f deploy/docker/Dockerfile --target panel -t caddy-sentinel-panel .
 #
-# Build-Argumente: VERSION, CADDY_VERSION (leer = go.mod, "latest"), UPGRADE_WAF=1
+# Build-Argumente: VERSION, CADDY_VERSION (Standard "latest"; leer = Version aus
+# go.mod), UPGRADE_WAF (Standard 1: neueste Coraza- und CRS-Version; 0 = go.mod).
+# Standard sind die neuesten Versionen, weil go.mod mit Caddy v2.10.0 bekannte
+# Schwachstellen enthält; reproduzierbar aus go.mod/go.sum:
+#   --build-arg CADDY_VERSION= --build-arg UPGRADE_WAF=0
 
 ARG GO_VERSION=1.27
 FROM golang:${GO_VERSION}-alpine AS build
@@ -12,8 +16,8 @@ RUN apk add --no-cache build-base git
 WORKDIR /src
 COPY . .
 ARG VERSION=dev
-ARG CADDY_VERSION=
-ARG UPGRADE_WAF=0
+ARG CADDY_VERSION=latest
+ARG UPGRADE_WAF=1
 ENV GOTOOLCHAIN=auto
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     case "$(go env GOARCH)" in arm) ARCH=armv7 ;; *) ARCH=$(go env GOARCH) ;; esac \
@@ -35,8 +39,8 @@ FROM base AS caddy
 COPY --from=build /out/bin/caddy /usr/bin/caddy
 COPY --from=build /out/bin/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
 RUN setcap cap_net_bind_service=+ep /usr/bin/caddy \
- && mkdir -p /data /config /run/caddy /run/sentinel-token /var/lib/caddy-sentinel /srv /etc/caddy/sites \
- && chown -R caddy:caddy /data /config /run/caddy /run/sentinel-token /etc/caddy /srv
+ && mkdir -p /data /config /run/caddy /run/sentinel-token /run/sentinel-staging /var/lib/caddy-sentinel /srv /etc/caddy/sites /var/log/caddy \
+ && chown -R caddy:caddy /data /config /run/caddy /run/sentinel-token /run/sentinel-staging /etc/caddy /srv /var/log/caddy
 ENV XDG_DATA_HOME=/data XDG_CONFIG_HOME=/config \
     SENTINEL_PANEL=http://panel:7600 SENTINEL_TOKEN_FILE=/var/lib/caddy-sentinel/agent.token
 USER caddy
@@ -52,8 +56,9 @@ FROM base AS panel
 COPY --from=build /out/bin/caddy-sentinel /usr/bin/caddy-sentinel
 COPY --from=build /out/bin/caddy /usr/bin/caddy
 COPY --from=build /out/bin/THIRD_PARTY_LICENSES.txt /usr/share/doc/caddy-sentinel/
-RUN mkdir -p /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy \
- && chown -R caddy:caddy /run/sentinel-token /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data
+# /run/sentinel-staging: Prüf-Kopien (eigenes Volume, Caddy hängt es nur lesend ein)
+RUN mkdir -p /run/sentinel-token /run/sentinel-staging /var/lib/caddy-sentinel /etc/caddy/sites /caddy-data /data /run/caddy /var/log/caddy \
+ && chown -R caddy:caddy /run/sentinel-token /run/sentinel-staging /var/lib/caddy-sentinel /etc/caddy /data /run/caddy /caddy-data /var/log/caddy
 ENV SENTINEL_LISTEN=0.0.0.0:7600 SENTINEL_DATA=/var/lib/caddy-sentinel \
     SENTINEL_CADDY_ADMIN=unix//run/caddy/admin.sock SENTINEL_CADDYFILE=/etc/caddy/Caddyfile \
     SENTINEL_CADDY_BIN=/usr/bin/caddy SENTINEL_CADDY_DATA=/caddy-data/caddy XDG_DATA_HOME=/data

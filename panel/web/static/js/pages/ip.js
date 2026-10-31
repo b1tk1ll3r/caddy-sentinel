@@ -6,7 +6,7 @@ import { banDialog } from './security.js';
 
 const SIGNAL_LABEL = {
   waf_block: 'WAF-Blocks', waf_detect: 'WAF-Treffer', honeypot: 'Honeypot', not_found: '404-Scans', auth_fail: 'Auth-Fehler', bad_request: 'Fehlerhafte Requests',
-  scanner_ua: 'Scanner-Tool', rate_limit: 'Ratelimit', user_agent: 'Gesperrter UA', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß', geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed', challenge: 'Bot-Challenge',
+  scanner_ua: 'Scanner-Tool', rate_limit: 'Ratelimit', user_agent: 'Gesperrter UA', method: 'Unerlaubte Methode', ip_deny: 'IP-Sperrliste', burst: 'Request-Burst', body_limit: 'Body zu groß', geo_block: 'Geo-Sperre', feed_block: 'Threat-Feed', challenge: 'Bot-Challenge', path_block: 'Pfad-Sperre', bot_fake: 'Falscher Suchmaschinen-Bot', bot: 'Crawler',
 };
 
 export async function render(root, [ip], scope) {
@@ -19,9 +19,9 @@ export async function render(root, [ip], scope) {
     el('button.btn', { onclick: () => copy(ip) }, 'IP kopieren'),
     el('a.btn', { href: `https://www.abuseipdb.com/check/${encodeURIComponent(ip)}`, target: '_blank', rel: 'noopener noreferrer' }, 'AbuseIPDB'),
     el('a.btn', { href: `https://ipinfo.io/${encodeURIComponent(ip)}`, target: '_blank', rel: 'noopener noreferrer' }, 'ipinfo'),
-    can('bans') ? el('button.btn', { onclick: () => tempDialog({ value: ip, scope: 'global', list: 'trusted', policies: pols, onDone: reload }, modal), title: 'Befristet freigeben oder sperren' }, 'Befristet …') : null,
+    can('bans') ? el('button.btn', { onclick: () => tempDialog({ value: ip, scope: 'global', list: can('admin') ? 'trusted' : 'never_ban', policies: pols, onDone: reload }, modal), title: 'Befristet freigeben oder sperren' }, 'Befristet …') : null,
     el('a.btn', { href: '#/flow?ip=' + encodeURIComponent(ip) }, 'Simulieren'),
-    d.ban ? el('button.btn.primary', {
+    !can('bans') ? null : d.ban ? el('button.btn.primary', {
       onclick: async () => {
         if (!await confirmDialog('Sperre aufheben', `${d.ban.ip} wird wieder zugelassen.`, 'Aufheben', 'primary')) return;
         try { await del('/bans/' + encodeURIComponent(d.ban.ip)); toast('Entsperrt', 'ok'); reload(); } catch (e) { errToast(e); }

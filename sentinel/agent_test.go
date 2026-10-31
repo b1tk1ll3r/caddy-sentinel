@@ -12,7 +12,7 @@ import (
 func TestChallenge(t *testing.T) {
 	secret := challengeSecret("00112233445566778899aabbccddeeff")
 	now := time.Now()
-	tok := newToken(secret, "203.0.113.9", 8, now)
+	tok := newToken(secret, "203.0.113.9", "p@h", 8, now)
 	var counter int
 	for counter = 0; ; counter++ {
 		sum := sha256.Sum256([]byte(tok + ":" + strconv.Itoa(counter)))
@@ -20,22 +20,22 @@ func TestChallenge(t *testing.T) {
 			break
 		}
 	}
-	if err := verifySolution(secret, "203.0.113.9", tok, strconv.Itoa(counter), now); err != nil {
+	if err := verifySolution(secret, "203.0.113.9", "p@h", 8, tok, strconv.Itoa(counter), now); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifySolution(secret, "203.0.113.10", tok, strconv.Itoa(counter), now); err == nil {
+	if err := verifySolution(secret, "203.0.113.10", "p@h", 8, tok, strconv.Itoa(counter), now); err == nil {
 		t.Fatal("token accepted for other IP")
 	}
-	if err := verifySolution(secret, "203.0.113.9", tok, strconv.Itoa(counter), now.Add(time.Hour)); err == nil {
+	if err := verifySolution(secret, "203.0.113.9", "p@h", 8, tok, strconv.Itoa(counter), now.Add(time.Hour)); err == nil {
 		t.Fatal("expired token accepted")
 	}
-	c := passCookie(secret, "203.0.113.9", time.Hour, now, false)
+	c := passCookie(secret, "203.0.113.9", "p@h", time.Hour, now, false)
 	r := httptest.NewRequest("GET", "/", nil)
 	r.AddCookie(c)
-	if !validPass(r, secret, "203.0.113.9", now) {
+	if !validPass(r, secret, "203.0.113.9", "p@h", now) {
 		t.Fatal("cookie rejected")
 	}
-	if validPass(r, secret, "203.0.113.8", now) {
+	if validPass(r, secret, "203.0.113.8", "p@h", now) {
 		t.Fatal("cookie accepted for other IP")
 	}
 	if safeReturn("//evil.example") != "/" || safeReturn("/a?b=1") != "/a?b=1" {

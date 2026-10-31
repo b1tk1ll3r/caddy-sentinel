@@ -1,5 +1,6 @@
 import { el, mount, get, post, put, del, qs, panel, tabs, field, toggle, select, linesInput, toast, errToast, confirmDialog, empty, fmtInt, fmtAgo, fmtDateTime, ipLink, roleLabel, modal, copy, untilInput, fmtUnix, fmtUntil, debounce } from '../ui.js';
 import { setActions } from '../app.js';
+import { idpTab } from './idp.js';
 
 const RESULT = {
   ok: ['ok', 'angemeldet'],
@@ -38,8 +39,8 @@ export async function render(root, _p, scope, q) {
   const draw = () => {
     history.replaceState(null, '', '#/access' + (tab === 'overview' ? '' : '?tab=' + tab));
     setActions();
-    mount(root, tabs([['overview', 'Übersicht'], ['users', 'Konten'], ['tokens', 'Zugriffstokens'], ['log', 'Anmeldeprotokoll'], ['selfservice', 'Self-Service'], ['oauth', 'OAuth / OIDC'], ['directory', 'Verzeichnis (AD)']], tab, (t) => { tab = t; draw(); }), body);
-    ({ overview, users, tokens, log, selfservice, oauth, directory })[tab]().catch(errToast);
+    mount(root, tabs([['overview', 'Übersicht'], ['users', 'Konten'], ['tokens', 'Zugriffstokens'], ['log', 'Anmeldeprotokoll'], ['selfservice', 'Self-Service'], ['oauth', 'OAuth / OIDC'], ['directory', 'Verzeichnis (AD)'], ['idp', 'OIDC-Server']], tab, (t) => { tab = t; draw(); }), body);
+    ({ overview, users, tokens, log, selfservice, oauth, directory, idp: () => idpTab(body, scope, isAdmin) })[tab]().catch(errToast);
   };
   const goto = (t) => (e) => { e?.preventDefault?.(); tab = t; draw(); };
 
@@ -182,8 +183,9 @@ export async function render(root, _p, scope, q) {
             u.note ? el('div', null, el('small.muted', null, '📝 ' + u.note + (u.created_by ? ' (' + u.created_by + ')' : ''))) : null),
           el('td', null, sourceBadge(u.source)),
           el('td', { style: { maxWidth: '300px' } }, u.groups.slice(0, 5).map(g => el('span.chip', { style: { margin: '1px' } }, g)), u.groups.length > 5 ? el('small.muted', { title: u.groups.join('\n') }, ` +${u.groups.length - 5}`) : null),
-          el('td', null, u.totp_enabled ? el('span.badge.ok', null, 'eingerichtet') : el('span.badge', null, 'nicht eingerichtet'),
-            u.totp_enabled ? el('div', null, el('small' + (u.recovery_left ? '.muted' : '.warn-text'), { title: 'Wiederherstellungscodes erzeugt die Person auf ihrer Kontoseite' }, u.recovery_left ? `${u.recovery_left} Ersatzcodes` : 'keine Ersatzcodes')) : null,
+          el('td', null, u.totp_enabled ? el('span.badge.ok', null, 'App') : null, u.passkeys ? el('span.badge.ok', { style: { marginLeft: '4px' }, title: 'Passkeys (WebAuthn)' }, u.passkeys === 1 ? 'Passkey' : `${u.passkeys} Passkeys`) : null,
+            !u.totp_enabled && !u.passkeys ? el('span.badge', null, 'nicht eingerichtet') : null,
+            u.totp_enabled || u.passkeys ? el('div', null, el('small' + (u.recovery_left ? '.muted' : '.warn-text'), { title: 'Wiederherstellungscodes erzeugt die Person auf ihrer Kontoseite' }, u.recovery_left ? `${u.recovery_left} Ersatzcodes` : 'keine Ersatzcodes')) : null,
             u.must_change ? el('div', null, el('span.badge.warn', { title: 'Muss bei der nächsten Anmeldung ein eigenes Passwort festlegen' }, 'Passwort ändern')) : null),
           el('td.nowrap', null, u.last_login ? [fmtAgo(u.last_login * 1000), el('div', null, el('small.muted', null, `${u.last_host} · ${u.last_ip}`))] : '–'),
           el('td.num', null, fmtInt(u.logins)),
@@ -206,7 +208,7 @@ export async function render(root, _p, scope, q) {
               },
             }, 'Passwort'), ' '] : null,
             el('button.btn.sm', { onclick: () => act(u, 'revoke', 'Sitzungen beenden', `Alle Site-Anmeldungen von ${u.username} werden sofort ungültig.`, 'Beenden') }, 'Abmelden'), ' ',
-            u.totp_enabled ? el('button.btn.sm', { onclick: () => act(u, 'reset-totp', '2FA zurücksetzen', `${u.username} richtet beim nächsten Login einen neuen Authenticator ein (z. B. nach Handywechsel). Bestehende Sitzungen enden.`, 'Zurücksetzen') }, '2FA zurücksetzen') : null, ' ',
+            u.totp_enabled || u.passkeys ? el('button.btn.sm', { onclick: () => act(u, 'reset-totp', '2FA zurücksetzen', `Authenticator-App, Wiederherstellungscodes und Passkeys von ${u.username} werden entfernt; beim nächsten Login wird der zweite Faktor neu eingerichtet (z. B. nach Handywechsel). Bestehende Sitzungen enden.`, 'Zurücksetzen') }, '2FA zurücksetzen') : null, ' ',
             u.disabled ? el('button.btn.sm', { onclick: () => act(u, 'enable') }, 'Entsperren') : el('button.btn.sm.danger', { onclick: () => act(u, 'disable', 'Konto sperren', `${u.username} kann sich nicht mehr an geschützten Sites anmelden, auch nicht mit Tokens. Laufende Sitzungen enden sofort.`, 'Sperren') }, 'Sperren'), ' ',
             el('button.btn.sm', {
               onclick: async () => {
@@ -475,7 +477,7 @@ export async function render(root, _p, scope, q) {
             el('div.fields', null,
               el('div.field', null, el('span', null, 'Panel-Login'), toggle(d.panel_login, (v) => { d.panel_login = v; markDirty(); }, 'Verzeichniskonten zulassen')),
               el('div.field', null, el('span', null, '2FA'), toggle(d.panel_require_totp, (v) => { d.panel_require_totp = v; markDirty(); }, 'für AD-Konten verlangen')),
-              field('Administratoren-Gruppen', linesInput(d.panel_admin_groups, (v) => { d.panel_admin_groups = v; markDirty(); }, { rows: 2, placeholder: 'IT-Admins' })),
+              field('Administratoren-Gruppen', linesInput(d.panel_admin_groups, (v) => { d.panel_admin_groups = v; markDirty(); }, { rows: 2, placeholder: 'CN=Sentinel-Admins,OU=Tier0,DC=firma,DC=local' }), 'Voller DN = genau diese Gruppe (empfohlen). Ein reiner Name passt auf jede gleichnamige Gruppe in jeder OU.'),
               field('Bearbeiter-Gruppen', linesInput(d.panel_editor_groups, (v) => { d.panel_editor_groups = v; markDirty(); }, { rows: 2, placeholder: 'Web-Team' }), 'Caddyfile, Policies, Regelsätze, Feeds, Monitore, Sperren'),
               field('Support-Gruppen', linesInput(d.panel_support_groups, (v) => { d.panel_support_groups = v; markDirty(); }, { rows: 2, placeholder: 'IT-Support' }), 'alles sehen, Sperren aufheben/setzen'),
               field('Leser-Gruppen', linesInput(d.panel_viewer_groups, (v) => { d.panel_viewer_groups = v; markDirty(); }, { rows: 2, placeholder: 'IT-Leitung' })))))),

@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"os/user"
 	"sort"
 	"strings"
 	"sync"
@@ -149,7 +151,7 @@ func (e *Engine) collectWarnings(ctx context.Context, only string) []Warning {
 			if d.Kind != "cause_spike" {
 				continue
 			}
-			add(Warning{Severity: ev.Severity, Kind: "spike", Inst: ev.Inst, Title: ev.Title, Href: d.Link, Detail: "vor " + time.Since(time.UnixMilli(ev.TS)).Round(time.Minute).String()})
+			add(Warning{Severity: ev.Severity, Kind: "spike", Inst: ev.Inst, Title: ev.Title, Href: d.Link, Detail: agoDE(time.UnixMilli(ev.TS))})
 		}
 	}
 	// maintenance and things that end soon
@@ -184,12 +186,61 @@ func (e *Engine) collectWarnings(ctx context.Context, only string) []Warning {
 			add(Warning{Severity: 1, Kind: "expiry", Title: fmt.Sprintf("%d Zugriffstoken laufen in den nächsten 7 Tagen ab", n), Detail: "Skripte und Dienste mit diesen Tokens werden danach abgewiesen.", Href: "#/access?tab=tokens"})
 		}
 	}
+	for _, w := range e.settingsWarnings() {
+		add(w)
+	}
 	if e.Settings().IDS.DryRun {
 		add(Warning{Severity: 1, Kind: "ids", Title: "Bedrohungserkennung im Probebetrieb", Detail: "Das IDS sperrt keine IPs, es meldet nur.", Href: "#/settings?tab=ids"})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Severity > out[j].Severity })
 	if out == nil {
 		out = []Warning{}
+	}
+	return out
+}
+
+// settingsWarnings finds settings that are saved but cannot work as meant.
+func (e *Engine) settingsWarnings() []Warning {
+	s := e.Settings()
+	var out []Warning
+	w := func(sev int, title, detail, href string) {
+		out = append(out, Warning{Severity: sev, Kind: "settings", Title: title, Detail: detail, Href: href})
+	}
+	smtp := s.SMTP.Host != "" && s.SMTP.From != ""
+	if s.SelfService.PasswordReset && !smtp {
+		w(2, "Passwort-Reset per E-Mail ist eingeschaltet, aber kein Mailserver eingerichtet",
+			"Der Link „Passwort vergessen?“ erscheint erst, wenn SMTP-Server und Absender eingetragen sind.", "#/settings?tab=alerts")
+	}
+	if s.Report.Enabled && (!smtp || len(s.Report.Recipients) == 0) {
+		w(1, "Wochenbericht ohne Mailserver oder Empfänger", "Der Bericht wird nicht verschickt.", "#/settings?tab=alerts")
+	}
+	for _, wh := range s.Webhooks {
+		if wh.Enabled && wh.Format == "email" && !smtp {
+			w(2, "Benachrichtigung „"+wh.Name+"“ per E-Mail, aber kein Mailserver eingerichtet", "Diese Benachrichtigungen gehen verloren.", "#/settings?tab=alerts")
+		}
+	}
+	if s.PanelURL == "" && (len(s.Webhooks) > 0 || s.Report.Enabled) {
+		w(1, "Adresse des Panels fehlt", "Links in Benachrichtigungen und Berichten fehlen. Unter Einstellungen › Benachrichtigungen die Adresse eintragen, unter der das Panel erreichbar ist.", "#/settings?tab=alerts")
+	}
+	if s.SSO.Enabled && strings.TrimSpace(s.SSO.Domain) == "" {
+		w(2, "Single Sign-on ohne Domain", "Ohne Domain gilt die Anmeldung nur für die jeweilige Site.", "#/access?tab=directory")
+	}
+	if s.IDS.Enabled && s.IDS.ChallengeThreshold > 0 && s.IDS.ChallengeThreshold >= s.IDS.BanThreshold {
+		w(1, "Challenge-Schwelle liegt nicht unter der Sperrschwelle", "Verdächtige IPs werden gleich gesperrt, die Bot-Challenge greift nie.", "#/settings?tab=ids")
+	}
+	if _, docker := os.LookupEnv("SENTINEL_CADDY_DATA"); !docker {
+		if u, err := user.Current(); err == nil && u.Username == "caddy" {
+			w(3, "Panel läuft als Benutzer caddy",
+				"Caddy – und über die Caddyfile jeder Bearbeiter – kann die Panel-Datenbank mit allen Geheimnissen lesen. Einmal „sudo caddy-sentinel-update“ ausführen: Es stellt das Panel auf den eigenen Benutzer caddy-sentinel um.", "")
+		} else if st, err := os.Stat(e.cfg.DataDir); err == nil && st.Mode().Perm()&0o077 != 0 {
+			w(2, "Datenverzeichnis des Panels ist für andere lesbar",
+				fmt.Sprintf("%s hat die Rechte %#o – richtig ist 0700 (sudo chmod 0700 %s).", e.cfg.DataDir, st.Mode().Perm(), e.cfg.DataDir), "")
+		}
+	}
+	if p := e.Policy(s.DefaultPolicy); s.DefaultPolicy != "" && p == nil {
+		w(3, "Standard-Policy fehlt", "Sites ohne eigene Policy werden nicht geschützt. Unter Policies eine Standard-Policy festlegen.", "#/policies")
+	} else if p != nil && !p.Enabled {
+		w(2, "Standard-Policy „"+p.Name+"“ ist ausgeschaltet", "Sites ohne eigene Policy werden nicht geschützt.", "#/policies/"+p.ID)
 	}
 	return out
 }
@@ -228,4 +279,18 @@ func (e *Engine) instanceWarnings(ctx context.Context, inst, label string) []War
 
 func (s *Server) handleWarnings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"warnings": s.e.Warnings(r.Context(), instFrom(r))})
+}
+
+// agoDE formats a past time like the web UI ("vor 5 Min.").
+func agoDE(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "gerade eben"
+	case d < time.Hour:
+		return fmt.Sprintf("vor %d Min.", int(d.Minutes()+0.5))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("vor %d Std.", int(d.Hours()+0.5))
+	}
+	return fmt.Sprintf("vor %d Tagen", int(d.Hours()/24+0.5))
 }

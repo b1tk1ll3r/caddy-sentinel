@@ -12,22 +12,42 @@ services:
     image: ghcr.io/b1tk1ll3r/caddy-sentinel-panel:${SENTINEL_VERSION:-latest}
     # build: { context: ../.., dockerfile: deploy/docker/Dockerfile, target: panel }
     restart: unless-stopped
+    # Härtung: keine Linux-Capabilities, keine Rechteausweitung
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      sentinel:
+        ipv4_address: ${SENTINEL_NET:-172.31.77}.2
     ports:
-      - "0.0.0.0:7600:7600"
+      - "127.0.0.1:7600:7600"
     environment:
       TZ: ${TZ:-Europe/Berlin}
       # das Agent-Token liegt in einem eigenen Volume – Caddy sieht so nur
       # das Token, nicht die Datenbank des Panels
       SENTINEL_TOKEN_FILE: /run/sentinel-token/agent.token
-      # Anfragen über Caddy bzw. den Docker-Proxy: echte Client-IP aus
-      # X-Forwarded-For übernehmen (Anmelde-Sperren, Protokoll)
-      SENTINEL_TRUSTED_PROXIES: 127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      # zu prüfende Konfigurationen: eigenes Volume, das nur das Panel
+      # beschreibt; Caddy hängt es nur lesend ein, um importierte Dateien
+      # beim Prüfen zu lesen
+      SENTINEL_STAGING: /run/sentinel-staging/staging
+      # echte Client-IP aus X-Forwarded-For nur vom eigenen Caddy (.10)
+      # übernehmen. Verbindungen über den veröffentlichten Port 7600 kommen
+      # vom Docker-Gateway (.1); ihm wird bewusst nicht vertraut, sonst
+      # könnte jeder, der den Port erreicht (lokale Benutzer, SSH-Tunnel),
+      # per X-Forwarded-For eine beliebige Client-IP vortäuschen und so die
+      # Anmeldesperre pro IP umgehen. Diese Zugriffe zählen als Gateway-IP.
+      SENTINEL_TRUSTED_PROXIES: 127.0.0.0/8,::1,${SENTINEL_NET:-172.31.77}.10
     volumes:
       - sentinel-data:/var/lib/caddy-sentinel
       - sentinel-token:/run/sentinel-token
       - caddy-etc:/etc/caddy
-      - caddy-admin:/run/caddy
-      - caddy-data:/caddy-data:ro
+      - sentinel-staging:/run/sentinel-staging
+      # Admin-Socket: Caddy legt ihn an, das Panel verbindet sich nur
+      # (Verbinden mit einem Unix-Socket braucht kein beschreibbares Volume)
+      - caddy-admin:/run/caddy:ro
+      # Caddys Datenverzeichnis (private Schlüssel) und Logs sind bewusst
+      # nicht eingehängt: Zertifikate und interne CA liefert der
+      # Sentinel-Agent im Caddy-Container (nur öffentliche Teile), und
+      # "Vollständig prüfen" öffnet keine Log-Dateien.
       # GeoIP-Datenbanken (optional):
       # - ./geo:/geo:ro
 
@@ -38,6 +58,12 @@ services:
     depends_on:
       panel:
         condition: service_healthy
+    # nur das Binden der Ports 80/443 bleibt erlaubt
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    networks:
+      sentinel:
+        ipv4_address: ${SENTINEL_NET:-172.31.77}.10
     ports:
       - "80:80"
       - "443:443"
@@ -46,20 +72,36 @@ services:
       TZ: ${TZ:-Europe/Berlin}
       SENTINEL_TOKEN_FILE: /run/sentinel-token/agent.token
     volumes:
-      - caddy-etc:/etc/caddy
+      # Caddy liest die Caddyfile nur (das Panel schreibt sie); so kann ein
+      # übernommener Caddy dem Panel dort keine Dateien unterschieben
+      - caddy-etc:/etc/caddy:ro
       - caddy-data:/data
       - caddy-config:/config
       - caddy-admin:/run/caddy
       - sentinel-token:/run/sentinel-token:ro
+      - sentinel-staging:/run/sentinel-staging:ro
+      # Zugriffs-Logs aus "log { output file /var/log/caddy/… }"
+      - caddy-logs:/var/log/caddy
       # GeoIP-Datenbanken: derselbe Pfad wie im Panel
       # - ./geo:/geo:ro
       # eigene Inhalte für file_server:
       # - ./www:/srv:ro
 
+networks:
+  sentinel:
+    # festes Netz, damit das Panel nur Caddy als Proxy vertraut; bei
+    # Überschneidung mit eigenen Netzen SENTINEL_NET=10.99.77 o. Ä. setzen
+    ipam:
+      config:
+        - subnet: ${SENTINEL_NET:-172.31.77}.0/24
+          gateway: ${SENTINEL_NET:-172.31.77}.1
+
 volumes:
   sentinel-data:
   sentinel-token:
+  sentinel-staging:
   caddy-etc:
   caddy-data:
   caddy-config:
   caddy-admin:
+  caddy-logs:

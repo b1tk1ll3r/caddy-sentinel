@@ -14,7 +14,6 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/protocol"
 )
@@ -38,11 +37,12 @@ func sameOrigin(r *http.Request) bool {
 }
 
 func (h *Handler) serveAccount(w http.ResponseWriter, r *http.Request, info *reqInfo, st *runtimeState, pol *cpolicy, addr netip.Addr, sess *authSession, base authView) error {
-	secure := r.TLS != nil
+	secure := isSecure(r)
 	v := base
 	v.Step, v.Wide, v.User, v.Sess, v.SSO = "me", true, displayName(sess), sess, pol.ssoFor(info.rec.Host)
 	v.CSRF = csrfFor(st, sess)
-	req := protocol.AuthRequest{Policy: pol.p.ID, Host: info.rec.Host, IP: addr.String(), UA: info.rec.UA, Step: "account", Account: sess.U, Issued: sess.Iat}
+	req := protocol.AuthRequest{Policy: pol.p.ID, Host: info.rec.Host, IP: addr.String(), UA: info.rec.UA, Step: "account", Account: sess.U, Issued: sess.Iat,
+		Session: sessionCookieValue(r, sess), Origin: originOf(r)}
 
 	if r.Method == http.MethodPost {
 		if !sameOrigin(r) || subtle.ConstantTimeCompare([]byte(r.PostFormValue("csrf")), []byte(v.CSRF)) != 1 {
@@ -66,6 +66,12 @@ func (h *Handler) serveAccount(w http.ResponseWriter, r *http.Request, info *req
 			req.Step, req.Password, req.Code = "acct_recovery", r.PostFormValue("password"), code
 		case "logout_all":
 			req.Step = "acct_logout_all"
+		case "passkey_begin":
+			req.Step, req.Password, req.Code = "acct_passkey_begin", r.PostFormValue("password"), code
+		case "passkey_add":
+			req.Step, req.Ticket, req.WebAuthn, req.Username = "acct_passkey_add", r.PostFormValue("ticket"), r.PostFormValue("webauthn"), r.PostFormValue("name")
+		case "passkey_del":
+			req.Step, req.Ticket, req.Password, req.Code = "acct_passkey_del", r.PostFormValue("id"), r.PostFormValue("password"), code
 		}
 	}
 	res, err := h.core.authCall(r.Context(), req)
@@ -101,6 +107,10 @@ func (h *Handler) serveAccount(w http.ResponseWriter, r *http.Request, info *req
 		lv.Step, lv.RD, lv.SSO, lv.Info = "logout", "/", pol.ssoFor(info.rec.Host), res.Message
 		info.rec.Detail = sess.U
 		return h.authPage(w, r, info, http.StatusOK, protocol.ActionAuthOK, lv)
+	case res.Status == "passkey_register":
+		pv := v
+		pv.Step, pv.Ticket, pv.WebAuthn = "acct_passkey", res.Ticket, res.WebAuthn
+		return h.authPage(w, r, info, http.StatusOK, "", pv)
 	case res.Status == "enroll":
 		ev := v
 		ev.Step, ev.Ticket, ev.Secret, ev.URI, ev.QR = "acct_enroll", res.Ticket, res.Secret, res.URI, template.URL(res.QR)
@@ -115,11 +125,12 @@ func (h *Handler) serveAccount(w http.ResponseWriter, r *http.Request, info *req
 	case res.Status == "ok" && req.Step != "account":
 		v.OK = res.Message
 		if res.SessionSeconds < 0 {
-			// the panel ended all other sessions: issue a fresh one for this browser
-			ns := *sess
-			ns.Iat = time.Now().Unix() + 2
-			setSessionCookie(w, st, pol, info.rec.Host, &ns, secure)
-			v.CSRF = csrfFor(st, &ns)
+			// the panel ended all other sessions and issued a fresh one for
+			// this browser
+			if ns, ok := protocol.VerifySession(st.sessPub, res.Session); ok && ns.U == sess.U && ns.P == sess.P && ns.H == sess.H {
+				setSessionCookie(w, ns, res.Session, secure)
+				v.CSRF = csrfFor(st, ns)
+			}
 		}
 		return h.authPage(w, r, info, http.StatusOK, protocol.ActionAuthOK, v)
 	case res.Status != "ok":
@@ -140,7 +151,7 @@ func (h *Handler) serveReset(w http.ResponseWriter, r *http.Request, info *reqIn
 		return h.authPage(w, r, info, http.StatusNotFound, "", v)
 	}
 	scheme := "http"
-	if r.TLS != nil {
+	if isSecure(r) {
 		scheme = "https"
 	}
 	req := protocol.AuthRequest{Policy: pol.p.ID, Host: info.rec.Host, IP: addr.String(), UA: info.rec.UA, Origin: scheme + "://" + r.Host}
@@ -203,4 +214,16 @@ func (h *Handler) serveReset(w http.ResponseWriter, r *http.Request, info *reqIn
 	}
 	v.Step, v.Error, v.Token = "reset_request", res.Message, ""
 	return h.authPage(w, r, info, http.StatusOK, protocol.ActionAuthFail, v)
+}
+
+// sessionCookieValue returns the cookie that carried sess.
+func sessionCookieValue(r *http.Request, sess *authSession) string {
+	name := authCookie
+	if sess.P == "sso" {
+		name = ssoCookie
+	}
+	if c, err := r.Cookie(name); err == nil {
+		return c.Value
+	}
+	return ""
 }

@@ -2,13 +2,18 @@ package core
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +35,9 @@ type Config struct {
 	Caddyfile  string
 	CaddyBin   string
 	TokenFile  string
+	// StagingDir holds staged configurations for validation; Caddy must be
+	// able to read it (default <DataDir>/staging).
+	StagingDir string
 	Dev        bool
 }
 
@@ -55,6 +63,7 @@ type Engine struct {
 	changed   chan struct{}
 
 	agentToken string
+	tokenMu    sync.RWMutex
 
 	IDS    *IDS
 	Live   *Hub
@@ -71,6 +80,11 @@ type Engine struct {
 	loops           sync.WaitGroup // background loops (Run), awaited on shutdown
 	rebuildMu       sync.Mutex
 	challengeSecret string
+	sessKey         ed25519.PrivateKey // signs site-login sessions
+	actionSecret    string             // signs links in notifications (panel only)
+	idpRing         *idpKeyring        // OpenID Provider signing keys
+	idpMu           sync.RWMutex
+	idpCfg          *IdPConfig // cached "oidc" setting
 
 	cfgMu sync.Mutex // serialises Caddyfile apply
 
@@ -87,7 +101,11 @@ func NewEngine(cfg Config, log *slog.Logger) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	ws, err := caddyx.NewWorkspace(cfg.Caddyfile, filepath.Join(cfg.DataDir, "staging"))
+	staging := cfg.StagingDir
+	if staging == "" {
+		staging = filepath.Join(cfg.DataDir, "staging")
+	}
+	ws, err := caddyx.NewWorkspace(cfg.Caddyfile, staging)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +121,7 @@ func NewEngine(cfg Config, log *slog.Logger) (*Engine, error) {
 		agents:   newAgentRegistry(),
 		stats:    newLiveStats(),
 		cmds:     newCmdHub(),
+		idpRing:  &idpKeyring{},
 	}
 	e.Live = newHub()
 	e.Notify = newNotifier(e)
@@ -127,6 +146,7 @@ func NewEngine(cfg Config, log *slog.Logger) (*Engine, error) {
 		e.challengeSecret = RandomToken(32)
 		_ = st.SetSetting("challenge_secret", e.challengeSecret)
 	}
+	e.initKeys()
 	e.reloadGeo()
 	e.ensureDefaults()
 	e.Rebuild("startup")
@@ -143,9 +163,43 @@ func (e *Engine) Run(ctx context.Context) {
 		e.loops.Add(1)
 		go func() {
 			defer e.loops.Done()
-			f(ctx)
+			// a loop that panics (e.g. on a manipulated file from a remote
+			// instance) is restarted instead of taking the panel down
+			for ctx.Err() == nil {
+				if !runGuarded(e.log, f, ctx) {
+					return
+				}
+				select {
+				case <-ctx.Done():
+				case <-time.After(30 * time.Second):
+				}
+			}
 		}()
 	}
+}
+
+// runGuarded runs a background loop; it reports whether it panicked.
+func runGuarded(log *slog.Logger, f func(context.Context), ctx context.Context) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("background loop panicked – restarting in 30 s", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			panicked = true
+		}
+	}()
+	f(ctx)
+	return false
+}
+
+// goSafe starts a goroutine that cannot crash the panel.
+func goSafe(log *slog.Logger, name string, f func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("goroutine panicked", "name", name, "panic", fmt.Sprint(r))
+			}
+		}()
+		f()
+	}()
 }
 
 // Wait blocks until the background loops started by Run have returned
@@ -236,6 +290,8 @@ func (e *Engine) aggLoop(ctx context.Context) {
 }
 
 func (e *Engine) prune() {
+	goSafe(e.log, "directory recheck", e.recheckDirectoryPanelUsers)
+	e.Store.PruneOIDC()
 	s := e.Settings()
 	if err := e.Store.Prune(s.Retention.RequestsHours, s.Retention.EventsDays, s.Retention.RollupDays); err != nil {
 		e.log.Warn("prune", "err", err)
@@ -322,11 +378,24 @@ func (e *Engine) loadDocs() error {
 	return nil
 }
 
+// defaultHoneypots are paths no real site serves (a hit bans at once). Paths
+// of real applications (/wp-login.php, /phpmyadmin) do not belong here –
+// the default policy applies to every site without its own policy.
+var defaultHoneypots = []string{"/.env", "/.git/", "/.aws/", "/.ssh/", "/.svn/", "/wp-config.php"}
+
+// Values of earlier versions; an untouched default policy is updated.
+var (
+	oldHoneypotsV1  = []string{"/.env", "/.git/", "/wp-login.php", "/phpmyadmin", "/.aws/"}
+	defaultRLGlobal = protocol.RateLimit{ID: "rl-global", Name: "Allgemein pro IP", Key: "ip", Requests: 1200, WindowSeconds: 60, Action: "reject",
+		Note: "Schutz vor Überflutung. Großzügig, weil Büros hinter einer IP und Sync-Clients viele Anfragen stellen."}
+)
+
 func (e *Engine) ensureDefaults() {
 	e.mu.Lock()
 	empty := len(e.policies) == 0
 	e.mu.Unlock()
 	if !empty {
+		e.upgradeDefaultPolicy()
 		return
 	}
 	// A sensible default policy: monitoring, CRS in detection mode,
@@ -334,16 +403,15 @@ func (e *Engine) ensureDefaults() {
 	p := &PolicyDoc{
 		Policy: protocol.Policy{
 			ID: "default", Name: "Standard", Enabled: true,
-			HoneypotPaths: []string{"/.env", "/.git/", "/wp-login.php", "/phpmyadmin", "/.aws/"},
-			RateLimits: []protocol.RateLimit{
-				{ID: "rl-global", Name: "Allgemein pro IP", Key: "ip", Requests: 600, WindowSeconds: 60, Action: "reject"},
-			},
+			HoneypotPaths:   append([]string{}, defaultHoneypots...),
+			RateLimits:      []protocol.RateLimit{defaultRLGlobal},
 			WAF:             protocol.WAF{Mode: "detect", CRS: true, Paranoia: 1, InboundThreshold: 5, InspectBody: true, BodyLimit: 1 << 20},
 			SecurityHeaders: protocol.SecurityHeaders{Enabled: false, NoSniff: true, FrameOptions: "SAMEORIGIN", ReferrerPolicy: "strict-origin-when-cross-origin"},
 			IP:              protocol.IPRules{Mode: "off"},
 		},
 		Notes: "Automatisch angelegt. WAF startet im Erkennungsmodus – nach Prüfung der Treffer auf 'Blockieren' stellen.",
 	}
+	_ = e.Store.SetSetting("defaults_v2", true)
 	_ = e.SavePolicy(p, false)
 	s := e.Settings()
 	if s.DefaultPolicy == "" {
@@ -355,13 +423,54 @@ func (e *Engine) ensureDefaults() {
 	}
 }
 
+// upgradeDefaultPolicy replaces values of the automatically created policy
+// that earlier versions set and that turned out to be harmful – only if the
+// administrator has not changed them. Runs once.
+func (e *Engine) upgradeDefaultPolicy() {
+	var done bool
+	if ok, _ := e.Store.GetSetting("defaults_v2", &done); ok && done {
+		return
+	}
+	defer func() { _ = e.Store.SetSetting("defaults_v2", true) }()
+	cur := e.Policy("default")
+	if cur == nil {
+		return
+	}
+	b, _ := json.Marshal(cur)
+	var p PolicyDoc
+	if json.Unmarshal(b, &p) != nil {
+		return
+	}
+	changed := false
+	if slices.Equal(p.HoneypotPaths, oldHoneypotsV1) {
+		p.HoneypotPaths = append([]string{}, defaultHoneypots...)
+		changed = true
+	}
+	for i, rl := range p.RateLimits {
+		if rl.ID == "rl-global" && rl.Key == "ip" && rl.Requests == 600 && rl.WindowSeconds == 60 && rl.Action == "reject" && !rl.Test {
+			p.RateLimits[i].Requests = defaultRLGlobal.Requests
+			if p.RateLimits[i].Note == "" {
+				p.RateLimits[i].Note = defaultRLGlobal.Note
+			}
+			changed = true
+		}
+	}
+	if changed {
+		if err := e.SavePolicy(&p, false); err == nil {
+			e.log.Info("default policy updated (honeypot paths, rate limit)")
+		}
+	}
+}
+
 func (e *Engine) ensureAgentToken() error {
 	tf := e.cfg.TokenFile
 	if tf == "" {
 		tf = filepath.Join(e.cfg.DataDir, "agent.token")
 	}
 	if b, err := os.ReadFile(tf); err == nil && len(strings.TrimSpace(string(b))) >= 16 {
+		e.tokenMu.Lock()
 		e.agentToken = strings.TrimSpace(string(b))
+		e.tokenMu.Unlock()
 		return nil
 	}
 	return e.RotateAgentToken()
@@ -376,11 +485,17 @@ func (e *Engine) RotateAgentToken() error {
 	if err := os.WriteFile(tf, []byte(tok+"\n"), 0o640); err != nil {
 		return fmt.Errorf("writing agent token %s: %w", tf, err)
 	}
+	e.tokenMu.Lock()
 	e.agentToken = tok
+	e.tokenMu.Unlock()
 	return nil
 }
 
-func (e *Engine) AgentToken() string { return e.agentToken }
+func (e *Engine) AgentToken() string {
+	e.tokenMu.RLock()
+	defer e.tokenMu.RUnlock()
+	return e.agentToken
+}
 
 func (e *Engine) TokenFile() string {
 	if e.cfg.TokenFile != "" {
@@ -570,6 +685,28 @@ func (e *Engine) SavePolicy(p *PolicyDoc, rebuild bool) error {
 	if p.FeedRules == nil {
 		p.FeedRules = []protocol.FeedRule{}
 	}
+	// The agent drops entries it cannot parse; in allowlist mode a typo
+	// would lock everybody out – reject it here.
+	for _, l := range []struct {
+		name string
+		v    []string
+	}{{"Erlaubte IPs", p.IP.Allow}, {"Gesperrte IPs", p.IP.Deny}} {
+		for _, n := range l.v {
+			if err := validNet(n); err != nil {
+				return fmt.Errorf("%s: %q ist keine gültige IP-Adresse oder kein Netz (z. B. 192.0.2.10 oder 10.0.0.0/8)", l.name, n)
+			}
+		}
+	}
+	if p.IP.Mode == "allowlist" && len(p.IP.Allow) == 0 {
+		return fmt.Errorf("Nur-erlaubte-IPs ist eingeschaltet, aber die Liste ist leer – das würde alle Besucher aussperren")
+	}
+	for _, rl := range p.RateLimits {
+		if rl.PathRegex != "" {
+			if _, err := regexp.Compile(rl.PathRegex); err != nil {
+				return fmt.Errorf("Ratelimit „%s“: ungültiger regulärer Ausdruck: %v", rl.Name, err)
+			}
+		}
+	}
 	for i, c := range p.Geo.Countries {
 		p.Geo.Countries[i] = strings.ToUpper(strings.TrimSpace(c))
 	}
@@ -743,15 +880,27 @@ func (e *Engine) PolicyWAF(p *PolicyDoc) (protocol.WAF, []string) {
 func (e *Engine) BuildState() (*protocol.State, map[string][]string) {
 	s := e.Settings()
 	st := &protocol.State{
-		Policies:        map[string]*protocol.Policy{},
-		Hosts:           map[string]string{},
-		DefaultPolicy:   s.DefaultPolicy,
-		Trusted:         append([]string{}, s.Trusted...),
-		Telemetry:       s.Telemetry,
-		Feeds:           e.feeds.Refs(),
-		Challenges:      e.IDS.Challenges(),
-		ChallengeSecret: e.challengeSecret,
-		GeoIP:           s.GeoIP,
+		Policies:      map[string]*protocol.Policy{},
+		Hosts:         map[string]string{},
+		DefaultPolicy: s.DefaultPolicy,
+		Trusted:       append([]string{}, s.Trusted...),
+		Telemetry:     s.Telemetry,
+		Feeds:         e.feeds.Refs(),
+		Challenges:    e.IDS.Challenges(),
+		GeoIP:         s.GeoIP,
+		SessionKey:    e.sessionPublicKey(),
+		NeverBan:      append([]string{}, s.IDS.NeverBan...),
+		BanIPv6Prefix: ipv6Prefix(s.IDS.IPv6Prefix),
+	}
+	if temp, err := e.Store.TempEntries("global"); err == nil {
+		for _, t := range temp {
+			if t.List == "never_ban" {
+				st.NeverBan = append(st.NeverBan, t.Value)
+			}
+		}
+	}
+	if rs, err := e.Store.RevokedSessions(); err == nil && len(rs) > 0 {
+		st.RevokedSessions = rs
 	}
 	if rv, err := e.Store.DirRevocations(); err == nil && len(rv) > 0 {
 		st.AuthRevoked = rv
@@ -768,6 +917,9 @@ func (e *Engine) BuildState() (*protocol.State, map[string][]string) {
 	}
 	if len(st.AuthProviders) > 0 {
 		st.PanelURL = strings.TrimRight(s.PanelURL, "/")
+	}
+	if ic := e.idpConfig(); ic.Enabled && ic.host() != "" {
+		st.IdP = &protocol.IdPState{Host: ic.host()}
 	}
 	// temporary entries (with end date) join the regular lists
 	temp, _ := e.Store.TempEntries("")
@@ -812,7 +964,7 @@ func (e *Engine) BuildState() (*protocol.State, map[string][]string) {
 	bans, err := e.Store.ActiveBans()
 	if err == nil {
 		for _, b := range bans {
-			st.Bans = append(st.Bans, protocol.Ban{IP: b.IP, Until: b.Until, Reason: b.Reason})
+			st.Bans = append(st.Bans, protocol.Ban{IP: b.IP, Until: b.Until, Reason: b.Reason, Inst: b.Inst})
 		}
 	}
 	return st, errs
@@ -858,9 +1010,6 @@ func (e *Engine) State() ([]byte, int64, <-chan struct{}) {
 func (e *Engine) StateFor(inst string) ([]byte, int64, <-chan struct{}) {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
-	if !e.scoped {
-		return e.stateJSON, e.version, e.changed
-	}
 	if b, ok := e.stateInst[inst]; ok {
 		return b, e.version, e.changed
 	}
@@ -868,7 +1017,21 @@ func (e *Engine) StateFor(inst string) ([]byte, int64, <-chan struct{}) {
 	if json.Unmarshal(e.stateJSON, &st) != nil {
 		return e.stateJSON, e.version, e.changed
 	}
-	filterStateForInstance(&st, e.Policies(), inst)
+	if e.scoped {
+		filterStateForInstance(&st, e.Policies(), inst)
+	}
+	// bans limited to other instances stay out
+	bans := st.Bans[:0]
+	for _, b := range st.Bans {
+		if b.Inst == "" || b.Inst == inst {
+			bans = append(bans, b)
+		}
+	}
+	st.Bans = bans
+	// every instance gets its own secret: one compromised Caddy cannot
+	// forge challenge cookies or OAuth requests of the others
+	st.Instance = inst
+	st.ChallengeSecret = e.instanceSecret(inst)
 	b, _ := json.Marshal(&st)
 	e.stateInst[inst] = b
 	return b, e.version, e.changed
@@ -933,12 +1096,17 @@ func (e *Engine) PolicyForHost(host string) string {
 // ---------------------------------------------------------------- bans
 
 func (e *Engine) Ban(ip, reason, source string, seconds int, score float64) error {
+	return e.BanScoped(ip, reason, source, "", seconds, score)
+}
+
+// BanScoped bans ip on one instance (inst != "") or on all.
+func (e *Engine) BanScoped(ip, reason, source, inst string, seconds int, score float64) error {
 	now := time.Now()
 	until := int64(0)
 	if seconds > 0 {
 		until = now.Add(time.Duration(seconds) * time.Second).Unix()
 	}
-	b := store.Ban{IP: ip, Reason: reason, Source: source, Created: now.Unix(), Until: until, Score: score}
+	b := store.Ban{IP: ip, Reason: reason, Source: source, Created: now.Unix(), Until: until, Score: score, Inst: inst}
 	if err := e.Store.PutBan(b); err != nil {
 		return err
 	}
@@ -946,8 +1114,11 @@ func (e *Engine) Ban(ip, reason, source string, seconds int, score float64) erro
 	if seconds > 0 {
 		dur = humanDuration(time.Duration(seconds) * time.Second)
 	}
-	detail, _ := json.Marshal(map[string]any{"reason": reason, "source": source, "seconds": seconds, "score": score})
-	ev := store.Event{TS: now.UnixMilli(), Type: "ban", Severity: 3, IP: ip, Title: fmt.Sprintf("IP %s gesperrt (%s): %s", ip, dur, reason), Detail: detail}
+	if inst != "" {
+		dur += ", nur " + e.InstanceName(inst)
+	}
+	detail, _ := json.Marshal(map[string]any{"reason": reason, "source": source, "seconds": seconds, "score": score, "inst": inst})
+	ev := store.Event{TS: now.UnixMilli(), Type: "ban", Severity: 3, IP: ip, Inst: inst, Title: fmt.Sprintf("IP %s gesperrt (%s): %s", ip, dur, reason), Detail: detail}
 	_ = e.Store.AddEvents([]store.Event{ev})
 	e.Notify.Send(ev)
 	e.Live.Publish("event", ev)
@@ -1003,4 +1174,15 @@ func (e *Engine) importInitialConfig() {
 	}
 	b, _ := json.Marshal(snap)
 	_, _ = e.Store.AddConfigVersion(LocalInstance, "system", "Initialer Import", "import", string(b))
+}
+
+// validNet accepts what the agent's IP lists accept: an address or a CIDR.
+func validNet(s string) error {
+	s = strings.TrimSpace(s)
+	if strings.Contains(s, "/") {
+		_, err := netip.ParsePrefix(s)
+		return err
+	}
+	_, err := netip.ParseAddr(s)
+	return err
 }

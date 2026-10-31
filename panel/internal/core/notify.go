@@ -17,41 +17,76 @@ import (
 
 // Notifier delivers events to webhooks.
 type Notifier struct {
-	e      *Engine
-	queue  chan store.Event
+	e     *Engine
+	queue chan store.Event
+	// urgent holds events of severity >= 3 (agent offline, attack wave,
+	// certificates …): a flood of lower-severity events cannot push them out
+	// and they are delivered first.
+	urgent chan store.Event
 	client *http.Client
 }
 
 func newNotifier(e *Engine) *Notifier {
-	return &Notifier{e: e, queue: make(chan store.Event, 500), client: &http.Client{Timeout: 10 * time.Second}}
+	return &Notifier{e: e, queue: make(chan store.Event, 500), urgent: make(chan store.Event, 200), client: &http.Client{Timeout: 10 * time.Second}}
 }
 
 func (n *Notifier) Send(ev store.Event) {
+	ch := n.queue
+	if ev.Severity >= 3 {
+		ch = n.urgent
+	}
 	select {
-	case n.queue <- ev:
+	case ch <- ev:
 	default:
+		n.e.log.Warn("notification queue full, event dropped", "title", truncateStr(ev.Title, 120), "severity", ev.Severity)
 	}
 }
 
 func (n *Notifier) run(ctx context.Context) {
 	for {
+		var ev store.Event
 		select {
-		case <-ctx.Done():
-			return
-		case ev := <-n.queue:
-			if n.e.muted(ev) {
+		case ev = <-n.urgent:
+		default:
+			select {
+			case <-ctx.Done():
+				return
+			case ev = <-n.urgent:
+			case ev = <-n.queue:
+			}
+		}
+		if n.e.muted(ev) {
+			continue
+		}
+		for _, wh := range n.e.Settings().Webhooks {
+			if !wh.Enabled || ev.Severity < wh.MinSeverity || !typeMatch(wh.Types, ev.Type) {
 				continue
 			}
-			for _, wh := range n.e.Settings().Webhooks {
-				if !wh.Enabled || ev.Severity < wh.MinSeverity || !typeMatch(wh.Types, ev.Type) {
-					continue
-				}
-				if err := n.deliver(ctx, wh, ev); err != nil {
-					n.e.log.Warn("webhook failed", "webhook", wh.Name, "err", err)
-				}
+			if err := n.deliver(ctx, wh, ev); err != nil {
+				n.e.log.Warn("webhook failed", "webhook", wh.Name, "err", err)
 			}
 		}
 	}
+}
+
+// mdEscape neutralises Markdown (Discord, Teams, Gotify) in text from
+// outside: links, emphasis, code and mentions show up literally.
+func mdEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '\\', '*', '_', '~', '`', '[', ']', '(', ')', '<', '>', '@', '#', '|', '!':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// slackEscape escapes the characters Slack's mrkdwn treats as control
+// sequences (<!channel>, <https://x|label>).
+func slackEscape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 func typeMatch(types []string, t string) bool {
@@ -81,7 +116,7 @@ func (n *Notifier) Test(ctx context.Context, wh Webhook) error {
 }
 
 func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) error {
-	text := ev.Title
+	text := truncateStr(ev.Title, 300)
 	var lines []string
 	if ev.Host != "" {
 		lines = append(lines, "Host: "+ev.Host)
@@ -124,13 +159,15 @@ func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) erro
 	}
 	switch wh.Format {
 	case "discord":
-		msg := fmt.Sprintf("**[%s] %s**\n%s", sev, text, body)
+		// title and lines carry attacker-controlled text (paths, Host
+		// headers): escaped, and mentions are never resolved
+		msg := fmt.Sprintf("**[%s] %s**\n%s", sev, mdEscape(text), mdEscape(body))
 		if len(links) > 0 {
 			msg += "\n" + mdLinks(func(l actionLink) string { return "[" + l.Label + "](<" + l.URL + ">)" })
 		}
-		payload, _ = json.Marshal(map[string]any{"username": "Caddy Sentinel", "content": msg})
+		payload, _ = json.Marshal(map[string]any{"username": "Caddy Sentinel", "content": msg, "allowed_mentions": map[string]any{"parse": []string{}}})
 	case "slack":
-		blocks := []any{map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": fmt.Sprintf("*[%s] %s*\n%s", sev, text, body)}}}
+		blocks := []any{map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": fmt.Sprintf("*[%s] %s*\n%s", sev, slackEscape(text), slackEscape(body))}}}
 		if len(links) > 0 {
 			var els []any
 			for _, l := range links {
@@ -138,14 +175,14 @@ func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) erro
 			}
 			blocks = append(blocks, map[string]any{"type": "actions", "elements": els})
 		}
-		payload, _ = json.Marshal(map[string]any{"text": fmt.Sprintf("[%s] %s", sev, text), "blocks": blocks})
+		payload, _ = json.Marshal(map[string]any{"text": fmt.Sprintf("[%s] %s", sev, slackEscape(text)), "blocks": blocks})
 	case "teams":
 		// Teams "Workflows" webhook (the old Office 365 connectors are retired):
 		// an Adaptive Card with link buttons.
 		var facts []any
 		for _, l := range lines {
 			k, v, _ := strings.Cut(l, ": ")
-			facts = append(facts, map[string]any{"title": k, "value": v})
+			facts = append(facts, map[string]any{"title": k, "value": mdEscape(v)})
 		}
 		var acts []any
 		for _, l := range links {
@@ -155,7 +192,7 @@ func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) erro
 			"type": "AdaptiveCard", "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "version": "1.4",
 			"body": []any{
 				map[string]any{"type": "TextBlock", "text": "Caddy Sentinel · " + sev, "isSubtle": true, "size": "Small"},
-				map[string]any{"type": "TextBlock", "text": text, "weight": "Bolder", "wrap": true},
+				map[string]any{"type": "TextBlock", "text": mdEscape(text), "weight": "Bolder", "wrap": true},
 				map[string]any{"type": "FactSet", "facts": facts},
 			},
 			"actions": acts,
@@ -202,7 +239,7 @@ func (n *Notifier) deliver(ctx context.Context, wh Webhook, ev store.Event) erro
 			headers["Authorization"] = "Bearer " + wh.Token
 		}
 	case "gotify":
-		msg := body
+		msg := mdEscape(body)
 		if len(links) > 0 {
 			msg += "\n\n" + mdLinks(func(l actionLink) string { return "[" + l.Label + "](" + l.URL + ")" })
 		}

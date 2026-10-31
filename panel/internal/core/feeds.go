@@ -45,7 +45,7 @@ type feedManager struct {
 }
 
 func newFeedManager(e *Engine) *feedManager {
-	return &feedManager{e: e, sets: map[string]*iprange.Set{}, client: &http.Client{Timeout: 60 * time.Second}, kick: make(chan string, 16)}
+	return &feedManager{e: e, sets: map[string]*iprange.Set{}, client: &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{Proxy: guardedProxy, DialContext: noMetadataDialer().DialContext, TLSHandshakeTimeout: 15 * time.Second}}, kick: make(chan string, 16)}
 }
 
 func feedHash(content string) string {

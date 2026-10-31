@@ -659,6 +659,10 @@ func describeMatcher(k string, v json.RawMessage) string {
 		_ = json.Unmarshal(v, &hm)
 		var parts []string
 		for hk, hv := range hm {
+			if secretHeaders[strings.ToLower(hk)] {
+				parts = append(parts, hk+"="+redacted) // credentials stay out of the view
+				continue
+			}
 			parts = append(parts, hk+"="+strings.Join(hv, "|"))
 		}
 		sort.Strings(parts)
@@ -680,7 +684,7 @@ func describeMatcher(k string, v json.RawMessage) string {
 			_ = json.Unmarshal(v, &o)
 			ex = o.Expr
 		}
-		return "Ausdruck " + ex
+		return "Ausdruck " + RedactExpression(ex)
 	}
 	return k
 }

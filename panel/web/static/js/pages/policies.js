@@ -14,7 +14,7 @@ function blankPolicy(name) {
   return {
     id: '', name, enabled: true, hosts: [], rulesets: [], rules: [], disabled_groups: [], notes: '',
     maintenance: false, maintenance_message: '', ip: { mode: 'off', allow: [], deny: [] }, allowed_methods: [], blocked_user_agents: [],
-    honeypot_paths: ['/.env', '/.git/', '/wp-login.php'], max_body_bytes: 0, rate_limits: [],
+    honeypot_paths: ['/.env', '/.git/', '/.aws/', '/.ssh/', '/wp-config.php'], max_body_bytes: 0, rate_limits: [],
     waf: { mode: 'detect', crs: true, paranoia: 1, inbound_threshold: 5, remove_rules: [], directives: '', post_directives: '', inspect_body: true, body_limit: 1048576 },
     security_headers: { enabled: false, hsts: true, frame_options: 'SAMEORIGIN', no_sniff: true, referrer_policy: 'strict-origin-when-cross-origin', permissions_policy: '', content_security_policy: '', hide_server: true },
     block_status: 0, block_message: '', ids_overrides: { disabled: false, ban_threshold: 0, weights: {} },
@@ -28,7 +28,9 @@ export async function render(root, [id], scope, q) {
 
   if (!id) {
     const target = policies.find(p => p.id === list.default) || policies[0];
-    if (exclude) return excludeFlow(root, policies, exclude, list.default);
+    // only a single CRS rule ID (six digits): a shared link must not prepare
+    // the removal of whole ranges
+    if (exclude && /^\d{6}$/.test(exclude)) return excludeFlow(root, policies, exclude, list.default);
     if (target) { location.replace('#/policies/' + target.id); return; }
   }
   const sideList = el('div.policy-list', null, policies.map(p => el('a' + (p.id === id ? '.active' : ''), { href: '#/policies/' + p.id },
@@ -368,7 +370,7 @@ export async function render(root, [id], scope, q) {
           field('Sitzungsdauer (Stunden)', el('input', { type: 'number', min: 1, max: 2160, value: a.session_hours || 12, oninput: (e) => { a.session_hours = +e.target.value; markDirty(); } }), 'Danach ist eine neue Anmeldung nötig.'),
           field('Titel der Login-Seite', el('input', { value: a.title || '', placeholder: hostHint, oninput: (e) => { a.title = e.target.value; markDirty(); } })),
           el('div.field.wide', null, el('span', null, 'Erlaubte Gruppen'), linesInput(a.allowed_groups, (v) => { a.allowed_groups = v; markDirty(); }, { rows: 3, placeholder: 'Wiki-Benutzer\nCN=IT-Admins,OU=Gruppen,DC=firma,DC=local' }),
-            el('small', null, 'AD-Gruppe (CN oder DN), Gruppe eines Zugangskontos oder Gruppe/Rolle vom OAuth-Anbieter – eine pro Zeile. Leer = jedes Konto der erlaubten Anmeldemethoden.')),
+            el('small', null, 'AD-Gruppe, Gruppe eines Zugangskontos oder Gruppe/Rolle vom OAuth-Anbieter – eine pro Zeile. Ein voller DN (CN=…,OU=…) passt nur auf genau diese AD-Gruppe; ein reiner Name auf jede gleichnamige Gruppe aus jeder Quelle. Leer = jedes Konto der erlaubten Anmeldemethoden.')),
           el('div.field.wide', null, el('span', null, 'Zusätzlich erlaubte Benutzer'), linesInput(a.allowed_users, (v) => { a.allowed_users = v; markDirty(); }, { rows: 2, placeholder: 'max.mustermann' }), el('small', null, 'Benutzername, unabhängig von den Gruppen.'))))),
       panel('Ausnahmen', el('div.fields', null,
         field('Pfade ohne Anmeldung', linesInput(a.exempt_paths, (v) => { a.exempt_paths = v; markDirty(); }, { placeholder: '/public/\n/api/webhook' }), 'Pfad-Präfixe, z. B. für Webhooks oder öffentliche Dateien.'),
@@ -520,7 +522,9 @@ export async function render(root, [id], scope, q) {
           field('Paranoia-Level', seg([[1, '1'], [2, '2'], [3, '3'], [4, '4']], w.paranoia || 1, (v) => { w.paranoia = v; markDirty(); }), '1 = wenige Fehlalarme, 4 = sehr streng'),
           field('Anomalie-Schwelle', el('input', { type: 'number', min: 1, max: 100, value: w.inbound_threshold || 5, oninput: (e) => { w.inbound_threshold = +e.target.value; markDirty(); } }), 'Ab diesem Score wird blockiert (CRS-Standard 5). Höher = toleranter.'),
           el('div.field', null, el('span', null, 'Request-Body prüfen'), toggle(w.inspect_body, (v) => { w.inspect_body = v; markDirty(); }, 'Formulare, JSON, XML, Uploads')),
-          field('Body-Prüflimit (KiB)', el('input', { type: 'number', min: 16, value: Math.round((w.body_limit || 1048576) / 1024), oninput: (e) => { w.body_limit = +e.target.value * 1024; markDirty(); } }), 'Größere Bodies werden nur teilweise geprüft.')),
+          field('Body-Prüflimit (KiB)', el('input', { type: 'number', min: 16, value: Math.round((w.body_limit || 1048576) / 1024), oninput: (e) => { w.body_limit = +e.target.value * 1024; markDirty(); } }), 'Gilt für Anfragen und – falls eingeschaltet – Antworten.'),
+          field('Größere Bodies', select([['partial', 'bis zum Limit prüfen, Rest durchlassen'], ['reject', 'ablehnen (413)']], w.body_limit_action || 'partial', (v) => { w.body_limit_action = v === 'partial' ? '' : v; markDirty(); }), 'Ablehnen schließt die Lücke hinter dem Limit, verhindert aber größere Uploads – nur für Sites ohne Uploads oder mit eigener Pfad-Regel dafür.'),
+          el('div.field', null, el('span', null, 'Antworten prüfen'), toggle(w.inspect_response, (v) => { w.inspect_response = v; markDirty(); }, 'nur melden'), el('small', null, 'Prüft Text-Antworten (HTML, JSON, XML) bis zum Limit auf Datenlecks wie SQL-Fehlermeldungen, Stacktraces oder Verzeichnislisten. Die Antwort wird nie aufgehalten oder verändert; Treffer erscheinen unter Sicherheit. Kostet etwas CPU pro Antwort.'))),
         w.mode === 'detect' ? el('div.callout.warn', null, 'Erkennungsmodus: Treffer erscheinen unter Sicherheit und fließen in die IDS-Scores ein, Requests werden aber nicht blockiert. Gut zum Einlernen vor dem Scharfschalten.') : null)),
       w.crs ? panel('CRS-Regelgruppen', el('div.stack', null, groupBox,
         field('Einzelne CRS-Regeln deaktivieren', linesInput(w.remove_rules, (v) => { w.remove_rules = v; markDirty(); }, { rows: 3, placeholder: '920350\n942100-942199' }), 'Global für diese Policy. Für gezielte Ausnahmen (nur bestimmte Pfade) besser eine Regel mit Aktion „CRS-Regeln ausnehmen“ verwenden.'))) : null,

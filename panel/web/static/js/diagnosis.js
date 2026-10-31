@@ -1,6 +1,6 @@
 // Readable diagnosis of a single request: who stopped it, why, evidence,
 // fixes and whether the current configuration would still stop it.
-import { el, mount, get, post, del, toast, errToast, instChip } from './ui.js';
+import { el, mount, get, post, del, toast, errToast, instChip, can } from './ui.js';
 import { openWafAssistant } from './waffp.js';
 
 const WHO = {
@@ -45,7 +45,7 @@ export function diagnosisView(d, { compact = false, onUnban } = {}) {
     d.fixes?.length ? el('section.diag-fixes', null,
       el('h4', null, d.verdict === 'ok' || d.verdict === 'redirect' ? 'Falls das nicht gewollt ist' : 'So lässt es sich beheben'),
       el('ul', null, d.fixes.map(f => el('li', null,
-        f.action === 'unban'
+        f.action === 'unban' && can('bans')
           ? el('button.btn.sm', { onclick: async (e) => { e.currentTarget.disabled = true; try { await del('/bans/' + encodeURIComponent(f.arg)); toast(`${f.arg} entsperrt`, 'ok'); onUnban?.(); } catch (err) { errToast(err); } } }, f.label)
           : f.action === 'waf-assist'
             ? el('button.btn.sm.primary', { onclick: () => { const [policy, host, path, inst] = f.arg.split('|'); openWafAssistant({ policy, host, path, inst }); } }, f.label)

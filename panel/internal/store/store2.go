@@ -109,6 +109,19 @@ CREATE INDEX IF NOT EXISTS requests_cc ON requests(cc, ts);
 	if _, err := s.DB.Exec(`DELETE FROM sessions WHERE token NOT LIKE 'h:%'`); err != nil {
 		return err
 	}
+	// reset links of Sentinel's login pages were logged with their token
+	if _, err := s.DB.Exec(`UPDATE requests SET query='' WHERE path LIKE '/.sentinel/%' AND query<>''`); err != nil {
+		return err
+	}
+	if err := s.migrateSiteSessions(); err != nil {
+		return err
+	}
+	if err := s.migrateOIDC(); err != nil {
+		return err
+	}
+	if err := s.migratePasskeys(); err != nil {
+		return err
+	}
 	return s.migrateAgg()
 }
 
@@ -133,6 +146,15 @@ func (s *Store) ListUsers() ([]User, error) {
 
 func (s *Store) SetUserRole(id int64, role string) error {
 	_, err := s.Exec(`UPDATE users SET role=? WHERE id=?`, role, id)
+	return err
+}
+
+// RevokeUserAccess ends all panel sessions and deletes all API tokens of a user.
+func (s *Store) RevokeUserAccess(id int64) error {
+	if _, err := s.Exec(`DELETE FROM sessions WHERE user_id=?`, id); err != nil {
+		return err
+	}
+	_, err := s.Exec(`DELETE FROM api_tokens WHERE user_id=?`, id)
 	return err
 }
 

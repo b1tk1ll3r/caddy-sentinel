@@ -14,8 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/corazawaf/coraza/v3"
-
 	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/protocol"
 	"github.com/b1tk1ll3r/caddy-sentinel/sentinel/wafconf"
 )
@@ -597,17 +595,9 @@ func (e *Engine) traceWAF(pol *PolicyDoc, mode string, in TraceRequest, ip netip
 		return "", false, fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	wc.Mode = mode
-	h := wafconf.Hash(wc)
-	var waf coraza.WAF
-	if v, ok := wafCache.Load(h); ok {
-		waf = v.(coraza.WAF)
-	} else {
-		w, err := wafconf.Build(wc)
-		if err != nil {
-			return "", false, err
-		}
-		wafCache.Store(h, w)
-		waf = w
+	waf, err := cachedWAF(context.Background(), wc)
+	if err != nil {
+		return "", false, err
 	}
 	hr, err := http.NewRequest(in.Method, "http://"+in.Host+in.Path, bytes.NewBufferString(in.Body))
 	if err != nil {

@@ -42,7 +42,7 @@ export function openIPDrawer(ip) {
         can('bans') ? (b.ban
           ? el('button.btn.primary', { onclick: async () => { if (!await confirmDialog('Sperre aufheben', `${b.ban.ip} wird wieder zugelassen.`, 'Aufheben', 'primary')) return; try { await del('/bans/' + encodeURIComponent(b.ban.ip)); toast('Entsperrt', 'ok'); load(); } catch (e) { errToast(e); } } }, 'Sperre aufheben')
           : [el('button.btn.danger', { onclick: () => quickBan(ip, 3600, load) }, '1 h sperren'), el('button.btn.danger', { onclick: () => quickBan(ip, 86400, load) }, '24 h sperren')]) : null,
-        can('bans') ? el('button.btn', { onclick: () => tempDialog({ value: ip, scope: 'global', list: 'trusted', onDone: load }, modal), title: 'Befristet als vertrauenswürdig eintragen – alle Prüfungen werden übersprungen' }, 'Dulden …') : null,
+        can('bans') ? el('button.btn', { onclick: () => tempDialog({ value: ip, scope: 'global', list: can('admin') ? 'trusted' : 'never_ban', onDone: load }, modal), title: can('admin') ? 'Befristet als vertrauenswürdig eintragen – alle Prüfungen werden übersprungen' : 'Befristet vor IDS-Sperren schützen' }, 'Dulden …') : null,
         el('a.btn', { href: '#/analytics?ip=' + encodeURIComponent(ip) }, 'Anfragen'),
         el('a.btn', { href: '#/flow?ip=' + encodeURIComponent(ip) }, 'Simulieren'),
         el('button.btn.ghost', { onclick: () => copy(ip) }, 'Kopieren')),

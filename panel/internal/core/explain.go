@@ -830,7 +830,7 @@ func replayRequest(e *Engine, site *FlowSite, r *store.RequestRow) TraceRequest 
 	if user != "" && r.Action != protocol.ActionAuth {
 		in.User, in.Factors = user, 2
 		if u, err := e.Store.DirUser(user); err == nil && u != nil {
-			in.Groups = u.Groups
+			in.Groups = accessGroups(u)
 		}
 	}
 	return in

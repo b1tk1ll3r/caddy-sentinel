@@ -17,7 +17,6 @@ export function el(tag, props, ...children) {
       else if (k === 'class') node.setAttribute('class', [node.getAttribute('class'), v].filter(Boolean).join(' '));
       else if (k === 'style' && typeof v === 'object') { for (const [sk, sv] of Object.entries(v)) { if (sk.startsWith('--')) { if (sv != null) node.style.setProperty(sk, sv); } else node.style[sk] = sv; } }
       else if (k === 'value' || k === 'checked' || k === 'selected' || k === 'disabled' || k === 'indeterminate') node[k] = v;
-      else if (k === 'html') node.innerHTML = v;
       else if (k === 'ref') v(node);
       else node.setAttribute(k, v === true ? '' : v);
     }
@@ -88,7 +87,9 @@ export function qs(obj) {
 let toastHost;
 export function toast(msg, kind = 'info', ms = 4000) {
   if (!toastHost) { toastHost = el('div.toasts', { role: 'status', 'aria-live': 'polite' }); document.body.append(toastHost); }
-  const t = el('div.toast.' + kind, null, msg);
+  // at most four at a time; a click dismisses one
+  while (toastHost.children.length >= 4) toastHost.firstChild.remove();
+  const t = el('div.toast.' + kind, { title: 'Klicken zum Schließen', onclick: () => t.remove() }, msg);
   toastHost.append(t);
   setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, ms);
 }

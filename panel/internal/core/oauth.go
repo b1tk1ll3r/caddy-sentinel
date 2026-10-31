@@ -110,7 +110,7 @@ func normalizeOAuth(list []OAuthProvider, cur []OAuthProvider, panelURL string) 
 				return nil, fmt.Errorf("OAuth %s: Autorisierungs-, Token- und Userinfo-URL angeben", p.Name)
 			}
 			if strings.TrimSpace(panelURL) == "" {
-				return nil, errors.New("OAuth braucht die öffentliche Panel-Adresse (Einstellungen › Allgemein › Panel-URL) – daraus ergibt sich die Redirect-URI")
+				return nil, errors.New("OAuth braucht die öffentliche Panel-Adresse (Site-Login › OAuth / OIDC › Öffentliche Panel-Adresse) – daraus ergibt sich die Redirect-URI")
 			}
 		}
 		out = append(out, p)
@@ -207,6 +207,7 @@ type siteStart struct {
 	RD       string `json:"rd"`
 	Exp      int64  `json:"exp"`
 	Nonce    string `json:"n"`
+	Inst     string `json:"i,omitempty"`
 }
 
 // siteCode is handed to the browser after a successful provider login and
@@ -240,8 +241,23 @@ func (o *oauthStore) putFlow(f *oauthFlow) string {
 			delete(o.flows, k)
 		}
 	}
-	if len(o.flows) > 5000 {
-		o.flows = map[string]*oauthFlow{}
+	if len(o.flows) >= 5000 {
+		// evict the oldest flows only: running sign-ins of others survive
+		// a flood of started-but-abandoned flows
+		var oldK string
+		var old time.Time
+		for i := 0; i < 500 && len(o.flows) >= 4500; i++ {
+			oldK, old = "", time.Now()
+			for k, v := range o.flows {
+				if v.created.Before(old) {
+					oldK, old = k, v.created
+				}
+			}
+			if oldK == "" {
+				break
+			}
+			delete(o.flows, oldK)
+		}
 	}
 	o.flows[st] = f
 	return st
@@ -361,14 +377,19 @@ func (s *Server) handleOAuthSite(w http.ResponseWriter, r *http.Request) {
 		s.oauthError(w, nil, "Ungültige Anmeldeanfrage.")
 		return
 	}
-	m := hmac.New(sha256.New, oauthKey([]byte(s.e.challengeSecretBytes())))
+	// signed by the instance that started the flow (its own secret)
+	var st siteStart
+	if json.Unmarshal(raw, &st) != nil {
+		s.oauthError(w, nil, "Ungültige Anmeldeanfrage.")
+		return
+	}
+	m := hmac.New(sha256.New, oauthKey(s.e.instanceSecretBytes(st.Inst)))
 	m.Write(raw)
 	if !hmac.Equal(got, m.Sum(nil)) {
 		s.oauthError(w, nil, "Die Anmeldeanfrage ist nicht gültig signiert.")
 		return
 	}
-	var st siteStart
-	if json.Unmarshal(raw, &st) != nil || time.Now().Unix() > st.Exp {
+	if time.Now().Unix() > st.Exp {
 		s.oauthError(w, nil, "Die Anmeldeanfrage ist abgelaufen – bitte die Seite neu laden.")
 		return
 	}
@@ -453,6 +474,11 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		s.oauthPanelLogin(w, r, p, id)
 		return
 	}
+	if p.Public() {
+		// anyone can register at a public provider and pick names: keep its
+		// accounts and groups apart from directory and local ones
+		id = qualifyIdentity(id, p.ID)
+	}
 	if err := s.e.Store.UpsertExternalUser(source, &store.DirUser{Username: id.Username, Display: id.Display, Email: id.Email, Groups: id.Groups}); err != nil {
 		s.oauthError(w, f, err.Error())
 		return
@@ -477,11 +503,47 @@ func (e *Engine) siteCodeLogin(req protocol.AuthRequest, a protocol.AuthPolicy) 
 		e.access(req, c.id.Username, "denied", c.provider+" für diese Seite nicht zugelassen")
 		return &protocol.AuthResponse{Status: "forbidden", Message: "Mit " + c.provider + " ist diese Seite nicht erreichbar."}
 	}
+	if p := e.oauthProvider(strings.TrimPrefix(c.source, "oidc:")); p != nil && p.Open() && !protocol.OpenSourceAllowed(a, c.source) {
+		e.access(req, c.id.Username, "denied", c.provider+" ohne Beschränkung (Gruppen, Benutzer, Domains oder ausdrückliche Freigabe)")
+		return &protocol.AuthResponse{Status: "forbidden", Message: "Mit " + c.provider + " ist diese Seite nicht freigegeben."}
+	}
 	via := c.provider
 	if c.factors >= 2 {
 		via += " (MFA beim Anbieter)"
 	}
 	return e.afterPrimary(req, a, c.id, via, c.factors)
+}
+
+// Public reports providers where anyone can create an account (and choose
+// organisation or group names): GitHub, Google, gitlab.com and the
+// multi-tenant Microsoft endpoints.
+func (p *OAuthProvider) Public() bool {
+	iss := strings.ToLower(p.Issuer)
+	switch p.Preset {
+	case "github", "google":
+		return true
+	case "gitlab":
+		return iss == "" || strings.Contains(iss, "//gitlab.com")
+	case "entra":
+		return strings.Contains(iss, "/common/") || strings.Contains(iss, "/organizations/") || strings.Contains(iss, "/consumers/")
+	}
+	return false
+}
+
+// Open reports a public provider without an e-mail domain restriction.
+func (p *OAuthProvider) Open() bool { return p.Public() && len(p.AllowedDomains) == 0 }
+
+// qualifyIdentity prefixes name and groups of a public provider account
+// ("github:octocat", "github:my-org"), so they cannot match a directory
+// user or group of the same name.
+func qualifyIdentity(id *DirIdentity, pid string) *DirIdentity {
+	q := *id
+	q.Username = pid + ":" + id.Username
+	q.Groups = make([]string, 0, len(id.Groups))
+	for _, g := range id.Groups {
+		q.Groups = append(q.Groups, pid+":"+g)
+	}
+	return &q
 }
 
 // oauthPanelLogin creates the panel session for a provider account.
@@ -505,6 +567,11 @@ func (s *Server) oauthPanelLogin(w http.ResponseWriter, r *http.Request, p *OAut
 	u, err := s.e.Store.UpsertExternalPanelUser("oidc:"+p.ID, id.Username, id.Display, role)
 	if err != nil {
 		s.oauthError(w, &oauthFlow{purpose: "panel"}, err.Error())
+		return
+	}
+	if u.TOTPEnabled {
+		// the panel's own second factor applies to provider logins as well
+		http.Redirect(w, r, "/#/?totp="+tickets.issue(u.ID), http.StatusFound)
 		return
 	}
 	if err := s.setSession(w, r, u.ID); err != nil {
@@ -627,18 +694,39 @@ func (p *OAuthProvider) mapClaims(c map[string]any) (*DirIdentity, error) {
 		return ""
 	}
 	email := str("email")
-	if v, ok := c["email_verified"].(bool); ok && !v {
+	// An e-mail address is an identity (allowed domains, user name) only if
+	// the provider vouches for it. Most OIDC providers say so with
+	// email_verified; Entra ID and GitHub send no such claim but only hand
+	// out addresses of accounts they manage or have verified.
+	verified, hasClaim := c["email_verified"].(bool)
+	if s, ok := c["email_verified"].(string); ok { // some providers send "true"
+		verified, hasClaim = strings.EqualFold(s, "true"), true
+	}
+	if hasClaim && !verified || !hasClaim && p.Preset != "entra" && p.Preset != "github" {
 		email = ""
 	}
 	user := ""
-	for _, k := range []string{p.UsernameClaim, "preferred_username", "email", "upn", "login", "sub"} {
-		if k != "" && str(k) != "" {
-			user = str(k)
-			if k == "email" && email == "" {
-				user = "" // unverified e-mail is not an identity
-				continue
+	if k := strings.TrimSpace(p.UsernameClaim); k != "" {
+		// an explicitly chosen claim is the identity: if it is missing or
+		// an unverified address, the login fails instead of falling back to
+		// another claim the user may be able to choose freely
+		user = str(k)
+		if k == "email" && email == "" {
+			return nil, errors.New("die E-Mail-Adresse ist beim Anbieter nicht bestätigt")
+		}
+		if user == "" {
+			return nil, fmt.Errorf("der Claim %q für den Benutzernamen fehlt", k)
+		}
+	} else {
+		for _, k := range []string{"preferred_username", "email", "upn", "login", "sub"} {
+			if str(k) != "" {
+				user = str(k)
+				if k == "email" && email == "" {
+					user = "" // unverified e-mail is not an identity
+					continue
+				}
+				break
 			}
-			break
 		}
 	}
 	if user == "" {
@@ -686,6 +774,9 @@ func (p *OAuthProvider) mapClaims(c map[string]any) (*DirIdentity, error) {
 			}
 		}
 	}
+	// DN-shaped names are reserved for directory groups: a provider can never
+	// satisfy a DN entry of a policy or a panel role
+	groups = withoutDNs(groups)
 	if len(groups) > 200 {
 		groups = groups[:200]
 	}
@@ -807,7 +898,7 @@ func (e *Engine) providersForState() []protocol.AuthProvider {
 	var out []protocol.AuthProvider
 	for _, p := range e.Settings().OAuth {
 		if p.Enabled && p.SiteLogin {
-			out = append(out, protocol.AuthProvider{ID: p.ID, Name: p.Name})
+			out = append(out, protocol.AuthProvider{ID: p.ID, Name: p.Name, Open: p.Open()})
 		}
 	}
 	return out

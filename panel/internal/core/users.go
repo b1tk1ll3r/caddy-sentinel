@@ -127,6 +127,7 @@ func panelTOTPUse(uid int64, step int64) bool {
 
 func (s *Server) handleTOTPLogin(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if !s.login.allow(ip) {
 		writeErr(w, http.StatusTooManyRequests, "Zu viele Fehlversuche – bitte 15 Minuten warten")
 		return
@@ -149,23 +150,37 @@ func (s *Server) handleTOTPLogin(w http.ResponseWriter, r *http.Request) {
 	name := ""
 	if u != nil {
 		name = u.Username
-		if !s.login.allowUser(name) {
-			writeErr(w, http.StatusTooManyRequests, "Zu viele Fehlversuche für dieses Konto – bitte 15 Minuten warten")
-			return
+	}
+	// the attempt counts before the code is checked (parallel requests
+	// cannot exceed the limits); a correct code gives it back
+	if ok, which := s.login.take(ip, name); !ok {
+		msg := "Zu viele Fehlversuche – bitte 15 Minuten warten"
+		if which == "user" {
+			msg = "Zu viele Fehlversuche für dieses Konto – bitte 15 Minuten warten"
 		}
+		writeErr(w, http.StatusTooManyRequests, msg)
+		return
 	}
 	valid := false
 	if err == nil {
 		if u.Source == "ldap" {
 			// directory accounts share the TOTP secret with the site login
-			secret := tk.enroll
-			if secret == "" {
-				if du, derr := s.e.Store.DirUser(u.Username); derr == nil && du.TOTPEnabled {
-					secret = du.TOTPSecret
-				}
+			// (only the directory record of this account, never a
+			// same-named account of another source)
+			du, derr := s.e.Store.DirUser(u.Username)
+			if derr == nil && du.Source != store.SourceLDAP {
+				du, derr = nil, store.ErrNotFound
 			}
-			if step, ok := totpMatch(secret, req.Code, time.Now()); ok && secret != "" {
+			secret := tk.enroll
+			if secret == "" && derr == nil && du.TOTPEnabled {
+				secret = du.TOTPSecret
+			}
+			if step, ok := totpMatch(secret, req.Code, time.Now()); ok && secret != "" && derr == nil {
 				if tk.enroll != "" {
+					if s.e.hasSecondFactor(du) {
+						writeErr(w, http.StatusConflict, "Für dieses Konto ist inzwischen ein zweiter Faktor eingerichtet. Bitte erneut anmelden.")
+						return
+					}
 					_ = s.e.Store.DirSetTOTP(u.Username, secret, true)
 				}
 				valid, _ = s.e.Store.DirUseTOTPStep(u.Username, step)
@@ -175,13 +190,12 @@ func (s *Server) handleTOTPLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !valid {
-		s.login.fail(ip)
-		s.login.failUser(name)
 		s.auditLogin(r, name, false, "2FA-Code falsch")
 		// allow a retry with a fresh ticket
 		writeJSON(w, 401, map[string]any{"error": "Code ungültig", "ticket": tickets.issueEnroll(uid, tk.enroll)})
 		return
 	}
+	s.login.give(ip, name)
 	if err := s.setSession(w, r, u.ID); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -192,15 +206,12 @@ func (s *Server) handleTOTPLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // ldapPanelLogin authenticates a panel login against the directory.
-func (s *Server) ldapPanelLogin(w http.ResponseWriter, r *http.Request, username, password string) {
-	ip := clientIP(r)
+func (s *Server) ldapPanelLogin(w http.ResponseWriter, r *http.Request, username, password string) (passwordOK bool) {
 	dir := s.e.Settings().Directory
 	id, err := dir.Authenticate(username, password)
 	if err != nil {
 		var de *dirError
 		if errors.Is(err, errBadCredentials) || errors.As(err, &de) {
-			s.login.fail(ip)
-			s.login.failUser(username)
 			why := "falsches Passwort für „" + username + "“ (Verzeichnis)"
 			if de != nil {
 				why += ": " + de.reason
@@ -208,51 +219,72 @@ func (s *Server) ldapPanelLogin(w http.ResponseWriter, r *http.Request, username
 			s.auditLogin(r, username, false, why)
 			time.Sleep(400 * time.Millisecond)
 			writeErr(w, http.StatusUnauthorized, "Benutzername oder Passwort falsch")
-			return
+			return false
 		}
 		s.auditLogin(r, username, false, "Verzeichnisfehler: "+err.Error())
 		writeErr(w, http.StatusServiceUnavailable, "Verzeichnis nicht erreichbar: "+err.Error())
-		return
+		return true // not a wrong password
 	}
 	role := panelRole(dir, id)
 	if role == "" {
+		s.e.revokeDirectoryPanelUser(id.Username)
 		s.auditLogin(r, id.Username, false, "kein Panel-Zugriff (Gruppen)")
 		writeErr(w, http.StatusForbidden, "Dein Verzeichniskonto hat keinen Zugriff auf das Panel")
-		return
+		return true
 	}
-	_ = s.e.Store.UpsertDirUser(&store.DirUser{Username: id.Username, Display: id.Display, Email: id.Email, DN: id.DN, Groups: id.Groups})
+	if err := s.e.Store.UpsertDirUser(&store.DirUser{Username: id.Username, Display: id.Display, Email: id.Email, DN: id.DN, Groups: id.Groups, GroupDNs: id.GroupDNs}); err != nil {
+		// the name belongs to an account of another source: never use its
+		// record (second factor, lock, expiry) for this directory login
+		s.auditLogin(r, id.Username, false, "Namenskonflikt: "+err.Error())
+		writeErr(w, http.StatusForbidden, "Dieses Konto kann sich hier nicht anmelden (Namenskonflikt). Bitte die Administration informieren.")
+		return true
+	}
 	du, err := s.e.Store.DirUser(id.Username)
 	if err != nil {
 		writeErr(w, 500, err.Error())
-		return
+		return true
 	}
 	if du.Disabled {
+		s.e.revokeDirectoryPanelUser(id.Username)
 		s.auditLogin(r, id.Username, false, "Konto in Sentinel gesperrt")
 		writeErr(w, http.StatusForbidden, "Dein Konto ist gesperrt")
-		return
+		return true
+	}
+	if du.Expires > 0 && du.Expires <= time.Now().Unix() {
+		s.auditLogin(r, id.Username, false, "Zugang abgelaufen")
+		writeErr(w, http.StatusForbidden, "Dein Zugang ist abgelaufen")
+		return true
 	}
 	u, err := s.e.Store.UpsertLDAPPanelUser(id.Username, id.Display, role)
 	if err != nil {
 		writeErr(w, 400, err.Error())
-		return
+		return true
 	}
 	if dir.PanelRequireTOTP {
 		if du.TOTPEnabled {
 			writeJSON(w, 200, map[string]any{"totp_required": true, "ticket": tickets.issue(u.ID)})
-			return
+			return true
+		}
+		if s.e.hasSecondFactor(du) {
+			// passkeys or recovery codes only: the password alone must not
+			// be enough to register a new authenticator app
+			s.auditLogin(r, id.Username, false, "2FA-Einrichtung abgelehnt (anderer zweiter Faktor vorhanden)")
+			writeErr(w, http.StatusForbidden, "Die Panel-Anmeldung braucht eine Authenticator-App. Richte sie über die Kontoseite einer Site ein (/.sentinel/auth/me).")
+			return true
 		}
 		secret := newTOTPSecret()
 		uri, qr := enrollmentQR(dir.TOTPIssuer, id.Username, secret)
 		writeJSON(w, 200, map[string]any{"totp_required": true, "totp_enroll": true, "ticket": tickets.issueEnroll(u.ID, secret), "secret": secret, "uri": uri, "qr": qr})
-		return
+		return true
 	}
 	if err := s.setSession(w, r, u.ID); err != nil {
 		writeErr(w, 500, err.Error())
-		return
+		return true
 	}
 	s.e.Store.TouchLogin(u.ID)
 	s.auditLogin(r, u.Username, true, "")
 	writeJSON(w, 200, map[string]any{"ok": true, "user": u})
+	return true
 }
 
 func (s *Server) handleTOTPSetup(w http.ResponseWriter, r *http.Request) {
@@ -375,6 +407,10 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "unbekannte Rolle")
 		return
 	}
+	if len(req.Password) > maxPasswordBytes {
+		writeErr(w, 400, "Das Passwort ist zu lang (höchstens 72 Byte)")
+		return
+	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
 	if _, err := s.e.Store.CreateUser(req.Username, string(hash), req.Role); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -414,13 +450,13 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = s.e.Store.SetUserRole(id, req.Role)
 	}
-	if req.Password != "" && target.Source == "ldap" {
-		writeErr(w, 400, "Verzeichniskonten haben kein lokales Passwort")
+	if req.Password != "" && target.Source != "" && target.Source != "local" {
+		writeErr(w, 400, "Verzeichnis- und OAuth-Konten haben kein lokales Passwort")
 		return
 	}
 	if req.Password != "" {
-		if len(req.Password) < 10 {
-			writeErr(w, 400, "Passwort ≥ 10 Zeichen")
+		if len(req.Password) < 10 || len(req.Password) > maxPasswordBytes {
+			writeErr(w, 400, "Passwort: 10 bis 72 Zeichen")
 			return
 		}
 		hash, _ := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
@@ -428,6 +464,7 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ResetTOTP {
 		_ = s.e.Store.SetTOTP(id, "", false)
+		_ = s.e.Store.RevokeUserAccess(id) // sessions and API tokens
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -485,6 +522,7 @@ var auditLabels = map[string]string{
 	"PUT /api/monitors/{id}":                 "Monitor gespeichert",
 	"DELETE /api/monitors/{id}":              "Monitor gelöscht",
 	"POST /api/backup/restore":               "Backup eingespielt",
+	"POST /api/backup":                       "Sicherung heruntergeladen",
 	"DELETE /api/auth/sessions/{id}":         "Sitzung beendet",
 	"POST /api/policies/{id}/waf-exclude":    "WAF-Ausnahme angelegt",
 	"POST /api/instances":                    "Caddy-Instanz angelegt",
@@ -550,8 +588,97 @@ func (s *Server) auditLogin(r *http.Request, user string, ok bool, why string) {
 		s.auditEvent(r, user, "Anmeldung", nil)
 		return
 	}
-	ev := store.Event{Type: "audit", Severity: 2, IP: clientIP(r), Title: "Fehlgeschlagene Anmeldung: " + why}
-	d, _ := json.Marshal(map[string]any{"user": user, "ip": clientIP(r), "ua": r.UserAgent()})
+	ev := store.Event{Type: "audit", Severity: 2, IP: clientIP(r), Title: "Fehlgeschlagene Anmeldung: " + truncateStr(why, 300)}
+	d, _ := json.Marshal(map[string]any{"user": truncateStr(user, 256), "ip": clientIP(r), "ua": truncateStr(r.UserAgent(), 256)})
 	ev.Detail = d
 	s.e.AddEvent(ev, false)
+}
+
+// panelAccountBlocked reports directory panel accounts that are locked or
+// expired in Sentinel – checked on every request, also for API tokens.
+//
+// It fails closed: a directory account without its directory record (e.g.
+// deleted in Sentinel) or whose login source is switched off has no access.
+func (e *Engine) panelAccountBlocked(u *store.User) bool {
+	if u == nil {
+		return false
+	}
+	expired := func(du *store.DirUser) bool {
+		return du.Disabled || (du.Expires > 0 && du.Expires <= time.Now().Unix())
+	}
+	switch {
+	case u.Source == "ldap":
+		if dir := e.Settings().Directory; !dir.Enabled || !dir.PanelLogin {
+			return true
+		}
+		du, err := e.Store.DirUser(u.Username)
+		if err != nil || du.Source != store.SourceLDAP {
+			return true
+		}
+		return expired(du)
+	case strings.HasPrefix(u.Source, "oidc:"):
+		p := e.oauthProvider(strings.TrimPrefix(u.Source, "oidc:"))
+		if p == nil || !p.Enabled || !p.PanelLogin {
+			return true
+		}
+		du, err := e.Store.DirUser(u.Username)
+		if err == nil && du.Source == u.Source && expired(du) {
+			return true
+		}
+		return err != nil && !errors.Is(err, store.ErrNotFound)
+	}
+	return false
+}
+
+var dirRecheck sync.Mutex
+
+// recheckDirectoryPanelUsers re-reads the groups of directory panel
+// accounts (every 30 minutes): removed from the panel groups or deleted
+// in the directory ends their sessions and API tokens, a lower role
+// applies at once. Accounts of OIDC providers are only checked at login,
+// their API tokens expire after at most 90 days.
+func (e *Engine) recheckDirectoryPanelUsers() {
+	if !dirRecheck.TryLock() {
+		return
+	}
+	defer dirRecheck.Unlock()
+	dir := e.Settings().Directory
+	if !dir.Enabled {
+		return
+	}
+	users, err := e.Store.ListUsers()
+	if err != nil {
+		return
+	}
+	for _, u := range users {
+		if u.Source != "ldap" {
+			continue
+		}
+		id, err := dir.Lookup(u.Username)
+		role := ""
+		switch {
+		case errors.Is(err, errUserNotFound):
+		case err != nil:
+			continue // directory unreachable: decide next time
+		default:
+			role = panelRole(dir, id)
+		}
+		if role == "" {
+			if err := e.Store.RevokeUserAccess(u.ID); err == nil {
+				e.log.Info("directory panel account lost access", "user", u.Username)
+			}
+			continue
+		}
+		if role != u.Role {
+			_ = e.Store.SetUserRole(u.ID, role)
+		}
+	}
+}
+
+// revokeDirectoryPanelUser ends sessions and API tokens of a directory
+// panel account that no longer has access.
+func (e *Engine) revokeDirectoryPanelUser(name string) {
+	if u, err := e.Store.UserByName(name); err == nil && u.Source == "ldap" {
+		_ = e.Store.RevokeUserAccess(u.ID)
+	}
 }

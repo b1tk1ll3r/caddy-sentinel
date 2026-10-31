@@ -110,7 +110,7 @@ function pulse() {
     const last = data.slice(-5);
     const rps = last.length ? last.reduce((a, d) => a + d.req, 0) / last.length : 0;
     const blk = last.reduce((a, d) => a + d.blocked, 0);
-    num.replaceChildren(el('strong', null, rps.toFixed(rps < 10 ? 1 : 0) + ' Req/s'), blk ? el('span', { style: { color: 'var(--bad)' } }, `${blk} blockiert`) : 'live');
+    num.replaceChildren(el('strong', null, rps.toFixed(rps < 10 ? 1 : 0) + ' Req/s'), blk ? el('span.pulse-blk', null, el('i.sw'), `${blk} blockiert`) : 'live');
   };
   get('/stats/live?n=' + N).then(pts => { data.push(...pts); draw(); }).catch(() => { });
   bus.addEventListener('tick', (e) => {
@@ -120,7 +120,7 @@ function pulse() {
     if (data.length > N * 2) data.splice(0, data.length - N);
     draw();
   });
-  return el('div.pulse', { title: 'Requests pro Sekunde (rot: blockiert)' }, bars, num);
+  return el('div.pulse', { title: 'Requests pro Sekunde (violett: blockiert)' }, bars, num);
 }
 
 // --------------------------------------------------------------- auth screens
@@ -351,7 +351,12 @@ async function start() {
   let st;
   try { st = await get('/auth/state'); } catch (e) { mount(document.getElementById('app'), el('div.boot', null, e.message)); return; }
   if (st.setup_required) return loginScreen(true);
-  if (!st.user) return loginScreen(false);
+  if (!st.user) {
+    // provider login with panel 2FA: the server hands over a ticket
+    const m = location.hash.match(/[?&]totp=([A-Za-z0-9_-]+)/);
+    if (m) { history.replaceState(null, '', '/#/'); return totpScreen(m[1], null); }
+    return loginScreen(false);
+  }
   const status = await get('/status');
   instState.setList(status.instances);
   buildShell(status);
@@ -367,7 +372,27 @@ window.addEventListener('sentinel:unauthorized', () => { if (shellEls) { shellEl
 setInterval(() => { if (shellEls && !document.hidden) get('/status').then(updateStatus).catch(() => { }); }, 15000);
 bus.addEventListener('event', (e) => {
   const ev = e.detail;
-  if (ev.type === 'ban') { toast(ev.title, 'bad', 6000); get('/status').then(updateStatus).catch(() => { }); }
+  if (ev.type === 'ban') { banToast(ev); get('/status').then(updateStatus).catch(() => { }); }
   if (ev.type === 'alert' && ev.severity >= 3) toast(ev.title, 'bad', 8000);
 });
 start();
+
+// Bans arrive in bursts during an attack: the first one is shown as is,
+// further bans within 10 seconds are summed up in one message.
+let banBurst = null;
+function banToast(ev) {
+  const now = Date.now();
+  if (!banBurst || now - banBurst.last > 10000) {
+    banBurst = { n: 1, last: now, timer: null };
+    toast(ev.title, 'bad', 6000);
+    return;
+  }
+  banBurst.n++;
+  banBurst.last = now;
+  clearTimeout(banBurst.timer);
+  const b = banBurst;
+  b.timer = setTimeout(() => {
+    toast(`${b.n - 1} weitere IPs gesperrt – Details unter Sicherheit › Sperren & Freigaben`, 'bad', 8000);
+    b.n = 1;
+  }, 2500);
+}

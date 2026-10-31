@@ -192,7 +192,7 @@ func (l *lockout) recent(key string, window time.Duration) int {
 func (l *lockout) locked(user, ip string, max int, window time.Duration) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return (user != "" && l.recent("u|"+strings.ToLower(user), window) >= max) || l.recent("ip|"+ip, window) >= max*4
+	return (user != "" && l.recent("u|"+truncateStr(strings.ToLower(user), 128), window) >= max) || l.recent("ip|"+limitIP(ip), window) >= max*4
 }
 
 func (l *lockout) add(user, ip string) {
@@ -200,16 +200,52 @@ func (l *lockout) add(user, ip string) {
 	defer l.mu.Unlock()
 	now := time.Now()
 	if user != "" {
-		k := "u|" + strings.ToLower(user)
+		k := "u|" + truncateStr(strings.ToLower(user), 128)
 		l.fail[k] = append(l.fail[k], now)
 	}
-	l.fail["ip|"+ip] = append(l.fail["ip|"+ip], now)
+	l.fail["ip|"+limitIP(ip)] = append(l.fail["ip|"+limitIP(ip)], now)
+}
+
+// reserve counts an attempt before the password is checked (parallel
+// requests cannot exceed the budget); false when the budget is used up.
+// release takes the attempt back after a correct password.
+func (l *lockout) reserve(user, ip string, max int, window time.Duration) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	user = truncateStr(strings.ToLower(user), 128)
+	if (user != "" && l.recent("u|"+user, window) >= max) || l.recent("ip|"+limitIP(ip), window) >= max*4 {
+		return false
+	}
+	now := time.Now()
+	if user != "" {
+		l.fail["u|"+user] = append(l.fail["u|"+user], now)
+	}
+	l.fail["ip|"+limitIP(ip)] = append(l.fail["ip|"+limitIP(ip)], now)
+	if len(l.fail) > 50000 {
+		for k := range l.fail {
+			l.recent(k, window)
+		}
+	}
+	return true
+}
+
+func (l *lockout) release(user, ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, k := range []string{"u|" + truncateStr(strings.ToLower(user), 128), "ip|" + limitIP(ip)} {
+		if n := len(l.fail[k]); n > 0 {
+			l.fail[k] = l.fail[k][:n-1]
+		}
+		if len(l.fail[k]) == 0 {
+			delete(l.fail, k)
+		}
+	}
 }
 
 func (l *lockout) clear(user string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.fail, "u|"+strings.ToLower(user))
+	delete(l.fail, "u|"+truncateStr(strings.ToLower(user), 128))
 }
 
 func (l *lockout) snapshot(window time.Duration, max int) map[string]int {
@@ -236,6 +272,10 @@ type authTicket struct {
 	secret  string // enrolment secret
 	tries   int
 	expires time.Time
+	// passkeys (WebAuthn)
+	challenge []byte
+	origin    string
+	rpID      string
 }
 
 type authTicketStore struct {
@@ -257,6 +297,21 @@ func (s *authTicketStore) put(t *authTicket) string {
 	}
 	s.m[tok] = t
 	return tok
+}
+
+// attempt counts a code attempt on a ticket before the code is checked and
+// returns the number of attempts so far; false (and the ticket is dropped)
+// once its five attempts are used up.
+func (s *authTicketStore) attempt(tok string) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.m[tok]
+	if t == nil || time.Now().After(t.expires) || t.tries >= 5 {
+		delete(s.m, tok)
+		return 0, false
+	}
+	t.tries++
+	return t.tries, true
 }
 
 func (s *authTicketStore) get(tok string) *authTicket {
@@ -310,7 +365,7 @@ func (s *Server) handleAgentAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Inst = agentInst(r)
-	writeJSON(w, 200, s.e.siteLogin(req))
+	writeJSON(w, 200, s.e.handleSessionSteps(req))
 }
 
 func deny(msg string) *protocol.AuthResponse {
@@ -347,33 +402,45 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 	if !a.Enabled {
 		return deny("Für diese Seite ist keine Anmeldung eingerichtet.")
 	}
+	e.idpTightenLogin(req, &a)
 	window := time.Duration(dir.LockoutMinutes) * time.Minute
 
 	switch req.Step {
 	case "code":
 		return e.siteCodeLogin(req, a)
-	case "account", "acct_password", "acct_totp", "acct_totp_confirm", "acct_recovery", "acct_logout_all":
+	case "account", "acct_password", "acct_totp", "acct_totp_confirm", "acct_recovery", "acct_logout_all",
+		"acct_passkey_begin", "acct_passkey_add", "acct_passkey_del":
 		return e.selfService(req)
 	case "reset_request", "reset_check", "reset":
 		return e.passwordReset(req, a)
 	case "pwchange":
 		return e.pwChangeStep(req, a)
+	case "passkey", "passkey_enroll":
+		return e.passkeyLogin(req, a)
 	case "totp", "enroll":
 		t := siteTickets.get(req.Ticket)
 		if t == nil || t.policy != req.Policy || t.host != req.Host || t.ip != req.IP || t.stage != req.Step {
 			return deny("Die Anmeldung ist abgelaufen – bitte erneut anmelden.")
 		}
 		name := t.id.Username
-		if dirLock.locked(name, req.IP, dir.LockoutAttempts, window) {
+		// count the attempt before the code is checked: on the account
+		// budget and on the ticket (atomically, parallel codes included)
+		if !dirLock.reserve(name, req.IP, dir.LockoutAttempts, window) {
 			siteTickets.drop(req.Ticket)
 			e.access(req, name, "locked", "zu viele Fehlversuche")
 			return deny(fmt.Sprintf("Zu viele Fehlversuche – bitte %d Minuten warten.", dir.LockoutMinutes))
 		}
+		tries, ok := siteTickets.attempt(req.Ticket)
+		if !ok {
+			dirLock.release(name, req.IP)
+			return deny("Zu viele falsche Codes – bitte erneut anmelden.")
+		}
 		secret := t.secret
 		if t.stage == "totp" {
 			u, err := e.Store.DirUser(name)
-			if err != nil || !u.TOTPEnabled {
+			if err != nil || (!u.TOTPEnabled && len(e.passkeysFor(name, t.rpID)) == 0) {
 				siteTickets.drop(req.Ticket)
+				dirLock.release(name, req.IP)
 				return deny("Die Anmeldung ist abgelaufen – bitte erneut anmelden.")
 			}
 			secret = u.TOTPSecret
@@ -381,6 +448,7 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 				// recovery code instead of the app (lost or new device)
 				if ok, _ := e.Store.UseRecoveryCode(name, recoveryHash(req.Code)); ok {
 					siteTickets.drop(req.Ticket)
+					dirLock.release(name, req.IP)
 					dirLock.clear(name)
 					e.recoveryUsed(req, name)
 					return e.loginOK(req, t.id, a, t.via+" + Wiederherstellungscode", 2)
@@ -389,8 +457,15 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 		}
 		step, ok := totpMatch(secret, req.Code, time.Now())
 		if ok && t.stage == "enroll" {
+			// someone set up a factor in the meantime: this ticket is void
+			if cur, err := e.Store.DirUser(name); err != nil || e.hasSecondFactor(cur) {
+				siteTickets.drop(req.Ticket)
+				dirLock.release(name, req.IP)
+				return deny("Für dieses Konto ist inzwischen ein zweiter Faktor eingerichtet. Bitte erneut anmelden.")
+			}
 			// activate the new secret before recording the used step
 			if err := e.Store.DirSetTOTP(name, secret, true); err != nil {
+				dirLock.release(name, req.IP)
 				return deny("Interner Fehler: " + err.Error())
 			}
 		}
@@ -398,12 +473,10 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 			ok, _ = e.Store.DirUseTOTPStep(name, step) // replay protection
 		}
 		if !ok {
-			dirLock.add(name, req.IP)
-			t.tries++
 			e.access(req, name, "fail", map[string]string{"totp": "2FA-Code falsch", "enroll": "Einrichtungscode falsch"}[t.stage])
 			res := deny("Der Code ist ungültig. Bitte den aktuellen Code eingeben (Uhrzeit des Geräts prüfen).")
 			res.User = &protocol.AuthUser{Name: name, Display: t.id.Display}
-			if t.tries < 5 {
+			if tries < 5 {
 				res.Ticket = req.Ticket
 				if t.stage == "enroll" {
 					res.Secret = t.secret
@@ -416,6 +489,7 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 			return res
 		}
 		siteTickets.drop(req.Ticket)
+		dirLock.release(name, req.IP)
 		dirLock.clear(name)
 		detail := t.via + " + 2FA"
 		if t.stage == "enroll" {
@@ -431,15 +505,15 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 			e.access(req, lname, "denied", "Zugangskonten für diese Seite nicht zugelassen")
 			return &protocol.AuthResponse{Status: "forbidden", Message: "Mit Zugangskonten ist diese Seite nicht erreichbar."}
 		}
-		if dirLock.locked(lname, req.IP, dir.LockoutAttempts, window) {
+		if !dirLock.reserve(lname, req.IP, dir.LockoutAttempts, window) {
 			e.access(req, lname, "locked", "zu viele Fehlversuche")
 			return deny(fmt.Sprintf("Zu viele Fehlversuche – bitte %d Minuten warten.", dir.LockoutMinutes))
 		}
 		if du.PWHash == "" || bcrypt.CompareHashAndPassword([]byte(du.PWHash), []byte(req.Password)) != nil {
-			dirLock.add(lname, req.IP)
 			e.access(req, lname, "fail", "Passwort falsch (Zugangskonto)")
 			return deny(errBadCredentials.Error())
 		}
+		dirLock.release(lname, req.IP)
 		if du.MustChange && !du.Disabled {
 			dirLock.clear(lname)
 			return e.mustChangeTicket(req, du)
@@ -459,7 +533,7 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 		e.access(req, user, "denied", "Domänenkonten für diese Seite nicht zugelassen")
 		return &protocol.AuthResponse{Status: "forbidden", Message: "Mit Domänenkonten ist diese Seite nicht erreichbar."}
 	}
-	if dirLock.locked(user, req.IP, dir.LockoutAttempts, window) {
+	if !dirLock.reserve(user, req.IP, dir.LockoutAttempts, window) {
 		e.access(req, user, "locked", "zu viele Fehlversuche")
 		return deny(fmt.Sprintf("Zu viele Fehlversuche – bitte %d Minuten warten.", dir.LockoutMinutes))
 	}
@@ -468,19 +542,19 @@ func (e *Engine) siteLogin(req protocol.AuthRequest) *protocol.AuthResponse {
 		var de *dirError
 		switch {
 		case errors.Is(err, errBadCredentials):
-			dirLock.add(user, req.IP)
 			e.access(req, user, "fail", "Benutzername oder Passwort falsch")
 			return deny(errBadCredentials.Error())
 		case errors.As(err, &de):
-			dirLock.add(user, req.IP)
 			e.access(req, user, "fail", de.reason)
 			return deny(de.msg)
 		}
+		dirLock.release(user, req.IP) // not the password's fault
 		e.log.Warn("site login: directory error", "err", err)
 		e.access(req, user, "error", err.Error())
 		return deny("Der Anmeldedienst ist gestört. Bitte später erneut versuchen.")
 	}
-	if err := e.Store.UpsertDirUser(&store.DirUser{Username: id.Username, Display: id.Display, Email: id.Email, DN: id.DN, Groups: id.Groups}); err != nil {
+	dirLock.release(user, req.IP)
+	if err := e.Store.UpsertDirUser(&store.DirUser{Username: id.Username, Display: id.Display, Email: id.Email, DN: id.DN, Groups: id.Groups, GroupDNs: id.GroupDNs}); err != nil {
 		e.access(req, id.Username, "denied", err.Error())
 		return &protocol.AuthResponse{Status: "forbidden", Message: "Dieses Konto kann sich hier nicht anmelden (Namenskonflikt). Bitte die Administration informieren."}
 	}
@@ -517,15 +591,41 @@ func (e *Engine) afterPrimary(req protocol.AuthRequest, a protocol.AuthPolicy, i
 		return e.loginOK(req, id, a, detail, max(factors, 1))
 	}
 	t := &authTicket{id: id, policy: req.Policy, host: req.Host, ip: req.IP, via: via}
-	if du.TOTPEnabled {
+	_, rpID := e.passkeyContext(req)
+	if e.hasSecondFactor(du) {
+		// a second factor exists – never offer a new one here, even when it
+		// cannot be used on this address (passkeys belong to their host):
+		// the password alone must not be enough to set up an own app
 		t.stage = "totp"
-		return &protocol.AuthResponse{Status: "totp", Ticket: siteTickets.put(t), User: au}
+		res := &protocol.AuthResponse{Status: "totp", Ticket: siteTickets.put(t), User: au, NoTOTP: !du.TOTPEnabled}
+		e.offerPasskeyLogin(req, t, res)
+		if !du.TOTPEnabled && (rpID == "" || len(e.passkeysFor(id.Username, rpID)) == 0) {
+			res.Message = "Der Passkey dieses Kontos ist für eine andere Adresse eingerichtet. Bitte dort anmelden oder einen Wiederherstellungscode verwenden."
+		}
+		return res
 	}
 	t.stage, t.secret = "enroll", newTOTPSecret()
 	res := &protocol.AuthResponse{Status: "enroll", Ticket: siteTickets.put(t), User: au, Secret: t.secret}
 	res.URI, res.QR = enrollmentQR(dir.TOTPIssuer, id.Username, t.secret)
+	e.offerPasskeyEnroll(req, t, res)
 	e.access(req, id.Username, "enroll", "2FA-Einrichtung gestartet")
 	return res
+}
+
+// hasSecondFactor reports whether an account has any second factor: an
+// authenticator app, a passkey for any address or unused recovery codes.
+func (e *Engine) hasSecondFactor(du *store.DirUser) bool {
+	if du == nil {
+		return false
+	}
+	if du.TOTPEnabled {
+		return true
+	}
+	if pks, _ := e.Store.Passkeys(du.Username); len(pks) > 0 {
+		return true
+	}
+	n, _ := e.Store.RecoveryCodesLeft(du.Username)
+	return n > 0
 }
 
 func (e *Engine) loginOK(req protocol.AuthRequest, id *DirIdentity, a protocol.AuthPolicy, detail string, factors int) *protocol.AuthResponse {
@@ -540,17 +640,15 @@ func (e *Engine) loginOK(req protocol.AuthRequest, id *DirIdentity, a protocol.A
 	}
 	// only hand out groups relevant for access decisions plus a few more;
 	// the agent re-checks them against the policy on every request
-	groups := id.Groups
+	var groups []string
+	if src == "directory" {
+		// full DNs only for the DN entries the policies actually use
+		groups = append(append([]string{}, id.Groups...), wantedDNs(id.GroupDNs, e.dnEntries(req.Policy, a))...)
+	} else {
+		groups = withoutDNs(id.Groups)
+	}
 	if len(groups) > 40 && !a.SSO { // SSO sessions serve several sites: keep all groups
-		var rel []string
-		for _, g := range groups {
-			for _, want := range a.AllowedGroups {
-				if strings.EqualFold(protocol.GroupCN(want), g) {
-					rel = append(rel, g)
-				}
-			}
-		}
-		groups = append(rel, groups[:40-len(rel)]...)
+		groups = relevantGroups(groups, e.policyGroups(req.Policy, a), 40)
 	}
 	return &protocol.AuthResponse{
 		Status:         "ok",
@@ -619,6 +717,15 @@ func (s *Server) handleDirUsers(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	count := map[string]int{}
+	if pks, err := s.e.Store.Passkeys(""); err == nil {
+		for _, p := range pks {
+			count[p.Username]++
+		}
+	}
+	for i := range us {
+		us[i].Passkeys = count[strings.ToLower(us[i].Username)]
+	}
 	writeJSON(w, 200, us)
 }
 
@@ -631,7 +738,11 @@ func (s *Server) handleDirUserAction(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch r.PathValue("action") {
 	case "reset-totp":
+		// all second factors: app, recovery codes and passkeys
 		if err = s.e.Store.DirSetTOTP(name, "", false); err == nil {
+			err = s.e.Store.DeletePasskeys(name)
+		}
+		if err == nil {
 			err = s.e.Store.DirRevoke(name)
 		}
 	case "revoke":
@@ -657,6 +768,13 @@ func (s *Server) handleDirUserAction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDirUserDelete(w http.ResponseWriter, r *http.Request) {
 	// DirDelete leaves a tombstone so existing sessions stay invalid
 	_ = s.e.Store.DeleteSiteTokensOf(r.PathValue("name"))
+	// the panel account of a directory or OAuth user loses sessions and
+	// API tokens too (local panel accounts are not affected)
+	if du, err := s.e.Store.DirUser(r.PathValue("name")); err == nil && du.Source != store.SourceLocal {
+		if u, err := s.e.Store.UserByName(du.Username); err == nil && u.Source == du.Source {
+			_ = s.e.Store.RevokeUserAccess(u.ID)
+		}
+	}
 	if err := s.e.Store.DirDelete(r.PathValue("name")); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -771,4 +889,118 @@ func panelRole(d DirectoryConfig, id *DirIdentity) string {
 		return "viewer"
 	}
 	return ""
+}
+
+// policyGroups lists every group a policy decides on: its own allowed
+// groups and those of all its path rules (a session is checked against both).
+func (e *Engine) policyGroups(policy string, a protocol.AuthPolicy) []string {
+	out := append([]string{}, a.AllowedGroups...)
+	if p := e.Policy(policy); p != nil {
+		out = append(out, p.Auth.AllowedGroups...)
+		for _, r := range p.PathRules {
+			out = append(out, r.AuthGroups...)
+		}
+	}
+	return out
+}
+
+// accessGroups are the groups an access decision may use for an account:
+// directory accounts add the full DNs of their groups; any other source
+// never contributes DN-shaped names, so a DN entry in a policy can only be
+// satisfied by the directory.
+func accessGroups(du *store.DirUser) []string {
+	if du.Source == store.SourceLDAP {
+		return append(append([]string{}, du.Groups...), du.GroupDNs...)
+	}
+	return withoutDNs(du.Groups)
+}
+
+// withoutDNs drops DN-shaped entries ("CN=x,OU=…") from a group list.
+func withoutDNs(groups []string) []string {
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		if !protocol.IsDN(g) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// dnEntries lists the DN-shaped group entries a login for policy may be
+// checked against: those of the policy and its path rules, for SSO sessions
+// those of every policy with a login.
+func (e *Engine) dnEntries(policy string, a protocol.AuthPolicy) []string {
+	all := e.policyGroups(policy, a)
+	if a.SSO {
+		for _, p := range e.Policies() {
+			all = append(all, p.Auth.AllowedGroups...)
+			for _, r := range p.PathRules {
+				all = append(all, r.AuthGroups...)
+			}
+		}
+	}
+	var out []string
+	for _, g := range all {
+		if protocol.IsDN(g) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// wantedDNs returns the group DNs of an account that match one of entries.
+func wantedDNs(dns, entries []string) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, w := range entries {
+		want[protocol.NormalizeDN(w)] = true
+	}
+	var out []string
+	for _, d := range dns {
+		if want[protocol.NormalizeDN(d)] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// groupKey is the comparison key of a group entry: the normalised DN for
+// DNs, the lower-cased name otherwise.
+func groupKey(g string) string {
+	if protocol.IsDN(g) {
+		return protocol.NormalizeDN(g)
+	}
+	return strings.ToLower(strings.TrimSpace(g))
+}
+
+// relevantGroups keeps the groups that matter for access decisions first and
+// fills up with others to at least max entries (cookie size).
+func relevantGroups(groups, wanted []string, max int) []string {
+	want := map[string]bool{}
+	for _, w := range wanted {
+		want[groupKey(w)] = true
+	}
+	var rel, rest []string
+	seen := map[string]bool{}
+	for _, g := range groups {
+		k := groupKey(g)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		if want[k] {
+			rel = append(rel, g)
+		} else {
+			rest = append(rest, g)
+		}
+	}
+	if n := max - len(rel); n > 0 {
+		if n > len(rest) {
+			n = len(rest)
+		}
+		rel = append(rel, rest[:n]...)
+	}
+	return rel
 }

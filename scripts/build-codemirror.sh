@@ -9,28 +9,38 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
-# repo  version(tag)
+# repo  version(tag)  commit
+# Der Commit hält die Quelle fest: ein nachträglich umgehängter Tag fällt auf
+# (Abbruch), statt unbemerkt anderen Code ins Bundle zu bringen. Neue Version:
+#   git ls-remote https://github.com/<repo> 'refs/tags/<tag>^{}'
+# (bei leichtgewichtigen Tags ohne ^{}) und Tag und Commit hier eintragen.
 REPOS="
-codemirror/state 6.6.0
-codemirror/view 6.41.0
-codemirror/commands 6.10.3
-codemirror/language 6.12.3
-codemirror/search 6.6.0
-codemirror/autocomplete 6.20.1
-codemirror/lint 6.9.5
-lezer-parser/common 1.5.2
-lezer-parser/highlight 1.2.3
-lezer-parser/lr 1.4.8
-marijnh/style-mod 4.1.3
-marijnh/w3c-keyname 2.2.8
-marijnh/crelt 1.0.6
-marijnh/find-cluster-break 1.0.2
+codemirror/state 6.6.0 821d9b772a1d2d9c989b6ae472513380bf10136b
+codemirror/view 6.41.0 a0a5ed946cfdfde61dcf33b131d551136378ccf9
+codemirror/commands 6.10.3 6f83cb93abc81cb13993ce4805aafce45bfe2853
+codemirror/language 6.12.3 f5af31eed71fa22e8c110d74e61098c0fb1c1acb
+codemirror/search 6.6.0 502b2e43fecbb4b49f631e1ba5dce05d1ad493ae
+codemirror/autocomplete 6.20.1 7cbf7fd3b8126fd2b8f3d29a0cb150ac31506fd1
+codemirror/lint 6.9.5 296d74376596acd4c7aa4cd1cf00e877cdd2ff52
+lezer-parser/common 1.5.2 de5f96276a2954c249de1475e8b03f79c20d9ce4
+lezer-parser/highlight 1.2.3 37e3eef517edd8e8dc8790419d04b61a7ac28420
+lezer-parser/lr 1.4.8 f81d6a25c3482aa7fc12434e9adea9d75c56ad08
+marijnh/style-mod 4.1.3 f8a0376473b604184916ef2ae4f28edfaf653849
+marijnh/w3c-keyname 2.2.8 5ea93b04bb62230c7de4165e3a9b5c840f05cd44
+marijnh/crelt 1.0.6 25eabb104d50e160cd4e4acd9eed2eacb32b332b
+marijnh/find-cluster-break 1.0.2 b0b1f10aa0c131cf53f2dc347a09544b4ae87324
 "
-echo "$REPOS" | while read -r repo ver; do
+echo "$REPOS" | while read -r repo ver commit; do
   [ -n "$repo" ] || continue
   name=$(basename "$repo")
-  git clone -q --depth 1 --branch "$ver" "https://github.com/$repo" "$name" 2>/dev/null \
-    || git clone -q --depth 1 "https://github.com/$repo" "$name"
+  # exactly the pinned version – never silently fall back to HEAD
+  git -c advice.detachedHead=false clone -q --depth 1 --branch "$ver" "https://github.com/$repo" "$name" \
+    || { echo "Fehler: $repo $ver nicht abrufbar" >&2; exit 1; }
+  got=$(git -C "$name" rev-parse HEAD)
+  if [ "$got" != "$commit" ]; then
+    echo "Fehler: $repo $ver zeigt auf $got statt $commit – Tag umgehängt? Abbruch." >&2
+    exit 1
+  fi
 done
 
 cat > entry.ts <<'TS'

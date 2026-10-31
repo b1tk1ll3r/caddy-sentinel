@@ -184,21 +184,41 @@ func atomicWrite(p string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	// Try in-place write first when the directory is not writable but the
-	// file is (common for /etc/caddy owned by root with a group-writable file).
-	tmp := p + ".sentinel-tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		f, err2 := os.OpenFile(p, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, mode)
+	// A new temporary file next to the target (random name, O_EXCL: never
+	// follows a link someone else placed there), then rename over the target.
+	f, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".sentinel-tmp-*")
+	if err != nil {
+		// The directory is not writable but the file may be (/etc/caddy
+		// owned by root with a group-writable file): write in place, but
+		// never through a symbolic link.
+		if st, lerr := os.Lstat(p); lerr == nil && !st.Mode().IsRegular() {
+			return errors.New(p + ": keine reguläre Datei")
+		}
+		f2, err2 := os.OpenFile(p, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, mode)
 		if err2 != nil {
 			return err
 		}
-		_, err2 = f.Write(data)
-		if cerr := f.Close(); err2 == nil {
+		_, err2 = f2.Write(data)
+		if cerr := f2.Close(); err2 == nil {
 			err2 = cerr
 		}
 		return err2
 	}
-	return os.Rename(tmp, p)
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmp, mode)
+	}
+	if err == nil {
+		err = os.Rename(tmp, p)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+	}
+	return err
 }
 
 // Stage materialises the workspace with overrides in the staging directory
@@ -222,7 +242,17 @@ func (w *Workspace) Stage(overrides map[string]string) (string, error) {
 		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 			return "", err
 		}
-		if err := os.WriteFile(p, []byte(content), 0o640); err != nil {
+		// O_EXCL: the tree was just emptied, so a file that exists now was
+		// placed by someone else (possibly a link) – never write through it
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
+		if err != nil {
+			return "", err
+		}
+		_, err = f.WriteString(content)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
 			return "", err
 		}
 	}

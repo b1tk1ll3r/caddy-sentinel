@@ -76,6 +76,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/access/tokens", s.admin(s.handleSiteTokenCreate))
 	m.HandleFunc("DELETE /api/access/tokens/{id}", s.admin(s.handleSiteTokenDelete))
 	m.HandleFunc("POST /api/access/oauth/test", s.admin(s.handleOAuthTest))
+	s.idpRoutes(m)
 
 	// OAuth2 / OIDC (browser redirects, no session needed)
 	m.HandleFunc("GET /oauth/panel", s.handleOAuthPanel)
@@ -136,6 +137,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/pki/{ca}/issued", s.auth(s.handlePKIIssued))
 	m.HandleFunc("GET /api/pki/{ca}/issued/{serial}", s.auth(s.handlePKICert))
 	m.HandleFunc("GET /api/backup", s.admin(s.handleBackup))
+	m.HandleFunc("POST /api/backup", s.admin(s.handleBackupEncrypted))
 	m.HandleFunc("POST /api/backup/restore", s.admin(s.handleBackupRestore))
 	// status & stats
 	m.HandleFunc("GET /api/status", s.auth(s.handleStatus))
@@ -355,6 +357,11 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 
 // authorized checks the role and writes the audit trail.
 func (s *Server) authorized(w http.ResponseWriter, r *http.Request, u *store.User, h http.HandlerFunc) {
+	if s.e.panelAccountBlocked(u) {
+		_ = s.e.Store.RevokeUserAccess(u.ID)
+		writeErr(w, http.StatusUnauthorized, "Konto gesperrt oder abgelaufen")
+		return
+	}
 	if r.Method != http.MethodGet && !viewerAllowed[r.Pattern] {
 		need := patternCap[r.Pattern]
 		if !RoleCan(u.Role, need) {
@@ -376,6 +383,9 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request, u *store.Use
 			}
 		}
 		title := label
+		if v := rec.Header().Get(auditOutcomeHeader); v != "" {
+			title += " – " + v
+		}
 		if v := r.PathValue("action"); v != "" {
 			title += " – " + v
 		}
@@ -536,15 +546,18 @@ func (s *Server) handleAgentState(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentIngest(w http.ResponseWriter, r *http.Request) {
 	var b ingestBody
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<20) // 2000 records fit easily
 	if err := readJSON(r, &b); err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, errBodyTooLarge) {
+		var mbe *http.MaxBytesError
+		if errors.Is(err, errBodyTooLarge) || errors.Is(err, errBatchTooLarge) || errors.As(err, &mbe) {
+			// permanent: the agent drops such a batch instead of retrying
 			status = http.StatusRequestEntityTooLarge
 		}
 		writeErr(w, status, err.Error())
 		return
 	}
-	if err := s.e.Ingest(&b.Ingest, clientIP(r), agentInst(r)); err != nil {
+	if err := s.e.Ingest(b.ingest(), clientIP(r), agentInst(r)); err != nil {
 		s.e.log.Error("ingest", "err", err)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -560,16 +573,16 @@ type loginLimiter struct {
 }
 
 // allow: at most 10 failures per client IP in 15 minutes.
-func (l *loginLimiter) allow(ip string) bool { return l.allowN(ip, 10) }
+func (l *loginLimiter) allow(ip string) bool { return l.allowN(limitIP(ip), 10) }
 
 // allowUser: at most 30 failures per account in 15 minutes, whatever the
 // source address (spread-out guessing, clients behind one proxy).
 func (l *loginLimiter) allowUser(name string) bool {
-	return l.allowN("u:"+strings.ToLower(strings.TrimSpace(name)), 30)
+	return l.allowN(limitUserKey(name), 30)
 }
 
 func (l *loginLimiter) failUser(name string) {
-	l.fail("u:" + strings.ToLower(strings.TrimSpace(name)))
+	l.fail(limitUserKey(name))
 }
 
 func (l *loginLimiter) allowN(key string, n int) bool {
@@ -590,11 +603,104 @@ func (l *loginLimiter) allowN(key string, n int) bool {
 	return len(keep) < n
 }
 
-func (l *loginLimiter) fail(ip string) {
+func (l *loginLimiter) fail(key string) {
+	ip := limitIP(key) // account keys ("u:…") stay as they are
 	l.mu.Lock()
 	l.m[ip] = append(l.m[ip], time.Now())
+	l.sweepLocked()
 	l.mu.Unlock()
 }
+
+// limitUserKey is the limiter key of an account name (bounded length). It
+// uses the canonical account name, so "DOMAIN\\alice" or "alice@corp" do
+// not get a budget of their own next to "alice".
+func limitUserKey(name string) string {
+	return "u:" + truncateStr(strings.ToLower(splitLogin(name)), 128)
+}
+
+// limitIP is the limiter key of a client address: IPv6 clients count per
+// /64 (one customer network), IPv4 per address.
+func limitIP(ip string) string {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	a = a.Unmap()
+	if a.Is6() {
+		if p, err := a.Prefix(64); err == nil {
+			return p.String()
+		}
+	}
+	return a.String()
+}
+
+// take counts a password attempt before it is checked, so parallel
+// requests cannot run more checks than the limit allows; give takes it
+// back after a correct password. which names the exhausted limit.
+func (l *loginLimiter) take(ip, name string) (ok bool, which string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	ip = limitIP(ip)
+	uk := limitUserKey(name)
+	for _, k := range []string{ip, uk} {
+		var keep []time.Time
+		for _, t := range l.m[k] {
+			if now.Sub(t) < 15*time.Minute {
+				keep = append(keep, t)
+			}
+		}
+		l.m[k] = keep
+	}
+	if len(l.m[ip]) >= 10 {
+		return false, "ip"
+	}
+	if len(l.m[uk]) >= 30 {
+		return false, "user"
+	}
+	l.m[ip] = append(l.m[ip], now)
+	l.m[uk] = append(l.m[uk], now)
+	l.sweepLocked()
+	return true, ""
+}
+
+func (l *loginLimiter) give(ip, name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, k := range []string{limitIP(ip), limitUserKey(name)} {
+		if n := len(l.m[k]); n > 0 {
+			l.m[k] = l.m[k][:n-1]
+		}
+		if len(l.m[k]) == 0 {
+			delete(l.m, k)
+		}
+	}
+}
+
+// sweepLocked keeps the map bounded: expired keys go first; beyond 50 000
+// keys (many addresses or invented names) the account counters are
+// dropped – the per-address limit still holds.
+func (l *loginLimiter) sweepLocked() {
+	if len(l.m) < 20000 {
+		return
+	}
+	now := time.Now()
+	for k, ts := range l.m {
+		if len(ts) == 0 || now.Sub(ts[len(ts)-1]) >= 15*time.Minute {
+			delete(l.m, k)
+		}
+	}
+	if len(l.m) > 50000 {
+		for k := range l.m {
+			if strings.HasPrefix(k, "u:") {
+				delete(l.m, k)
+			}
+		}
+	}
+}
+
+// dummyHash equalises the time of logins with unknown names (cost 12).
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("sentinel-dummy-password"), 12)
 
 func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 	n, _ := s.e.Store.UserCount()
@@ -623,6 +729,13 @@ func (s *Server) setSession(w http.ResponseWriter, r *http.Request, uid int64) e
 }
 
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	// reachable without a session: small bodies only, and nothing is read
+	// once the setup is done
+	if n, _ := s.e.Store.UserCount(); n > 0 {
+		writeErr(w, http.StatusConflict, "Einrichtung bereits abgeschlossen")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	var req struct{ Username, Password string }
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -634,8 +747,8 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "Einrichtung bereits abgeschlossen")
 		return
 	}
-	if len(req.Username) < 3 || len(req.Password) < 10 {
-		writeErr(w, 400, "Benutzername ≥ 3 Zeichen, Passwort ≥ 10 Zeichen")
+	if len(req.Username) < 3 || len(req.Password) < 10 || len(req.Password) > maxPasswordBytes {
+		writeErr(w, 400, "Benutzername ≥ 3 Zeichen, Passwort 10 bis 72 Zeichen")
 		return
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
@@ -650,32 +763,41 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
-	if !s.login.allow(ip) {
-		writeErr(w, http.StatusTooManyRequests, "Zu viele Fehlversuche – bitte 15 Minuten warten")
-		return
-	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	var req struct{ Username, Password string }
 	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+		writeErr(w, 400, "Anfrage ungültig")
 		return
 	}
-	if !s.login.allowUser(req.Username) {
-		writeErr(w, http.StatusTooManyRequests, "Zu viele Fehlversuche für dieses Konto – bitte 15 Minuten warten")
+	if len(req.Username) > 256 || len(req.Password) > 1024 {
+		writeErr(w, 400, "Benutzername oder Passwort zu lang")
+		return
+	}
+	if ok, which := s.login.take(ip, req.Username); !ok {
+		msg := "Zu viele Fehlversuche – bitte 15 Minuten warten"
+		if which == "user" {
+			msg = "Zu viele Fehlversuche für dieses Konto – bitte 15 Minuten warten"
+		}
+		writeErr(w, http.StatusTooManyRequests, msg)
 		return
 	}
 	u, err := s.e.Store.UserByName(req.Username)
 	if dir := s.e.Settings().Directory; dir.Enabled && dir.PanelLogin && (err != nil || u.Source == "ldap") {
-		s.ldapPanelLogin(w, r, req.Username, req.Password)
+		if s.ldapPanelLogin(w, r, req.Username, req.Password) {
+			s.login.give(ip, req.Username)
+		}
 		return
 	}
+	if err != nil {
+		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(req.Password))
+	}
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(u.PWHash), []byte(req.Password)) != nil {
-		s.login.fail(ip)
-		s.login.failUser(req.Username)
 		s.auditLogin(r, req.Username, false, "falsches Passwort für „"+req.Username+"“")
 		time.Sleep(400 * time.Millisecond)
 		writeErr(w, http.StatusUnauthorized, "Benutzername oder Passwort falsch")
 		return
 	}
+	s.login.give(ip, req.Username) // password right: not a failed attempt
 	if u.TOTPEnabled {
 		writeJSON(w, 200, map[string]any{"totp_required": true, "ticket": tickets.issue(u.ID)})
 		return
@@ -715,8 +837,8 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "aktuelles Passwort falsch")
 		return
 	}
-	if len(req.New) < 10 {
-		writeErr(w, 400, "neues Passwort muss mindestens 10 Zeichen haben")
+	if len(req.New) < 10 || len(req.New) > maxPasswordBytes {
+		writeErr(w, 400, "neues Passwort: 10 bis 72 Zeichen")
 		return
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(req.New), 12)
@@ -752,7 +874,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	if p == "index.html" {
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
 	} else {
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 	}
@@ -772,3 +894,7 @@ func userFrom(r *http.Request) *store.User {
 	u, _ := r.Context().Value(userKey).(*store.User)
 	return u
 }
+
+// auditOutcomeHeader lets a handler qualify its audit entry (e.g. a
+// configuration Caddy rejected is not "übernommen").
+const auditOutcomeHeader = "X-Sentinel-Outcome"

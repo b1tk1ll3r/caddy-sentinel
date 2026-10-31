@@ -4,6 +4,7 @@
 package wafconf
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -65,9 +67,25 @@ func Directives(w protocol.WAF) string {
 		b.WriteString("SecRequestBodyAccess Off\n")
 	}
 	fmt.Fprintf(&b, "SecRequestBodyLimit %d\n", w.BodyLimit)
-	b.WriteString("SecRequestBodyInMemoryLimit 131072\n")
-	b.WriteString("SecRequestBodyLimitAction ProcessPartial\n")
-	b.WriteString("SecResponseBodyAccess Off\n")
+	mem := 131072
+	if w.BodyLimit < mem {
+		mem = w.BodyLimit // Coraza: the memory limit must not exceed the body limit
+	}
+	fmt.Fprintf(&b, "SecRequestBodyInMemoryLimit %d\n", mem)
+	if w.BodyLimitAction == "reject" {
+		b.WriteString("SecRequestBodyLimitAction Reject\n")
+	} else {
+		b.WriteString("SecRequestBodyLimitAction ProcessPartial\n")
+	}
+	if w.InspectResponse {
+		// detection only: the handler copies the response, never holds it
+		b.WriteString("SecResponseBodyAccess On\n")
+		b.WriteString("SecResponseBodyMimeType text/html text/plain text/xml application/json application/xml application/xhtml+xml application/problem+json\n")
+		fmt.Fprintf(&b, "SecResponseBodyLimit %d\n", w.BodyLimit)
+		b.WriteString("SecResponseBodyLimitAction ProcessPartial\n")
+	} else {
+		b.WriteString("SecResponseBodyAccess Off\n")
+	}
 	b.WriteString("SecAuditEngine Off\n")
 	b.WriteString(`SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "id:200000,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=XML"` + "\n")
 	b.WriteString(`SecRule REQUEST_HEADERS:Content-Type "^application/json" "id:200001,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=JSON"` + "\n")
@@ -150,34 +168,73 @@ var allowedDirectives = map[string]bool{
 	"secruleupdateactionbyid": true,
 }
 
-// @inspectFile runs an external program for every evaluation.
-var forbiddenOperator = regexp.MustCompile(`(?i)@inspectfile\b`)
+// @inspectFile runs an external program for every evaluation; setenv
+// changes the environment of the Caddy process (with request values).
+var (
+	forbiddenOperator = regexp.MustCompile(`(?i)@inspectfile\b`)
+	forbiddenAction   = regexp.MustCompile(`(?i)\bsetenv\s*:`)
+)
 
-// CheckDirectives rejects custom SecLang that is not a plain rule.
+// checkStatement rejects forbidden operators and actions in one joined
+// statement – continuation lines are joined without separator, so the raw
+// text alone can hide them ("@inspect\" + newline + "File").
+func checkStatement(stmt string, line int) error {
+	if forbiddenOperator.MatchString(stmt) {
+		return fmt.Errorf("Zeile %d: der Operator @inspectFile ist nicht erlaubt (startet externe Programme)", line)
+	}
+	if forbiddenAction.MatchString(stmt) {
+		return fmt.Errorf("Zeile %d: die Aktion setenv ist nicht erlaubt (ändert die Umgebung des Caddy-Prozesses)", line)
+	}
+	return nil
+}
+
+// CheckDirectives rejects custom SecLang that is not a plain rule. It splits
+// the text exactly like Coraza's parser (internal/seclang parseString): a
+// line starting with "#" is skipped everywhere – also inside a "\"
+// continuation, which then goes on with the next line – and continuations
+// are joined without a separator. Backtick blocks are not needed by any
+// allowed directive and are refused outright.
 func CheckDirectives(directives string) error {
 	if forbiddenOperator.MatchString(directives) {
 		return fmt.Errorf("der Operator @inspectFile ist nicht erlaubt (startet externe Programme)")
 	}
-	var logical strings.Builder
-	lines := strings.Split(strings.ReplaceAll(directives, "\r\n", "\n"), "\n")
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		logical.Reset()
-		logical.WriteString(line)
-		start := i + 1
-		for strings.HasSuffix(line, "\\") && i+1 < len(lines) {
-			i++
-			line = strings.TrimSpace(lines[i])
-			logical.WriteString(" " + line)
-		}
-		stmt := strings.TrimSpace(logical.String())
-		if stmt == "" || strings.HasPrefix(stmt, "#") {
+	sc := bufio.NewScanner(strings.NewReader(directives))
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	var buf strings.Builder
+	n, start := 0, 0
+	for sc.Scan() {
+		n++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' {
 			continue
 		}
-		name := strings.ToLower(strings.Fields(stmt)[0])
-		if !allowedDirectives[name] {
-			return fmt.Errorf("Zeile %d: Direktive %q ist in eigenen Regeln nicht erlaubt (nur SecRule, SecAction, SecMarker, SecRuleRemove…/SecRuleUpdate…)", start, strings.Fields(stmt)[0])
+		if line[0] == '`' || line[len(line)-1] == '`' {
+			return fmt.Errorf("Zeile %d: Backtick-Blöcke sind in eigenen Regeln nicht erlaubt", n)
 		}
+		if buf.Len() == 0 {
+			start = n
+		}
+		if line[len(line)-1] == '\\' {
+			buf.WriteString(strings.TrimSuffix(line, "\\"))
+			continue
+		}
+		buf.WriteString(line)
+		stmt := buf.String()
+		buf.Reset()
+		if err := checkStatement(stmt, start); err != nil {
+			return err
+		}
+		dir, _, _ := strings.Cut(stmt, " ")
+		if !allowedDirectives[strings.ToLower(dir)] {
+			return fmt.Errorf("Zeile %d: Direktive %q ist in eigenen Regeln nicht erlaubt (nur SecRule, SecAction, SecMarker, SecRuleRemove…/SecRuleUpdate…)", start, dir)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("Regeltext nicht lesbar: %v", err)
+	}
+	if buf.Len() > 0 {
+		// would swallow the next line of the generated configuration
+		return fmt.Errorf("Zeile %d: Regel endet mit „\\“ (Fortsetzung ohne Folgezeile)", start)
 	}
 	return nil
 }
@@ -186,6 +243,9 @@ func CheckDirectives(directives string) error {
 func Build(w protocol.WAF) (coraza.WAF, error) {
 	if err := CheckDirectives(w.Directives); err != nil {
 		return nil, err
+	}
+	if err := CheckDirectives(w.PostDirectives); err != nil {
+		return nil, fmt.Errorf("Nach dem CRS: %w", err)
 	}
 	cfg := coraza.NewWAFConfig().
 		WithRootFS(coreruleset.FS).
@@ -220,19 +280,131 @@ type Result struct {
 // rebuiltBody re-serves the inspected bytes and closes the original body.
 type rebuiltBody struct {
 	io.Reader
-	orig io.ReadCloser
+	orig  io.ReadCloser
+	spill *os.File // inspected part above spoolMem, removed on Close
 }
 
-func (b *rebuiltBody) Close() error { return b.orig.Close() }
+func (b *rebuiltBody) Close() error {
+	if b.spill != nil {
+		_ = b.spill.Close()
+		_ = os.Remove(b.spill.Name())
+		b.spill = nil
+	}
+	return b.orig.Close()
+}
+
+// spoolMem is the part of an inspected body kept in memory; the rest goes to
+// a temporary file, so large uploads do not each hold BodyLimit bytes of RAM.
+const spoolMem = 128 << 10
+
+// spool copies the inspected body out of Coraza's buffer (released with the
+// transaction) into memory or, above spoolMem, a temporary file.
+func spool(src io.Reader) (io.Reader, *os.File, error) {
+	head := make([]byte, spoolMem+1)
+	n, err := io.ReadFull(src, head)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return bytes.NewReader(head[:n]), nil, nil
+	}
+	if err != nil {
+		return bytes.NewReader(head[:n]), nil, err
+	}
+	f, err := os.CreateTemp("", "sentinel-body-*")
+	if err != nil {
+		// no temp space: fall back to memory
+		rest, rerr := io.ReadAll(src)
+		return io.MultiReader(bytes.NewReader(head[:n]), bytes.NewReader(rest)), nil, rerr
+	}
+	// unlink right away (POSIX): nothing is left behind even when no handler
+	// closes the body; the descriptor is released with the file object
+	_ = os.Remove(f.Name())
+	if _, err = f.Write(head[:n]); err == nil {
+		_, err = io.Copy(f, src)
+	}
+	if err == nil {
+		_, err = f.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return bytes.NewReader(nil), nil, err
+	}
+	return f, f, nil
+}
 
 func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err error) {
+	res, t, err := InspectKeep(waf, r, clientIP, false)
+	if t != nil {
+		t.Close()
+	}
+	return res, err
+}
+
+// Tx is an inspection kept open to look at the response as well.
+type Tx struct {
+	tx    types.Transaction
+	proto string
+}
+
+// Close ends the transaction.
+func (t *Tx) Close() {
+	t.tx.ProcessLogging()
+	_ = t.tx.Close()
+}
+
+// WantsResponse reports whether the WAF inspects response bodies.
+func (t *Tx) WantsResponse() bool { return t.tx.IsResponseBodyAccessible() }
+
+// Response runs the response phases on a copy of the response (detection
+// only). Only matches of response rules (phase 3/4) are returned.
+func (t *Tx) Response(status int, h http.Header, body []byte) Result {
+	for k, vs := range h {
+		for _, v := range vs {
+			t.tx.AddResponseHeader(k, v)
+		}
+	}
+	it := t.tx.ProcessResponseHeaders(status, t.proto)
+	if it == nil && len(body) > 0 && t.tx.IsResponseBodyProcessable() {
+		it, _, _ = t.tx.WriteResponseBody(body)
+	}
+	if it == nil {
+		it, _ = t.tx.ProcessResponseBody()
+	}
+	res := collect(t.tx, it)
+	var hits []protocol.Hit
+	for _, mr := range t.tx.MatchedRules() {
+		if ph := mr.Rule().Phase(); ph != types.PhaseResponseHeaders && ph != types.PhaseResponseBody {
+			continue
+		}
+		for _, h := range res.Hits {
+			if h.ID == mr.Rule().ID() {
+				hits = append(hits, h)
+				break
+			}
+		}
+	}
+	res.Hits = hits
+	res.Score = 0
+	if st, ok := t.tx.(plugintypes.TransactionState); ok {
+		if v := st.Variables().TX().Get("outbound_anomaly_score"); len(v) > 0 {
+			res.Score, _ = strconv.Atoi(v[0])
+		}
+	}
+	return res
+}
+
+// InspectKeep is Inspect; with keep it returns the open transaction (the
+// caller must Close it) when the WAF also inspects responses.
+func InspectKeep(waf coraza.WAF, r *http.Request, clientIP string, keep bool) (res Result, t *Tx, err error) {
 	tx := waf.NewTransaction()
+	t = &Tx{tx: tx, proto: r.Proto}
 	defer func() {
-		tx.ProcessLogging()
-		_ = tx.Close()
+		if !keep || !tx.IsResponseBodyAccessible() || res.Interrupted {
+			t.Close()
+			t = nil
+		}
 	}()
 	if tx.IsRuleEngineOff() {
-		return res, nil
+		return res, t, nil
 	}
 	tx.ProcessConnection(clientIP, 0, "", 0)
 	tx.ProcessURI(r.URL.RequestURI(), r.Method, r.Proto)
@@ -257,7 +429,10 @@ func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err 
 	if it == nil {
 		// streaming protocols (gRPC) never end the body before the response:
 		// reading it here would stall the connection
-		streaming := strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc")
+		// (gRPC needs HTTP/2; grpc-web and HTTP/1.x bodies are inspected –
+		// a client must not switch inspection off by naming a content type)
+		ctl := strings.ToLower(r.Header.Get("Content-Type"))
+		streaming := r.ProtoMajor >= 2 && strings.HasPrefix(ctl, "application/grpc") && !strings.HasPrefix(ctl, "application/grpc-web")
 		if tx.IsRequestBodyAccessible() && !streaming && r.Body != nil && r.Body != http.NoBody {
 			var rbErr error
 			it, _, rbErr = tx.ReadRequestBodyFrom(r.Body)
@@ -268,11 +443,11 @@ func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err 
 			// released by tx.Close() when Inspect returns. Copy it out, then
 			// hand the backend that copy followed by the unread rest.
 			if rbr, e := tx.RequestBodyReader(); e == nil {
-				buf, rerr := io.ReadAll(rbr)
+				head, spill, rerr := spool(rbr)
 				if rerr != nil && err == nil {
 					err = rerr
 				}
-				r.Body = &rebuiltBody{Reader: io.MultiReader(bytes.NewReader(buf), r.Body), orig: r.Body}
+				r.Body = &rebuiltBody{Reader: io.MultiReader(head, r.Body), orig: r.Body, spill: spill}
 			}
 		}
 		if it == nil {
@@ -285,7 +460,7 @@ func Inspect(waf coraza.WAF, r *http.Request, clientIP string) (res Result, err 
 		}
 	}
 	res = collect(tx, it)
-	return res, err
+	return res, t, err
 }
 
 func collect(tx types.Transaction, it *types.Interruption) Result {

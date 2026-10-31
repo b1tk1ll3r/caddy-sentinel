@@ -97,14 +97,24 @@ func TestRoleEscalationsClosed(t *testing.T) {
 
 	// WAF directives that write files or run programs are rejected
 	target := filepath.Join(p.dir, "pwn.log")
+	// viewers may only test saved policies
+	if c, b := p.do(view, "POST", "/api/waf/test", `{"waf":{"mode":"block"},"url":"/x"}`); c != 403 {
+		t.Errorf("viewer own waf test: %d %.120s", c, b)
+	}
 	for _, d := range []string{
 		`SecDebugLog ` + target + `\nSecDebugLogLevel 9`,
 		`SecAuditEngine On\nSecAuditLog ` + target,
 		`SecRule REQUEST_URI \"@inspectFile /bin/true\" \"id:5,phase:1,deny\"`,
+		// a comment line ending in a backslash does not swallow the next line
+		`# harmlos \\\nSecAuditEngine On\nSecAuditLog ` + target,
 	} {
-		c, b := p.do(view, "POST", "/api/waf/test", `{"waf":{"mode":"block","directives":"`+d+`"},"url":"/x"}`)
+		c, b := p.do(admin, "POST", "/api/waf/test", `{"waf":{"mode":"block","directives":"`+d+`"},"url":"/x"}`)
 		if c != 400 {
 			t.Errorf("waf test %q: %d %.120s", d, c, b)
+		}
+		c, b = p.do(admin, "POST", "/api/waf/test", `{"waf":{"mode":"block","post_directives":"`+d+`"},"url":"/x"}`)
+		if c != 400 {
+			t.Errorf("waf test post_directives %q: %d %.120s", d, c, b)
 		}
 		c, b = p.do(view, "POST", "/api/rules/compile", `{"rules":[{"mode":"raw","enabled":true,"raw":"`+d+`"}]}`)
 		if c != 200 || !strings.Contains(b, "nicht erlaubt") {

@@ -6,14 +6,31 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+func (s *Store) hasColumn(table, col string) (bool, error) {
+	var n int
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, table, col).Scan(&n)
+	return n > 0, err
+}
+
+// NewSubject returns a random OIDC subject ("u-" + 32 hex digits).
+func NewSubject() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return "u-" + hex.EncodeToString(b)
+}
 
 func (s *Store) ensureColumns(table string, defs []string) error {
 	existing := map[string]bool{}
@@ -44,17 +61,30 @@ func (s *Store) ensureColumns(table string, defs []string) error {
 }
 
 func (s *Store) migrateIdentity() error {
+	hadSubject, err := s.hasColumn("dir_users", "subject")
+	if err != nil {
+		return err
+	}
 	if err := s.ensureColumns("dir_users", []string{
+		"subject TEXT NOT NULL DEFAULT ''", "group_dns TEXT NOT NULL DEFAULT '[]'",
 		"source TEXT NOT NULL DEFAULT 'ldap'", "pw_hash TEXT NOT NULL DEFAULT ''", "expires INTEGER NOT NULL DEFAULT 0",
 		"note TEXT NOT NULL DEFAULT ''", "created_by TEXT NOT NULL DEFAULT ''",
 		"must_change INTEGER NOT NULL DEFAULT 0", "pw_changed INTEGER NOT NULL DEFAULT 0", "recovery TEXT NOT NULL DEFAULT '[]'",
 	}); err != nil {
 		return err
 	}
-	if err := s.ensureColumns("bans", []string{"note TEXT NOT NULL DEFAULT ''", "author TEXT NOT NULL DEFAULT ''"}); err != nil {
+	if !hadSubject {
+		// accounts that existed before stable subjects keep their name as
+		// OIDC subject (relying parties already know them by it); every
+		// account created afterwards gets a random, never reused subject
+		if _, err := s.DB.Exec(`UPDATE dir_users SET subject=username WHERE subject=''`); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureColumns("bans", []string{"note TEXT NOT NULL DEFAULT ''", "author TEXT NOT NULL DEFAULT ''", "inst TEXT NOT NULL DEFAULT ''"}); err != nil {
 		return err
 	}
-	_, err := s.DB.Exec(`
+	_, err = s.DB.Exec(`
 CREATE TABLE IF NOT EXISTS site_tokens (
 	id         TEXT PRIMARY KEY,
 	name       TEXT NOT NULL,
@@ -132,8 +162,12 @@ const (
 // CreateLocalAccount adds a local site-login account.
 func (s *Store) CreateLocalAccount(u *DirUser, hash string) error {
 	g, _ := json.Marshal(nonNil(u.Groups))
-	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,groups,created,source,pw_hash,expires,note,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		strings.ToLower(u.Username), u.Display, u.Email, string(g), time.Now().Unix(), SourceLocal, hash, u.Expires, u.Note, u.CreatedBy)
+	// sessions of an earlier, deleted account with this name must not come
+	// back to life: its tombstone becomes the revocation time
+	name := strings.ToLower(u.Username)
+	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,groups,created,source,pw_hash,expires,note,created_by,subject,revoked)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT revoked FROM dir_tombstones WHERE username=?),0))`,
+		name, u.Display, u.Email, string(g), time.Now().Unix(), SourceLocal, hash, u.Expires, u.Note, u.CreatedBy, NewSubject(), name)
 	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
 		return errors.New("ein Konto mit diesem Namen gibt es schon")
 	}
@@ -178,6 +212,17 @@ func (s *Store) SetRecoveryCodes(name string, hashes []string) error {
 	b, _ := json.Marshal(nonNil(hashes))
 	_, err := s.Exec(`UPDATE dir_users SET recovery=? WHERE username=?`, string(b), strings.ToLower(name))
 	return err
+}
+
+// RecoveryCodesLeft counts the unused recovery codes of an account.
+func (s *Store) RecoveryCodesLeft(name string) (int, error) {
+	var raw string
+	if err := s.DB.QueryRow(`SELECT recovery FROM dir_users WHERE username=?`, strings.ToLower(name)).Scan(&raw); err != nil {
+		return 0, err
+	}
+	var list []string
+	_ = json.Unmarshal([]byte(raw), &list)
+	return len(list), nil
 }
 
 // UseRecoveryCode consumes a recovery code; false if it is unknown or used.
@@ -288,9 +333,9 @@ func (s *Store) UpsertExternalUser(source string, u *DirUser) error {
 		return fmt.Errorf("der Name %q gehört schon zu einem anderen Konto (%s)", name, cur.Source)
 	}
 	g, _ := json.Marshal(nonNil(u.Groups))
-	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,groups,created,source) VALUES(?,?,?,?,?,?)
+	_, err := s.Exec(`INSERT INTO dir_users(username,display,email,groups,created,source,subject) VALUES(?,?,?,?,?,?,?)
 		ON CONFLICT(username) DO UPDATE SET display=excluded.display, email=excluded.email, groups=excluded.groups`,
-		name, u.Display, u.Email, string(g), time.Now().Unix(), source)
+		name, u.Display, u.Email, string(g), time.Now().Unix(), source, NewSubject())
 	return err
 }
 

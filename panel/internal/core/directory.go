@@ -329,6 +329,8 @@ type dirError struct{ msg, reason string }
 
 func (e *dirError) Error() string { return e.msg }
 
+var errUserNotFound = errors.New("Benutzer nicht gefunden")
+
 // Lookup reads a user without a password (used by the admin "test" tool).
 func (d DirectoryConfig) Lookup(input string) (*DirIdentity, error) {
 	conn, err := d.dial()
@@ -342,7 +344,7 @@ func (d DirectoryConfig) Lookup(input string) (*DirIdentity, error) {
 	e, err := d.lookupUser(conn, input)
 	if err != nil {
 		if err == errBadCredentials {
-			return nil, errors.New("Benutzer nicht gefunden")
+			return nil, errUserNotFound
 		}
 		return nil, err
 	}

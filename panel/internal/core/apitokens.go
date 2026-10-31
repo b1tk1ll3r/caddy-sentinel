@@ -102,6 +102,13 @@ func (s *Server) handleAPITokenCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "Ablaufdatum liegt in der Vergangenheit")
 		return
 	}
+	if u.Source != "" && u.Source != "local" {
+		// directory and provider accounts lose their rights outside the
+		// panel: their tokens must expire (at most 90 days)
+		if max := time.Now().Add(90 * 24 * time.Hour).Unix(); req.Expires == 0 || req.Expires > max {
+			req.Expires = max
+		}
+	}
 	raw := apiTokenPrefix + RandomToken(24)
 	sum := sha256.Sum256([]byte(raw))
 	t := &store.APIToken{ID: RandomToken(6), UserID: u.ID, Name: req.Name, Hash: hex.EncodeToString(sum[:]), Prefix: raw[:len(apiTokenPrefix)+6], Role: req.Role, Expires: req.Expires}

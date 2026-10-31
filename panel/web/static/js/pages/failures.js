@@ -28,9 +28,9 @@ export async function render(root, _p, scope, q) {
 
   const kpis = el('div.kpis');
   const series = [
-    { label: 'Blockiert (Sentinel)', color: 'var(--series-4)', values: [] },
-    { label: 'Client-Fehler 4xx', color: 'var(--series-6)', values: [] },
-    { label: 'Server-Fehler 5xx', color: 'var(--series-3)', values: [] },
+    { label: 'Blockiert (Sentinel)', color: 'var(--c-blocked)', values: [] },
+    { label: 'Client-Fehler 4xx', color: 'var(--c-4xx)', values: [] },
+    { label: 'Server-Fehler 5xx', color: 'var(--c-5xx)', values: [] },
   ];
   const chart = timeChart({ series, t: [], kind: 'area', height: 180, label: 'Fehlgeschlagene Anfragen über die Zeit', onMarker: (m) => eventDrawer(m.ev) });
   const changesBox = el('div.change-list');
@@ -84,7 +84,7 @@ export async function render(root, _p, scope, q) {
     series[1].values = sp.map(x => Math.max(0, x.s4 - x.blocked));
     series[2].values = sp.map(x => x.s5);
     const changes = evs.filter(e => CHANGE_RE.test(e.title) && !/Caddyfile übernommen/.test(e.title));
-    chart.update({ t: sp.map(x => x.t), markers: changes.map(e => ({ t: Math.floor(e.ts / 1000), label: fmtDateTime(e.ts) + ' – ' + e.title, ev: e, color: e.type === 'config' ? 'var(--series-1)' : 'var(--primary)' })) });
+    chart.update({ t: sp.map(x => x.t), markers: changes.map(e => ({ t: Math.floor(e.ts / 1000), label: fmtDateTime(e.ts) + ' – ' + e.title, ev: e, color: 'var(--ink-2)' })) });
     mount(changesBox, changes.length ? el('details', null, el('summary', null, `${changes.length} Änderung${changes.length === 1 ? '' : 'en'} im Zeitraum`),
       el('ul', null, changes.slice(0, 30).map(e => el('li', null, el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); eventDrawer(e); } }, fmtDateTime(e.ts)), ' ', instChip(e.inst), ' ', e.title)))) : el('small.muted', null, 'Keine Änderungen im Zeitraum.'));
   }

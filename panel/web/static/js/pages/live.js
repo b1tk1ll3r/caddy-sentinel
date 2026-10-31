@@ -7,11 +7,11 @@ import { bus } from '../app.js';
 export async function render(root, _p, scope, q) {
   const N = 300;
   const series = [
-    { label: 'Requests/s', color: 'var(--series-1)', values: [] },
-    { label: '5xx/s', color: 'var(--series-3)', values: [] },
-    { label: 'Blockiert/s', color: 'var(--series-4)', values: [] },
+    { label: 'Requests/s', color: 'var(--c-requests)', values: [] },
+    { label: '5xx/s', color: 'var(--c-5xx)', values: [] },
+    { label: 'Blockiert/s', color: 'var(--c-blocked)', values: [] },
   ];
-  const chart = timeChart({ series, t: [], kind: 'line', height: 190, yFormat: (v) => fmt1(v), label: 'Live-Traffic pro Sekunde' });
+  const chart = timeChart({ series, t: [], kind: 'line', height: 190, yFormat: (v) => fmt1(v), fractional: true, label: 'Live-Traffic pro Sekunde' });
   let pts = await get('/stats/live?n=' + N, scope.signal);
   const redraw = () => {
     series[0].values = pts.map(p => p.req);
