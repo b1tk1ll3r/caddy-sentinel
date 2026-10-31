@@ -97,6 +97,12 @@ davon 8 hoch, keiner kritisch – alle behoben oder entschärft. **Allen Install
   CodeMirror-Build ist auf Commit-Hashes festgelegt.
 - Dashboard-Warnung, solange das Panel noch als `caddy` läuft oder sein Datenverzeichnis für andere lesbar ist.
 
+### Behoben
+
+- Mit Caddy ab 2.11 lehnte die Admin-API über einen Unix-Socket (Docker, neue systemd-Installation) alle
+  Anfragen des Panels ab („client is not allowed to access from origin 'http://caddy-admin'“). Das Panel schickt
+  über Sockets keinen Origin-Header mehr.
+
 ## v1.2.0
 
 ### Neu

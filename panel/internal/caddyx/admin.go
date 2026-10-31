@@ -30,6 +30,9 @@ func NewAdmin(url string) *Admin {
 	a.base = strings.TrimRight(url, "/")
 	if strings.HasPrefix(url, "unix/") {
 		sock := strings.TrimPrefix(url, "unix/")
+		if i := strings.LastIndexByte(sock, '|'); i >= 0 {
+			sock = sock[:i] // socket permissions (unix//path|0660) are Caddy's business
+		}
 		tr.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", sock)
@@ -61,8 +64,15 @@ func (a *Admin) do(ctx context.Context, method, path, ctype string, body []byte)
 	if ctype != "" {
 		req.Header.Set("Content-Type", ctype)
 	}
-	// Caddy's admin endpoint enforces origin checks for some setups.
-	req.Header.Set("Origin", a.base)
+	// Caddy checks the Origin header whenever one is sent (since 2.11 also
+	// without enforce_origin). Over TCP the panel sends the admin address
+	// itself, which Caddy allows by default (and which satisfies
+	// enforce_origin). A Unix socket has no default origins at all – any
+	// Origin would be refused ("not allowed to access from origin") – so
+	// none is sent there; a non-browser request without Origin passes.
+	if strings.HasPrefix(a.URL, "http://") || strings.HasPrefix(a.URL, "https://") {
+		req.Header.Set("Origin", a.base)
+	}
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return nil, err
